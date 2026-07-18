@@ -67,6 +67,7 @@ if(BUILD_MODE EQUAL 1)
   add_library(sideloadnative SHARED
     jni_bridge_imd.c    # JNI API: nativeInit/Connect/Pair/Sideload (libimobiledevice)
     usb_fd_bridge.c     # Android USB fd → libusb handle + endpoint discovery
+    android_usbmuxd_fix.c  # Android non-root: override usbmuxd_get_device/connect
     usbmuxd_server.c    # Mini usbmuxd Unix socket server + v1 USB protocol (cho libusbmuxd kết nối)
   )
 

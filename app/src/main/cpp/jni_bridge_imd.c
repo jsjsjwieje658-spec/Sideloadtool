@@ -51,6 +51,7 @@
 
 #include "usb_fd_bridge.h"
 #include "usbmuxd_server.h"
+#include "android_usbmuxd_fix.h"
 
 #define LOG_TAG "jni_imd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -372,6 +373,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         emit_log(buf);
         /* Set env var ngay lập tức */
         setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_socket_path(), 1);
+
+        /* FIX: Inject UDID into shim so usbmuxd_get_device() can bypass discover */
+        android_fix_set_device(g_udid[0] ? g_udid : NULL, (int)productId);
 
         /* FIX CRITICAL: Fetch UDID early before nativeConnect() runs. */
         setenv("USBMUXD_SOCKET_PATH", usbmuxd_server_socket_path(), 1);
