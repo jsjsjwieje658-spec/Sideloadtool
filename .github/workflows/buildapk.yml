@@ -1,0 +1,178 @@
+name: Build APK
+
+# =============================================================================
+#  CI pipeline — Simplified integrated workflow
+#
+#  Phase 1: Setup (Java 17 + Android SDK + NDK + Python + Gradle)
+#  Phase 2: Cross-compile libmobiledevice stack (NDK 25)
+#  Phase 3: Build Gradle APK (prebuilt linked automatically via CMakeLists.txt)
+#  Phase 4: Verify APK integrity
+#  Phase 5: Upload ONLY final APK (prebuilt is embedded inside)
+#
+#  💡 Key: Prebuilt libraries are linked into APK at build time.
+#          No need to distribute prebuilt separately.
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      rebuild_native:
+        description: 'Force rebuild native (bỏ cache)'
+        default: 'false'
+
+env:
+  NDK_VERSION: "25.2.9519653"
+  JAVA_VERSION: "17"
+  ANDROID_PLATFORM: "34"
+
+jobs:
+  build:
+    name: "Build APK"
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ══════════════════════════════════════════════════════════════════════
+      # Phase 1: Setup environments
+      # ══════════════════════════════════════════════════════════════════════
+      
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "☕ Setup Java 17"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: "🤖 Setup Android SDK"
+        uses: android-actions/setup-android@v3
+
+      - name: "📦 Install NDK ${{ env.NDK_VERSION }}"
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "ndk;$NDK_VERSION" \
+            "platforms;android-$ANDROID_PLATFORM" \
+            "build-tools;34.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "✅ NDK installed"
+
+      - name: "🐍 Setup Python 3.11 (required by Chaquopy)"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "🔧 Setup Gradle"
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: "📥 Install host build tools"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            autoconf automake libtool libtool-bin pkg-config \
+            make cmake ninja-build curl gettext
+          echo "✅ Build tools installed"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # Phase 2: Cross-compile native libraries
+      # ══════════════════════════════════════════════════════════════════════
+
+      - name: "🔐 Calculate cache key"
+        id: cache-key
+        run: |
+          KEY="imd-ndk25.2-$(sha256sum scripts/build_all.sh | cut -d' ' -f1)"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: "⚡ Restore prebuilt cache"
+        id: cache-restore
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/cpp/prebuilt
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: imd-ndk25.2-
+
+      - name: "🏗️  Cross-compile libmobiledevice stack"
+        if: steps.cache-restore.outputs.cache-hit != 'true' || github.event.inputs.rebuild_native == 'true'
+        run: |
+          chmod +x scripts/build_all.sh
+          TARGET_ABIS="arm64-v8a x86_64" bash scripts/build_all.sh
+
+      - name: "✅ Verify prebuilt libraries"
+        run: |
+          echo "=== Verifying prebuilt libraries ==="
+          for abi in arm64-v8a x86_64; do
+            if [ -d "app/src/main/cpp/prebuilt/$abi/lib" ]; then
+              echo "✅ $abi: $(ls app/src/main/cpp/prebuilt/$abi/lib/*.a 2>/dev/null | wc -l) libraries"
+            fi
+          done
+
+      # ══════════════════════════════════════════════════════════════════════
+      # Phase 3: Build Gradle APK (CMakeLists.txt links prebuilt automatically)
+      # ══════════════════════════════════════════════════════════════════════
+
+      - name: "🏗️  Build Debug APK"
+        run: |
+          echo "🚀 Building APK (prebuilt will be linked automatically)..."
+          gradle :app:assembleDebug --stacktrace
+
+      # ══════════════════════════════════════════════════════════════════════
+      # Phase 4: Verify APK
+      # ══════════════════════════════════════════════════════════════════════
+
+      - name: "📋 Verify APK contents"
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          
+          if [ ! -f "$APK" ]; then
+            echo "❌ APK not found!"
+            exit 1
+          fi
+          
+          echo "=== APK Information ==="
+          echo "📦 File: $(basename "$APK")"
+          echo "💾 Size: $(du -h "$APK" | cut -f1)"
+          echo "🔐 SHA256: $(sha256sum "$APK" | cut -d' ' -f1)"
+          
+          echo ""
+          echo "=== Native Libraries in APK ==="
+          unzip -l "$APK" | grep "\.so$" | awk '{print $NF}'
+          
+          echo ""
+          if unzip -l "$APK" | grep -q "lib/arm64-v8a/libsideloadnative.so"; then
+            echo "✅ libsideloadnative.so linked successfully"
+          else
+            echo "❌ libsideloadnative.so NOT found!"
+            exit 1
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════
+      # Phase 5: Upload ONLY final APK
+      # ══════════════════════════════════════════════════════════════════════
+
+      - name: "⬆️  Upload APK"
+        uses: actions/upload-artifact@v4
+        with:
+          name: superalpha-sideload-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: "✅ Build completed"
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo ""
+          echo "╔════════════════════════════════════════════════════╗"
+          echo "║       ✅ BUILD COMPLETED SUCCESSFULLY ✅           ║"
+          echo "╚════════════════════════════════════════════════════╝"
+          echo ""
+          echo "📦 APK ready: $(basename "$APK")"
+          echo "💾 Size: $(du -h "$APK" | cut -f1)"
+          echo ""
+          echo "🚀 Install on Android:"
+          echo "   adb install $(basename "$APK")"
+          echo ""
