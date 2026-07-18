@@ -4,6 +4,7 @@ import android.hardware.usb.*
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import android.os.ParcelFileDescriptor
 
 /**
  * UsbTransport — Quản lý kết nối USB thô với iPhone/iPad qua Android USB Host API.
@@ -81,7 +82,18 @@ object UsbTransport {
     fun isConnected() = _connected.value
 
     // Mode 1: fd cho libusb_wrap_sys_device()
-    fun getFileDescriptor(): Int = connection?.fileDescriptor ?: -1
+    fun getFileDescriptor(): Int {
+        val pfd = connection?.fileDescriptor
+        return if (pfd != null) {
+            try {
+                ParcelFileDescriptor.adoptFd(pfd.fd).detachFd()
+            } catch (e: Exception) {
+                -1
+            }
+        } else {
+            -1
+        }
+    }
     fun getVendorId():  Int = currentDevice?.vendorId  ?: 0
     fun getProductId(): Int = currentDevice?.productId ?: 0
 
@@ -95,16 +107,6 @@ object UsbTransport {
         val epIn: UsbEndpoint,
         val epOut: UsbEndpoint
     )
-
-    /* FIX: Trả về fd đã detach để native code giữ bản sao an toàn */
-    fun getDetachedFd(): Int {
-        val pfd = connection?.fileDescriptor
-        return if (pfd != null) {
-            try { pfd.detachFd() } catch (e: Exception) { -1 }
-        } else {
-            -1
-        }
-    }
 
     private fun findUsbmuxIface(device: UsbDevice): FoundIface? {
         for (ci in 0 until device.configurationCount) {
