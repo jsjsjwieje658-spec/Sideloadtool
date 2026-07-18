@@ -40,6 +40,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <android/log.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
@@ -145,14 +147,23 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
 
     g_product_id = (int)productId;
 
+    /* FIX: Dup fd để tránh invalid khi Java GC thu hồi UsbDeviceConnection */
+    int fd_copy = dup((int)fd);
+    if (fd_copy < 0) {
+        emit_log("[usb] ❌ dup(fd) thất bại — fd không hợp lệ");
+        return JNI_FALSE;
+    }
+    int flags = fcntl(fd_copy, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd_copy, F_SETFL, flags | O_NONBLOCK);
+
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[usb] libusb_wrap_sys_device(fd=%d, vid=0x%04x, pid=0x%04x)",
-             (int)fd, (int)vendorId, (int)productId);
+             "[usb] libusb_wrap_sys_device(fd=%d[dup từ %d], vid=0x%04x, pid=0x%04x)",
+             fd_copy, (int)fd, (int)vendorId, (int)productId);
     emit_log(buf);
 
-    /* Bước 1: Khởi tạo libusb với Android USB fd */
-    bool ok = usb_bridge_init_from_fd((int)fd, (int)vendorId, (int)productId);
+    /* Bước 1: Khởi tạo libusb với fd copy */
+    bool ok = usb_bridge_init_from_fd(fd_copy, (int)vendorId, (int)productId);
     if (!ok) {
         emit_log("[usb] \u274c libusb_wrap_sys_device() thất bại — kiểm tra quyền USB Host");
         return JNI_FALSE;

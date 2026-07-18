@@ -96,6 +96,16 @@ object UsbTransport {
         val epOut: UsbEndpoint
     )
 
+    /* FIX: Trả về fd đã detach để native code giữ bản sao an toàn */
+    fun getDetachedFd(): Int {
+        val pfd = connection?.fileDescriptor ?: return -1
+        return try {
+            ParcelFileDescriptor.adoptFd(pfd.fd).detachFd()
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
     private fun findUsbmuxIface(device: UsbDevice): FoundIface? {
         for (ci in 0 until device.configurationCount) {
             val cfg = device.getConfiguration(ci)

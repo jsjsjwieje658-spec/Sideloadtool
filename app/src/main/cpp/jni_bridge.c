@@ -41,6 +41,9 @@
 
 /* ── Global state ────────────────────────────────────────────────────────── */
 static JavaVM      *g_jvm      = NULL;
+static jclass    g_cls_UsbTransport = NULL;
+static jmethodID g_mid_nativeBulkWrite = NULL;
+static jmethodID g_mid_nativeBulkRead = NULL;
 static mux_conn_t   g_mux;
 static lockdown_t   g_ld;
 static pair_record_t g_rec;
@@ -52,6 +55,16 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     g_jvm = vm;
     LOGI("libsideloadnative loaded (Mode 2/3).");
+    JNIEnv *env = NULL;
+    if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK) {
+        jclass cls = (*env)->FindClass(env, "com/superalpha/sideload/bridge/UsbTransport");
+        if (cls) {
+            g_cls_UsbTransport = (jclass)(*env)->NewGlobalRef(env, cls);
+            g_mid_nativeBulkWrite = (*env)->GetStaticMethodID(env, cls, "nativeBulkWrite", "([BI)I");
+            g_mid_nativeBulkRead = (*env)->GetStaticMethodID(env, cls, "nativeBulkRead", "([BI)I");
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
     return JNI_VERSION_1_6;
 }
 
@@ -110,9 +123,12 @@ static int usb_bulk_write(const void *buf, int len) {
     }
     if (!env) { LOGE("usb_bulk_write: no JNIEnv"); return -1; }
 
-    jclass cls = (*env)->FindClass(env, "com/superalpha/sideload/bridge/UsbTransport");
-    if (!cls) { LOGE("usb_bulk_write: no UsbTransport"); return -1; }
-    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "nativeBulkWrite", "([BI)I");
+    if (!g_cls_UsbTransport || !g_mid_nativeBulkWrite) {
+        LOGE("usb_bulk_write: cached refs not ready");
+        return -1;
+    }
+    jclass cls = g_cls_UsbTransport;
+    jmethodID mid = g_mid_nativeBulkWrite;
     if (!mid) { (*env)->DeleteLocalRef(env, cls); return -1; }
 
     jbyteArray jarr = (*env)->NewByteArray(env, len);
@@ -145,9 +161,12 @@ static int usb_bulk_read(void *buf, int len) {
     }
     if (!env) { LOGE("usb_bulk_read: no JNIEnv"); return -1; }
 
-    jclass cls = (*env)->FindClass(env, "com/superalpha/sideload/bridge/UsbTransport");
-    if (!cls) { LOGE("usb_bulk_read: no UsbTransport"); return -1; }
-    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "nativeBulkRead", "([BI)I");
+    if (!g_cls_UsbTransport || !g_mid_nativeBulkRead) {
+        LOGE("usb_bulk_read: cached refs not ready");
+        return -1;
+    }
+    jclass cls = g_cls_UsbTransport;
+    jmethodID mid = g_mid_nativeBulkRead;
     if (!mid) { (*env)->DeleteLocalRef(env, cls); return -1; }
 
     jbyteArray jarr = (*env)->NewByteArray(env, len);

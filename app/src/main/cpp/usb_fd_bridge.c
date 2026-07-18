@@ -49,6 +49,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #define TAG "usb_fd_bridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -66,6 +68,23 @@ static uint8_t               g_ep_in      = 0;
 static uint8_t               g_ep_out     = 0;
 static int                   g_iface_num  = -1;
 static int                   g_initialized = 0;
+static int                   g_fd_copy    = -1;  /* dup của fd Android */
+
+
+/* ── Helper: dup fd để tránh invalid khi Java GC ─────────────────────── */
+static bool dup_android_fd(int fd) {
+    if (g_fd_copy >= 0) { close(g_fd_copy); g_fd_copy = -1; }
+    g_fd_copy = dup(fd);
+    if (g_fd_copy < 0) {
+        LOGE("dup_android_fd: dup(%d) failed: %s", fd, strerror(errno));
+        return false;
+    }
+    /* Set non-blocking cho fd copy */
+    int flags = fcntl(g_fd_copy, F_GETFL, 0);
+    if (flags >= 0) fcntl(g_fd_copy, F_SETFL, flags | O_NONBLOCK);
+    LOGI("dup_android_fd: fd=%d → copy=%d", fd, g_fd_copy);
+    return true;
+}
 
 /* ════════════════════════════════════════════════════════════════════════
  * discover_apple_endpoints
@@ -74,6 +93,39 @@ static bool discover_apple_endpoints(void) {
     struct libusb_config_descriptor *cfg = NULL;
     libusb_device *dev = libusb_get_device(g_handle);
     if (!dev) return false;
+
+    /* FIX: Set configuration cao nhất trước khi claim */
+    struct libusb_device_descriptor dev_desc;
+    if (libusb_get_device_descriptor(dev, &dev_desc) == 0) {
+        int target_config = dev_desc.bNumConfigurations;
+        int current_config = 0;
+        libusb_get_configuration(g_handle, &current_config);
+        if (current_config != target_config) {
+            LOGI("discover: set configuration %d (current=%d)", target_config, current_config);
+            for (int cfg_val = target_config; cfg_val >= 1; cfg_val--) {
+                int r = libusb_set_configuration(g_handle, cfg_val);
+                if (r == 0) {
+                    LOGI("discover: set configuration %d OK", cfg_val);
+                    break;
+                }
+                if (r == LIBUSB_ERROR_BUSY) {
+                    LOGI("discover: config %d BUSY, detach kernel drivers...", cfg_val);
+                    struct libusb_config_descriptor *tmp_cfg = NULL;
+                    if (libusb_get_active_config_descriptor(dev, &tmp_cfg) == 0) {
+                        for (int i = 0; i < (int)tmp_cfg->bNumInterfaces; i++) {
+                            if (libusb_kernel_driver_active(g_handle, i) == 1) {
+                                libusb_detach_kernel_driver(g_handle, i);
+                            }
+                        }
+                        libusb_free_config_descriptor(tmp_cfg);
+                    }
+                    usleep(200000);
+                    r = libusb_set_configuration(g_handle, cfg_val);
+                    if (r == 0) break;
+                }
+            }
+        }
+    }
 
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) {
         LOGE("discover: libusb_get_active_config_descriptor thất bại");
@@ -123,13 +175,25 @@ static bool discover_apple_endpoints(void) {
                  * KHÔNG gọi libusb_detach_kernel_driver() — không áp dụng
                  * trên Android (không có kernel driver kiểu Linux desktop).
                  */
+                /* FIX: Detach kernel driver trước claim */
+                if (libusb_kernel_driver_active(g_handle, alt->bInterfaceNumber) == 1) {
+                    LOGI("discover: detach kernel driver for interface %d", alt->bInterfaceNumber);
+                    libusb_detach_kernel_driver(g_handle, alt->bInterfaceNumber);
+                }
+                libusb_set_auto_detach_kernel_driver(g_handle, 1);
+
                 int r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
                 if (r == 0) {
                     LOGI("discover: ✅ interface %d claimed successfully (fd sạch — termux-api pattern)",
                          alt->bInterfaceNumber);
                 } else if (r == LIBUSB_ERROR_BUSY) {
-                    LOGI("discover: interface %d BUSY (Android pre-claimed) — chia sẻ fd, tiếp tục",
-                         alt->bInterfaceNumber);
+                    LOGI("discover: interface %d BUSY — retry after detach", alt->bInterfaceNumber);
+                    libusb_detach_kernel_driver(g_handle, alt->bInterfaceNumber);
+                    usleep(100000);
+                    r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
+                    if (r != 0) {
+                        LOGE("discover: claim retry failed: %d", r);
+                    }
                 } else if (r == LIBUSB_ERROR_NOT_SUPPORTED) {
                     LOGI("discover: interface %d NOT_SUPPORTED — tiếp tục (bình thường trên Android)",
                          alt->bInterfaceNumber);
@@ -168,6 +232,11 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
         usb_bridge_close();
     }
 
+    /* FIX: Dup fd để tránh invalid khi Java GC */
+    if (!dup_android_fd(fd)) {
+        return false;
+    }
+
     int r = libusb_init(&g_ctx);
     if (r != 0) {
         LOGE("libusb_init() err=%d (%s)", r, libusb_error_name(r));
@@ -176,16 +245,16 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
 
     libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
 
-    r = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_handle);
+    r = libusb_wrap_sys_device(g_ctx, (intptr_t)g_fd_copy, &g_handle);
     if (r != 0) {
-        LOGE("libusb_wrap_sys_device(fd=%d, pid=0x%04x) err=%d (%s)",
-             fd, product_id, r, libusb_error_name(r));
+        LOGE("libusb_wrap_sys_device(fd_copy=%d, pid=0x%04x) err=%d (%s)",
+             g_fd_copy, product_id, r, libusb_error_name(r));
         libusb_exit(g_ctx);
         g_ctx = NULL;
         return false;
     }
 
-    LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
+    LOGI("libusb_wrap_sys_device OK: fd_copy=%d pid=0x%04x", g_fd_copy, product_id);
 
     /*
      * FIX (Bug 3 — CRITICAL): libusb_reset_device() REMOVED.

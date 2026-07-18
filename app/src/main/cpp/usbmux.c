@@ -273,40 +273,58 @@ int mux_do_setup(mux_conn_t *c) {
     uint8_t vpkt[V1_VERSION_PKT_LEN];
     build_version_pkt(vpkt);
 
-    if (raw_send(c, vpkt, sizeof(vpkt)) < 0) {
-        if (c->ui_log)
-            c->ui_log("[mux] ⚠️ Không gửi được VERSION packet (USB busy?) — tiếp tục");
-        LOGE("mux_do_setup: raw_send thất bại — tiếp tục không có version exchange");
-        return 0;  /* non-fatal */
+    /* FIX: Retry gửi 3 lần */
+    int send_ok = 0;
+    for (int retry = 0; retry < 3; retry++) {
+        if (raw_send(c, vpkt, sizeof(vpkt)) >= 0) {
+            send_ok = 1;
+            break;
+        }
+        LOGE("mux_do_setup: raw_send lần %d thất bại, retry...", retry + 1);
+        usleep(200000);
+    }
+    if (!send_ok) {
+        LOGE("mux_do_setup: không gửi được VERSION sau 3 lần");
+        if (c->ui_log) c->ui_log("[mux] ❌ Không gửi được VERSION packet — USB có thể bị chiếm");
+        return -1;
     }
 
     /*
-     * Chờ VERSION response từ iPhone.
-     * Đọc đúng V1_VERSION_PKT_LEN byte (32 bytes).
-     * Nếu không đủ hoặc magic sai → iPhone không hỗ trợ v1 (rất cũ) → tiếp tục.
+     * FIX: Chờ VERSION response với retry và timeout dài hơn.
+     * Nếu iPhone không phản hồi đúng v1 → báo lỗi rõ ràng thay vì non-fatal.
      */
-    uint8_t resp[V1_VERSION_PKT_LEN + 64];  /* +64 cho phép nhận thêm nếu cần */
-    int got = c->usb_read(resp, sizeof(resp));
+    uint8_t resp[V1_VERSION_PKT_LEN + 64];
+    int got = 0;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        got = c->usb_read(resp, sizeof(resp));
+        if (got >= (int)sizeof(usbmux_v1hdr_t)) break;
+        if (got < 0) {
+            LOGE("mux_do_setup: USB read error %d (lần %d)", got, attempt + 1);
+            return -1;
+        }
+        usleep(500000); /* 500ms */
+    }
 
     if (got < (int)sizeof(usbmux_v1hdr_t)) {
-        if (c->ui_log)
-            c->ui_log("[mux] ⚠️ Không nhận được VERSION response — tiếp tục (backward compat)");
-        LOGI("mux_do_setup: no response (got=%d) — assume old firmware, tiếp tục", got);
-        return 0;  /* non-fatal */
+        LOGE("mux_do_setup: không nhận đủ header (got=%d, cần %zu)", got, sizeof(usbmux_v1hdr_t));
+        if (c->ui_log) c->ui_log("[mux] ❌ iPhone không phản hồi VERSION — kiểm tra unlock + Trust + cáp data");
+        return -1; /* FIX: return -1 thay vì 0 */
     }
 
     usbmux_v1hdr_t *rhdr = (usbmux_v1hdr_t *)resp;
     uint32_t magic    = ntohl(rhdr->magic);
     uint32_t protocol = ntohl(rhdr->protocol);
 
-    if (magic != V1_MAGIC || protocol != V1_PROTO_VER) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "[mux] ⚠️ VERSION response: magic=0x%08x proto=%u (không phải v1) — tiếp tục",
-                 magic, protocol);
-        if (c->ui_log) c->ui_log(msg);
-        LOGI("mux_do_setup: unexpected response magic=0x%08x proto=%u", magic, protocol);
-        return 0;  /* non-fatal */
+    if (magic != V1_MAGIC) {
+        LOGE("mux_do_setup: bad magic 0x%08x (expected 0x%08x)", magic, V1_MAGIC);
+        if (c->ui_log) c->ui_log("[mux] ❌ VERSION response magic sai — iPhone dùng protocol khác");
+        return -1;
+    }
+
+    if (protocol != V1_PROTO_VER) {
+        LOGE("mux_do_setup: unexpected protocol=%u (expected VERSION=0)", protocol);
+        if (c->ui_log) c->ui_log("[mux] ❌ VERSION response protocol sai");
+        return -1;
     }
 
     /* Thành công: đọc major/minor từ body */
@@ -324,7 +342,7 @@ int mux_do_setup(mux_conn_t *c) {
              "[mux] ✅ v1 VERSION OK: major=%u minor=%u (iOS 7+ compatible)",
              resp_major, resp_minor);
     if (c->ui_log) c->ui_log(msg);
-    LOGI("mux_do_setup: ✅ v1 negotiated major=%u minor=%u", resp_major, resp_minor);
+    LOGI("mux_do_setup: v1 negotiated major=%u minor=%u", resp_major, resp_minor);
     return 0;
 }
 
