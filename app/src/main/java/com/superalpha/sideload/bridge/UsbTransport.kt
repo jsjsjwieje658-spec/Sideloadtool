@@ -1,6 +1,7 @@
 package com.superalpha.sideload.bridge
 
 import android.hardware.usb.*
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -100,7 +101,7 @@ object UsbTransport {
     fun getDetachedFd(): Int {
         val pfd = connection?.fileDescriptor ?: return -1
         return try {
-            ParcelFileDescriptor.adoptFd(pfd.fd).detachFd()
+            pfd.detachFd()
         } catch (e: Exception) {
             -1
         }
