@@ -375,7 +375,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_socket_path(), 1);
 
         /* FIX: Inject UDID into shim so usbmuxd_get_device() can bypass discover */
-        android_fix_set_device(g_udid[0] ? g_udid : NULL, (int)productId);
+        android_fix_set_device(g_udid[0] ? g_udid : "00000000-0000000000000000", (int)productId);
 
         /* FIX CRITICAL: Fetch UDID early before nativeConnect() runs. */
         setenv("USBMUXD_SOCKET_PATH", usbmuxd_server_socket_path(), 1);
@@ -392,6 +392,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
                 strncpy(g_udid, early_udid, sizeof(g_udid) - 1);
                 g_udid[sizeof(g_udid) - 1] = '\0';
                 usbmuxd_server_update_udid(g_udid);
+                android_fix_set_device(g_udid, (int)productId);
                 free(early_udid);
             } else {
                 emit_log("[bridge] ⚠️ Early device found but no UDID yet");
@@ -527,6 +528,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         free(udid);
         /* FIX: dùng update_udid thay vì restart (tránh race condition) */
         usbmuxd_server_update_udid(g_udid);
+        android_fix_set_device(g_udid, 0x12a8);
 
         /*
          * FIX (báo cáo lỗi #7): usbmuxd_server_update_udid() giờ đã tự

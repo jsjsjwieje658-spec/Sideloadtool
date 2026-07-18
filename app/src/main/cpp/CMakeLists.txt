@@ -1,3 +1,8 @@
+# Fix for Android NDK r25+ lld linker: allow duplicate symbols between
+# object files and static archives (android_usbmuxd_fix.c overrides
+# symbols from libusbmuxd-2.0.a)
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition")
+
 cmake_minimum_required(VERSION 3.22)
 project(sideloadnative C)
 
