@@ -78,6 +78,32 @@
  *        sau mỗi packet gửi, rx_seq echo lại giá trị nhận được gần nhất
  *        từ device (xem g_mux_tx_seq/g_mux_rx_seq).
  * ════════════════════════════════════════════════════════════════════
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * FIX v31 — theo bảng báo cáo lỗi (Kimi AI review): "Attached" event
+ * không được broadcast lại cho mọi client đang Listen khi UDID thật
+ * chỉ được biết SAU khi client đó đã Listen xong.
+ *
+ * Bug I (HIGH): make_attached_event()/make_device_list() vốn đã có đầy đủ
+ *        DeviceID, Properties dict, ConnectionType=USB, LocationID,
+ *        ProductID, SerialNumber — không đổi ở fix này (đã đúng từ v22).
+ *
+ * Bug J (HIGH — MỚI): "Attached" trước đây chỉ gửi MỘT LẦN, ngay trong
+ *        thread xử lý client vừa gửi "Listen", dùng UDID tại thời điểm
+ *        đó (thường vẫn là placeholder). Không có cơ chế broadcast lại
+ *        cho các client Listen khác, và không có cách nào gửi lại khi
+ *        UDID thay đổi. Fix: thêm registry (register_listener()/
+ *        unregister_listener()) + broadcast_attached() — gửi "Attached"
+ *        tới TOÀN BỘ client đang Listen, không chỉ một client.
+ *
+ * Bug K (HIGH — MỚI): usbmuxd_server_update_udid() (gọi từ
+ *        jni_bridge_imd.c ngay sau idevice_get_udid()) trước đây CHỈ
+ *        ghi đè g_udid trong bộ nhớ — không thông báo lại cho bất kỳ
+ *        client nào đang Listen. Fix: update_udid() giờ tự gọi
+ *        broadcast_attached() sau khi cập nhật; đồng thời export public
+ *        usbmuxd_server_broadcast_attached() để jni_bridge_imd.c gọi
+ *        tường minh ngay sau update_udid() như một safety-net rõ ràng.
+ * ════════════════════════════════════════════════════════════════════
  */
 #include "usbmuxd_server.h"
 #include "usb_fd_bridge.h"
@@ -1374,6 +1400,109 @@ static void *tcp_server_thread(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ * FIX (báo cáo lỗi #2/#3/#7) — Broadcast "Attached" tới mọi client Listen
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * TRƯỚC ĐÂY: "Attached" event chỉ được gửi MỘT LẦN, ngay trong cùng thread
+ * xử lý client vừa gửi "Listen" (xem nhánh msg_type=="Listen" bên dưới).
+ * Điều này gây hai vấn đề:
+ *
+ *   (a) Nếu client đó đã disconnect trước khi kịp nhận event, hoặc
+ *       libusbmuxd tạo một kết nối "Listen" khác song song, server không
+ *       có cách nào gửi lại "Attached" cho các client Listen khác.
+ *
+ *   (b) UDID thật thường chỉ được biết SAU khi client đầu tiên đã Listen
+ *       xong (luồng thật: nativeSetUsbFd() → usbmuxd_server_start() với
+ *       UDID placeholder → nativeConnect() → idevice_new_with_options()
+ *       gửi Listen/ListDevices → device_get_udid() → update_udid()).
+ *       Client đã Listen từ bước 1 chỉ thấy UDID placeholder mãi mãi vì
+ *       không có cơ chế thông báo lại.
+ *
+ * FIX: giữ một danh sách mọi client fd đang ở trạng thái Listen
+ * (register_listener() khi nhận "Listen", unregister_listener() khi
+ * client đóng kết nối hoặc chuyển sang tunnel dữ liệu qua "Connect").
+ * broadcast_attached() gửi "Attached" event (dùng UDID mới nhất) tới toàn
+ * bộ danh sách này — được gọi từ usbmuxd_server_update_udid() và có thể
+ * gọi tường minh qua usbmuxd_server_broadcast_attached().
+ * ════════════════════════════════════════════════════════════════════════ */
+#define MAX_LISTEN_CLIENTS 16
+static pthread_mutex_t g_listen_lock            = PTHREAD_MUTEX_INITIALIZER;
+static int             g_listen_fds[MAX_LISTEN_CLIENTS];
+static int             g_listen_count           = 0;
+
+static void register_listener(int fd) {
+    pthread_mutex_lock(&g_listen_lock);
+    for (int i = 0; i < g_listen_count; i++) {
+        if (g_listen_fds[i] == fd) { pthread_mutex_unlock(&g_listen_lock); return; }
+    }
+    if (g_listen_count < MAX_LISTEN_CLIENTS) {
+        g_listen_fds[g_listen_count++] = fd;
+        LOGI("register_listener: fd=%d — tổng %d client đang Listen", fd, g_listen_count);
+    } else {
+        LOGE("register_listener: danh sách đầy (%d) — bỏ qua fd=%d", MAX_LISTEN_CLIENTS, fd);
+    }
+    pthread_mutex_unlock(&g_listen_lock);
+}
+
+static void unregister_listener(int fd) {
+    pthread_mutex_lock(&g_listen_lock);
+    for (int i = 0; i < g_listen_count; i++) {
+        if (g_listen_fds[i] == fd) {
+            g_listen_fds[i] = g_listen_fds[g_listen_count - 1];
+            g_listen_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_listen_lock);
+}
+
+static void broadcast_attached(void) {
+    int fds_copy[MAX_LISTEN_CLIENTS];
+    int count;
+
+    pthread_mutex_lock(&g_listen_lock);
+    count = g_listen_count;
+    memcpy(fds_copy, g_listen_fds, sizeof(int) * (size_t)count);
+    pthread_mutex_unlock(&g_listen_lock);
+
+    if (count == 0) return;
+
+    char *event = make_attached_event();
+    if (!event) return;
+
+    int dead[MAX_LISTEN_CLIENTS];
+    int dead_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (send_plist(fds_copy[i], 0, event) < 0) {
+            LOGE("broadcast_attached: gửi thất bại fd=%d — client có thể đã đóng", fds_copy[i]);
+            dead[dead_count++] = fds_copy[i];
+        }
+    }
+    free(event);
+
+    /* Dọn các fd đã chết khỏi danh sách (tránh cố gửi lại lần sau) */
+    if (dead_count > 0) {
+        pthread_mutex_lock(&g_listen_lock);
+        for (int i = 0; i < dead_count; i++) {
+            for (int j = 0; j < g_listen_count; j++) {
+                if (g_listen_fds[j] == dead[i]) {
+                    g_listen_fds[j] = g_listen_fds[g_listen_count - 1];
+                    g_listen_count--;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_listen_lock);
+    }
+
+    LOGI("broadcast_attached: đã gửi Attached event (UDID mới) tới %d client Listen", count);
+}
+
+void usbmuxd_server_broadcast_attached(void) {
+    broadcast_attached();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  * Client handler — xử lý một kết nối từ libimobiledevice
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -1417,12 +1546,22 @@ static void *handle_client(void *arg) {
              * accumulates over many reconnects / device list polls.
              */
             free(xml);  /* FIX: release the request plist body */
-            // FIX v22 Bug A: Gửi Attached event ngay sau khi Listen OK
-            char *attached_event = make_attached_event();
-            if (attached_event) {
-                send_plist(client_fd, 0, attached_event); // tag=0 cho events
-                free(attached_event);
-            }
+
+            /*
+             * FIX (báo cáo lỗi #2/#3): trước đây chỉ gửi "Attached" một lần
+             * ngay tại đây cho riêng client này rồi thôi — không track lại
+             * client_fd ở đâu cả, nên nếu UDID cập nhật sau (real UDID từ
+             * idevice_get_udid()) thì client này (và mọi client Listen
+             * khác) không bao giờ nhận được event mới.
+             *
+             * Fix: đăng ký client_fd vào danh sách "đang Listen" rồi dùng
+             * broadcast_attached() — gửi ngay lập tức (đúng hành vi cũ,
+             * client mới Listen vẫn cần Attached ngay) NHƯNG cũng tự động
+             * gửi lại cho MỌI client khác mỗi khi UDID được cập nhật qua
+             * usbmuxd_server_update_udid()/usbmuxd_server_broadcast_attached().
+             */
+            register_listener(client_fd);
+            broadcast_attached(); // FIX v22 Bug A: Gửi Attached event ngay sau khi Listen OK (tới mọi client Listen)
         } else if (strcmp(msg_type, "ListDevices") == 0) {
             char *resp = make_device_list();
             if (resp) { send_plist(client_fd, hdr.tag, resp); free(resp); }
@@ -1459,6 +1598,17 @@ static void *handle_client(void *arg) {
             free(xml);
 
             LOGI("client fd=%d: Connect port_be=%ld → port=%d", client_fd, port_be, port);
+
+            /*
+             * FIX (an toàn cho broadcast_attached()): nếu client_fd này
+             * từng gửi "Listen" trước đó trên cùng kết nối (không phải
+             * pattern thường gặp, nhưng phải phòng thủ), gỡ nó khỏi danh
+             * sách broadcast NGAY trước khi chuyển fd sang chế độ tunnel
+             * dữ liệu thô. Nếu không, một lần usbmuxd_server_update_udid()
+             * xảy ra giữa lúc tunnel đang chạy sẽ ghi đè plist "Attached"
+             * chồng lên luồng byte TCP thô → hỏng dữ liệu tunnel.
+             */
+            unregister_listener(client_fd);
 
             /*
              * FIX v22 Bug B+C: Dùng v1 TCP handshake thay vì v0 binary CONNECT
@@ -1519,6 +1669,15 @@ static void *handle_client(void *arg) {
             if (resp) { send_plist(client_fd, hdr.tag, resp); free(resp); }
         }
     }
+
+    /*
+     * FIX (báo cáo lỗi #2/#3): gỡ client_fd khỏi danh sách broadcast khi
+     * đóng kết nối — tránh broadcast_attached() cố gửi vào fd đã đóng ở
+     * lần cập nhật UDID kế tiếp (dead_count cleanup trong broadcast_attached()
+     * cũng xử lý việc này, nhưng gỡ ngay tại đây tránh cửa sổ race và log
+     * lỗi gửi thất bại không cần thiết).
+     */
+    unregister_listener(client_fd);
 
     // Gửi Detached event khi client đóng kết nối
     char *detached_event = make_detached_event();
@@ -1694,6 +1853,21 @@ void usbmuxd_server_update_udid(const char *udid) {
     g_udid[63] = '\0';
     pthread_mutex_unlock(&g_udid_mutex);
     LOGI("usbmuxd_server_update_udid: %s", g_udid);
+
+    /*
+     * FIX (báo cáo lỗi #3): trước đây hàm này DỪNG LẠI Ở ĐÂY — chỉ cập
+     * nhật g_udid trong bộ nhớ mà không thông báo cho bất kỳ client nào
+     * đang Listen. Khi nativeConnect() gọi idevice_get_udid() rồi gọi hàm
+     * này để cập nhật UDID thật (thay vì UDID placeholder lúc
+     * usbmuxd_server_start()), mọi client đã Listen từ trước đó (VD:
+     * chính idevice_new_with_options() vừa mới Listen để lấy device list
+     * ban đầu) không bao giờ nhận được UDID mới → vẫn thấy UDID placeholder
+     * trong DeviceList của họ.
+     *
+     * Fix: gửi lại "Attached" event (với UDID mới) cho MỌI client đang
+     * Listen ngay sau khi cập nhật xong.
+     */
+    broadcast_attached();
 }
 
 const char *usbmuxd_server_socket_path(void) {

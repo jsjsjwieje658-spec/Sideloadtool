@@ -497,6 +497,19 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         /* FIX: dùng update_udid thay vì restart (tránh race condition) */
         usbmuxd_server_update_udid(g_udid);
 
+        /*
+         * FIX (báo cáo lỗi #7): usbmuxd_server_update_udid() giờ đã tự
+         * broadcast "Attached" (UDID mới) cho mọi client đang Listen bên
+         * trong nó, nhưng gọi tường minh usbmuxd_server_broadcast_attached()
+         * ở đây — ngay sau khi UDID thật được xác nhận qua
+         * idevice_get_udid() — như một safety-net rõ ràng ở tầng JNI, đảm
+         * bảo libusbmuxd (và bất kỳ client nào khác đang mở kết nối tới
+         * server nội bộ) luôn được thông báo lại ngay khi UDID thật sẵn
+         * sàng, thay vì phụ thuộc hoàn toàn vào side-effect bên trong
+         * update_udid().
+         */
+        usbmuxd_server_broadcast_attached();
+
         char msg[128];
         snprintf(msg, sizeof(msg), "[imd] \u2705 iPhone UDID: %s", g_udid);
         emit_log(msg);

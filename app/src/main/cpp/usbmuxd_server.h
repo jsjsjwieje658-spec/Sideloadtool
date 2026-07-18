@@ -65,8 +65,31 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
 /*
  * usbmuxd_server_update_udid — cập nhật UDID sau khi đã biết (gọi sau
  * idevice_get_udid()). Server cần UDID thật để ListDevices trả về đúng.
+ *
+ * FIX (báo cáo lỗi #2/#3): trước đây hàm này chỉ ghi đè g_udid trong bộ
+ * nhớ mà không thông báo cho bất kỳ client nào đang Listen — các client
+ * đã nhận "Attached" event trước đó (thường mang UDID placeholder
+ * "00000000-...") sẽ không bao giờ biết UDID thật đã sẵn sàng. Giờ đây
+ * hàm này tự động gọi broadcast lại "Attached" event (UDID mới) cho MỌI
+ * client đang Listen ngay sau khi cập nhật xong.
  */
 void usbmuxd_server_update_udid(const char *udid);
+
+/*
+ * usbmuxd_server_broadcast_attached — gửi lại "Attached" event (với UDID
+ * hiện tại) cho MỌI client đang Listen.
+ *
+ * FIX (báo cáo lỗi #2/#3/#7): trước đây "Attached" chỉ được gửi MỘT LẦN,
+ * ngay sau khi một client cụ thể gửi "Listen" — nếu client đó đã
+ * disconnect, hoặc UDID thật chỉ được biết SAU đó (qua idevice_get_udid()),
+ * không có cơ chế nào thông báo lại cho các client đang Listen khác.
+ *
+ * usbmuxd_server_update_udid() đã tự gọi hàm này, nhưng nó cũng được
+ * export public để nơi gọi (VD: jni_bridge_imd.c ngay sau
+ * idevice_get_udid() + usbmuxd_server_update_udid()) có thể chủ động gọi
+ * lại như một safety-net tường minh, khớp đúng luồng usbmuxd thật.
+ */
+void usbmuxd_server_broadcast_attached(void);
 
 /*
  * usbmuxd_server_socket_path — trả đường dẫn đến Unix socket.
