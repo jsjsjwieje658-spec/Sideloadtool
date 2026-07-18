@@ -410,51 +410,122 @@ static int usb_write(const void *buf, int len) {
     return usb_bridge_bulk_write(buf, len, 5000);
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * FIX v29 (ROOT CAUSE — thay thế toàn bộ v20-v28): buffered USB read layer
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * NGUYÊN NHÂN GỐC của mọi lần "version exchange thất bại" / "SYN+ACK không
+ * nhận được" xuyên suốt các bản v20-v28 (đã thử timeout dài hơn, nhiều retry
+ * hơn, clear_halt, flush, full re-init — KHÔNG bản nào sửa được vì không
+ * bản nào đụng đến nguyên nhân thật):
+ *
+ *   usb_read_exact() cũ gọi usb_bridge_bulk_read() TRỰC TIẾP với độ dài
+ *   CHÍNH XÁC nhỏ — ví dụ đọc 16 byte mux-header trước, rồi mới đọc riêng
+ *   20 byte TCP-header, rồi mới đọc riêng phần data (xem usb_recv_version()
+ *   và usb_recv_tcp()).
+ *
+ *   Nhưng iPhone không gửi từng phần nhỏ như vậy — nó ghi CẢ message
+ *   (mux header + tcp header + data, hoặc mux header + version body) trong
+ *   MỘT lần write()/URB duy nhất phía thiết bị. Khi ta yêu cầu libusb đọc
+ *   chỉ 16 byte trong khi iPhone đã đẩy 32+ byte vào CÙNG một gói USB,
+ *   libusb/kernel trả về LIBUSB_ERROR_OVERFLOW (-8) — đây là lỗi "device
+ *   gửi nhiều hơn buffer host yêu cầu", KHÔNG PHẢI lỗi tạm thời như PIPE
+ *   hay timeout (xem libusb docs: "Packets and overflows"). Dữ liệu bị mất,
+ *   usb_bridge_bulk_read() không retry lỗi này (chỉ retry PIPE) → thất bại
+ *   NHẤT QUÁN 100% mỗi lần, đúng như log cho thấy (5/5 attempt đều thất bại
+ *   giống hệt nhau — không phải flaky, mà là lỗi tất định).
+ *
+ * GIẢI PHÁP (giống hệt buf_read()/rxbuf đã dùng ĐÚNG trong usbmux.c —
+ * Mode 2/3 chưa từng bị lỗi này vì nó vốn đã đọc theo kiểu buffer lớn):
+ *
+ *   Đọc vào MỘT buffer nội bộ LỚN (64KB — bội số của max packet size nên
+ *   theo đúng khuyến cáo libusb, KHÔNG BAO GIỜ overflow: "you will never
+ *   see an overflow if your transfer buffer size is a multiple of the
+ *   endpoint's packet size") bằng MỘT lệnh usb_bridge_bulk_read() duy nhất,
+ *   rồi phục vụ mọi usb_read_exact() từ buffer đó — chỉ gọi bulk_read() mới
+ *   khi buffer đã cạn. Mutex bảo vệ buffer dùng chung giữa nhiều thread
+ *   (thread_sock_to_usb / thread_usb_to_sock / do_usb_v1_connect).
+ * ════════════════════════════════════════════════════════════════════════ */
+#define USB_RXBUF_SIZE 65536
+static pthread_mutex_t g_usb_rx_lock    = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t          g_usb_rxbuf[USB_RXBUF_SIZE];
+static int               g_usb_rxbuf_pos   = 0;
+static int               g_usb_rxbuf_avail = 0;
+
+/*
+ * usb_rx_buf_reset — xoá sạch buffer nội bộ. PHẢI gọi mỗi khi bắt đầu một
+ * USB session mới (fd mới / sau full re-init) để tránh byte "rác" còn sót
+ * từ session/lần thử trước bị hiểu nhầm là dữ liệu của session mới.
+ * Gọi từ usbmuxd_server_reset_version_state() — nơi vốn đã được gọi đúng
+ * tại mọi điểm bắt đầu session mới trong jni_bridge_imd.c.
+ */
+static void usb_rx_buf_reset(void) {
+    pthread_mutex_lock(&g_usb_rx_lock);
+    g_usb_rxbuf_pos   = 0;
+    g_usb_rxbuf_avail = 0;
+    pthread_mutex_unlock(&g_usb_rx_lock);
+}
+
 static int usb_read_exact(void *buf, int len, int timeout_ms) {
     char *p = (char *)buf;
     int got = 0;
+
     /*
-     * FIX Bug A (Critical): "retry" PHẢI là biến cục bộ.
-     * Trước đây khai báo `static int retry` khiến counter dùng CHUNG
-     * giữa MỌI cuộc gọi và MỌI thread (thread_sock_to_usb, thread_usb_to_sock,
-     * do_usb_v1_connect...). Kết quả: retry tích luỹ qua các lần gọi khác
-     * nhau thay vì reset mỗi lần usb_read_exact() mới — với timeout_ms=3000
-     * và max_retry=50 cũ, một lần đọc bị stall có thể hang tới 150 giây
-     * (50 × 3000ms) thay vì fail nhanh và trả lỗi.
-     *
-     * FIX v24 Bug E: usb_bridge_bulk_read() trả -1 cho lỗi tạm thời
-     * (LIBUSB_ERROR_PIPE sau khi libusb_wrap_sys_device — endpoint bị stall
-     * ngay sau init). Trước đây ta return -1 ngay lập tức mà không retry,
-     * khiến version exchange thất bại ngay lần đọc đầu tiên. Fix: retry
-     * tối đa 3 lần với 50ms delay trước khi từ bỏ.
+     * FIX Bug A (giữ nguyên): các counter retry PHẢI là biến cục bộ —
+     * không dùng `static` dùng chung giữa nhiều thread.
      */
-    int retry = 0; /* ✅ LOCAL — độc lập mỗi cuộc gọi/thread */
-    int err_retry = 0; /* retry cho lỗi I/O tạm thời từ bulk_read */
-    const int max_retries     = 12; /* timeout retries (max wait ~ 12 × timeout_ms) */
-    const int max_err_retries = 4;  /* I/O error retries trước khi từ bỏ */
+    int retry     = 0; /* timeout retries */
+    int err_retry = 0; /* lỗi I/O thật sự (không phải overflow — overflow
+                           giờ không còn xảy ra nhờ buffer 64KB ở trên) */
+    const int max_retries     = 12;
+    const int max_err_retries = 4;
+
+    pthread_mutex_lock(&g_usb_rx_lock);
     while (got < len) {
-        int n = usb_bridge_bulk_read(p + got, len - got, timeout_ms);
+        /* Phục vụ từ buffer nội bộ trước, nếu còn dữ liệu */
+        if (g_usb_rxbuf_avail > 0) {
+            int take = g_usb_rxbuf_avail < (len - got) ? g_usb_rxbuf_avail : (len - got);
+            memcpy(p + got, g_usb_rxbuf + g_usb_rxbuf_pos, (size_t)take);
+            g_usb_rxbuf_pos   += take;
+            g_usb_rxbuf_avail -= take;
+            got += take;
+            retry = 0;
+            err_retry = 0;
+            continue;
+        }
+
+        /*
+         * Buffer rỗng — nạp lại bằng MỘT lệnh đọc LỚN (64KB). Đây là điểm
+         * mấu chốt của fix: yêu cầu buffer luôn ≥ bất kỳ gói tin đơn lẻ nào
+         * iPhone có thể gửi → không bao giờ LIBUSB_ERROR_OVERFLOW nữa.
+         */
+        g_usb_rxbuf_pos = 0;
+        int n = usb_bridge_bulk_read(g_usb_rxbuf, USB_RXBUF_SIZE, timeout_ms);
         if (n < 0) {
-            /* Lỗi I/O — có thể tạm thời (LIBUSB_ERROR_PIPE sau wrap) */
-            if (++err_retry > max_err_retries) return -1;
-            usleep(50 * 1000); /* 50ms delay trước khi retry */
+            /* Lỗi I/O thật (VD: PIPE sau khi đã retry nội bộ hết) */
+            if (++err_retry > max_err_retries) {
+                pthread_mutex_unlock(&g_usb_rx_lock);
+                return -1;
+            }
+            usleep(50 * 1000);
             continue;
         }
         if (n == 0) {
-            /* timeout — thử lại, nhưng đếm retry cục bộ cho cuộc gọi này */
-            if (++retry > max_retries) return -1;
-            err_retry = 0; /* reset err_retry mỗi lần thấy progress */
+            /* timeout thật sự — không có dữ liệu nào để đọc */
+            if (++retry > max_retries) {
+                pthread_mutex_unlock(&g_usb_rx_lock);
+                return -1;
+            }
             continue;
         }
-        retry = 0;
-        err_retry = 0;
-        got += n;
+        g_usb_rxbuf_avail = n;
     }
+    pthread_mutex_unlock(&g_usb_rx_lock);
     return got;
 }
 
 static int usb_read_at_least(void *buf, int len, int timeout_ms) {
-    return usb_bridge_bulk_read(buf, len, timeout_ms);
+    return usb_read_exact(buf, len, timeout_ms);
 }
 
 /* ── Gửi v1 version packet ─────────────────────────────────────────────── */
@@ -734,6 +805,12 @@ bool usbmux_version_exchange(void) {
  */
 void usbmuxd_server_reset_version_state(void) {
     g_version_done = 0;
+    /*
+     * FIX v29: reset luôn buffer đọc nội bộ (xem usb_rx_buf_reset() ở trên).
+     * Bắt buộc — nếu không, byte còn sót trong buffer từ lần thử/USB fd
+     * trước có thể bị hiểu nhầm là dữ liệu hợp lệ của session mới.
+     */
+    usb_rx_buf_reset();
     LOGI("usbmuxd_server_reset_version_state: reset — session mới sẽ version exchange lại");
 }
 

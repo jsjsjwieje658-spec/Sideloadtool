@@ -222,9 +222,14 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
     // FIX: Tăng thời gian chờ ban đầu và số lần flush để đảm bảo endpoint ổn định hơn.
     // Thêm log chi tiết hơn để chẩn đoán.
     /*
-     * FIX v28: Thời gian chờ ban đầu giảm từ 3000ms → 500ms vì
-     * libusb_reset_device() trong usb_bridge_init_from_fd() đã đảm bảo
-     * endpoint sạch. Chờ lâu hơn trong outer retry loop bên dưới.
+     * FIX v28: Thời gian chờ ban đầu giảm từ 3000ms → 500ms.
+     *
+     * LƯU Ý (sửa comment sai — không có thay đổi hành vi): usb_fd_bridge.c
+     * KHÔNG gọi libusb_reset_device() (đã bị gỡ bỏ hoàn toàn — xem "FIX
+     * Bug 3 — CRITICAL" trong usb_bridge_init_from_fd(), vì reset_device()
+     * làm fd của Android bị invalid). Endpoint sạch nhờ clear_halt() +
+     * flush ở usb_bridge_init_from_fd(), không phải nhờ reset_device().
+     * Chờ lâu hơn trong outer retry loop bên dưới nếu cần.
      */
     emit_log("[usb] FIX v28: clear endpoint halts trước khi settle...");
     usb_bridge_clear_endpoints_halt();
