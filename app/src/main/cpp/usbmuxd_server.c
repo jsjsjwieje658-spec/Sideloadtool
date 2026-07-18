@@ -759,7 +759,14 @@ static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
     thdr->ack    = htonl(st->remote_seq);
     thdr->off    = 0x50;  /* 20 bytes / 4 = 5 → 0x50 */
     thdr->flags  = flags;
-    thdr->window = htons(0x0200);  /* 512 — conservative */
+    /*
+     * FIX (Bug 5 — HIGH): TCP receive window 512 bytes (0x0200) is far too small.
+     * The lockdownd TLS certificate exchange payload regularly exceeds 512 bytes.
+     * When the iPhone's TCP stack sees window=512 it throttles/fragments the
+     * response into many tiny segments which stalls the connection before the
+     * Trust prompt is ever shown.  Use the maximum 16-bit window (64 KB).
+     */
+    thdr->window = htons(0xFFFF);  /* FIX: 65535 bytes — full 16-bit window */
     thdr->cksum  = 0;
     thdr->urgp   = 0;
 
@@ -1157,6 +1164,12 @@ static void *handle_client(void *arg) {
                 send_plist(client_fd, hdr.tag, resp);
                 free(resp);
             }
+            /*
+             * FIX (Bug 6 — HIGH): free(xml) was MISSING here.
+             * Every Listen request body was leaked.  Non-fatal individually but
+             * accumulates over many reconnects / device list polls.
+             */
+            free(xml);  /* FIX: release the request plist body */
             // FIX v22 Bug A: Gửi Attached event ngay sau khi Listen OK
             char *attached_event = make_attached_event();
             if (attached_event) {

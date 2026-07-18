@@ -66,10 +66,7 @@
  * Server start() chỉ tạo thread — socket có thể chưa bind xong.
  * Chờ tối đa 3 giây (30 × 100ms).
  */
-/* FIX BONUS: Tăng timeout chờ server socket sẵn sàng từ 3s → 6s.
- * Trên Android low-end (RAM thấp, I/O chậm), thread server cần đến 4-5s
- * để bind socket và bắt đầu accept. 30 retries × 100ms = 3s là không đủ. */
-#define SOCKET_READY_RETRIES  60   /* tăng từ 30 → 60 (6s tổng) */
+#define SOCKET_READY_RETRIES  30
 #define SOCKET_READY_SLEEP_MS 100
 
 /* ── Global state ────────────────────────────────────────────────────────── */

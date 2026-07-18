@@ -67,7 +67,6 @@ object UsbTransport {
 
     @Volatile private var connection:       UsbDeviceConnection? = null
     @Volatile private var usbInterface:     UsbInterface?        = null
-    @Volatile private var usbConfiguration: UsbConfiguration?    = null
     @Volatile private var endpointIn:       UsbEndpoint?         = null
     @Volatile private var endpointOut:      UsbEndpoint?         = null
     @Volatile private var currentDevice:    UsbDevice?           = null
@@ -176,7 +175,6 @@ object UsbTransport {
          */
         connection      = conn
         usbInterface    = found.iface
-        usbConfiguration = found.config
         endpointIn      = found.epIn
         endpointOut     = found.epOut
         currentDevice   = device
@@ -211,21 +209,32 @@ object UsbTransport {
 
         Log.i(TAG, "prepareForBulkTransfers: claiming interface ${iface.id}...")
 
-        /* FIX ROOT CAUSE #4: setConfiguration() trước claimInterface().
-         * Một số Android OEM (Samsung Exynos, MediaTek) không tự đặt USB device
-         * vào đúng configuration khi openDevice() được gọi. Thiếu setConfiguration()
-         * khiến claimInterface() thất bại hoặc bulkTransfer() trả -1 liên tục.
-         * FIX_NOTES.md đề cập fix này nhưng chưa implement trong code. */
+        /*
+         * FIX (Bug 7 — HIGH): setConfiguration() must be called BEFORE claimInterface().
+         *
+         * Android does not guarantee that the active USB configuration is set when
+         * openDevice() returns.  On some OEM devices (MediaTek SoCs, some Samsung
+         * variants) the interface remains in an unconfigured state → claimInterface()
+         * fails with false even though the interface exists.
+         *
+         * The correct sequence (per Android USB Host API docs) is:
+         *   1. openDevice()
+         *   2. setConfiguration(cfg)   ← activate the configuration
+         *   3. claimInterface(iface)   ← now reliably succeeds
+         *
+         * We find the UsbConfiguration for the target interface via findUsbmuxIface()
+         * and call setConfiguration() before each claimInterface() attempt.
+         */
+        val found = findUsbmuxIface(currentDevice ?: run {
+            Log.e(TAG, "prepareForBulkTransfers: no currentDevice"); return false
+        }) ?: run {
+            Log.e(TAG, "prepareForBulkTransfers: usbmux iface not found"); return false
+        }
         try {
-            val cfg = usbConfiguration
-            if (cfg != null) {
-                val setConfResult = conn.setConfiguration(cfg)
-                Log.i(TAG, "setConfiguration(id=${cfg.id}) = $setConfResult")
-            } else {
-                Log.w(TAG, "setConfiguration() bỏ qua: chưa có UsbConfiguration (open() chưa gọi?)")
-            }
+            conn.setConfiguration(found.config)
+            Log.i(TAG, "prepareForBulkTransfers: setConfiguration(${found.config.id}) OK")
         } catch (e: Exception) {
-            Log.w(TAG, "setConfiguration() exception (non-fatal): ${e.message}")
+            Log.w(TAG, "prepareForBulkTransfers: setConfiguration exception (non-fatal): $e")
         }
 
         // Claim với retry (8 lần, exponential backoff)
@@ -280,7 +289,6 @@ object UsbTransport {
         try { connection?.close() } catch (_: Exception) {}
         connection      = null
         usbInterface    = null
-        usbConfiguration = null
         endpointIn      = null
         endpointOut     = null
         currentDevice   = null

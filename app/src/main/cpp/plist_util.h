@@ -17,9 +17,14 @@ void          plist_free   (plist_dict_t *d);
 
 /* ── Getters ───────────────────────────────────────────────────────────── */
 /* Trả con trỏ nội bộ — KHÔNG free, hợp lệ đến khi plist_free() */
-const char *plist_get_str     (const plist_dict_t *d, const char *key);
-/* FIX ROOT CAUSE #2: Read <data> type values (e.g. DevicePublicKey) */
-const char *plist_get_data_str(const plist_dict_t *d, const char *key);
+const char *plist_get_str (const plist_dict_t *d, const char *key);
+/*
+ * FIX (Bug 5): plist_get_data() trả str_val cho entries có type PTYPE_DATA
+ * (<data> tags). Apple lockdownd trả DevicePublicKey và certificates dưới
+ * dạng <data> không phải <string>.  plist_get_str() chỉ match PTYPE_STR
+ * nên luôn trả NULL cho những key đó — dẫn đến pairing thất bại hoàn toàn.
+ */
+const char *plist_get_data(const plist_dict_t *d, const char *key);
 int         plist_get_bool(const plist_dict_t *d, const char *key);
 long long   plist_get_int (const plist_dict_t *d, const char *key);
 

@@ -187,21 +187,27 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
 
     LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
 
-    /* FIX ROOT CAUSE #3: KHÔNG gọi libusb_reset_device().
+    /*
+     * FIX (Bug 3 — CRITICAL): libusb_reset_device() REMOVED.
      *
-     * libusb_reset_device() gây USB bus reset → iPhone ngắt kết nối khỏi
-     * Android USB host → Android nhận USB_DEVICE_DETACHED event → Android
-     * huỷ UsbDeviceConnection → fd không còn hợp lệ → mọi libusb operation
-     * sau đó thất bại với LIBUSB_ERROR_NO_DEVICE hoặc LIBUSB_ERROR_IO.
+     * PROBLEM: On Android, the fd comes from UsbDeviceConnection which the OS
+     * keeps alive for the same physical iPhone.  libusb_reset_device() issues a
+     * USB bus reset → iPhone re-enumerates as a NEW device with a new descriptor.
+     * The fd from UsbDeviceConnection is now stale (it references the old device
+     * descriptor).  Re-calling libusb_wrap_sys_device() with the same stale fd
+     * yields a broken libusb handle → ALL subsequent bulk transfers silently fail
+     * → lockdownd never connects → Trust popup never appears.
      *
-     * termux-usbmuxd KHÔNG cần reset vì nó nhận fd SẠCH (UsbAPI.java chỉ
-     * openDevice, không claim). Sideloadtool v27+ cũng dùng fd sạch
-     * (UsbTransport.open() không claimInterface nữa). Không cần reset.
+     * The reference implementation (termux-usbmuxd via UsbAPI.java) avoids this
+     * entirely by passing a FRESH fd for each session (openDevice() on each connect)
+     * and NEVER calling libusb_reset_device().  It relies only on libusb_clear_halt()
+     * to unstick endpoints.
      *
-     * Thay thế: dùng clear_halt + flush sau khi discover endpoints — đủ để
-     * xóa trạng thái STALL mà không gây re-enumeration.
+     * FIX: Remove reset_device entirely.  Use clear_halt only (see below).
+     * The proactive clear_halt block after discover_apple_endpoints() is sufficient
+     * to clear any stale STALL conditions without invalidating the fd.
      */
-    LOGI("usb_bridge_init: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3 — gây re-enum)");
+    LOGI("usb_bridge_init: skipping libusb_reset_device (would invalidate Android fd) — using clear_halt only");
 
     if (!discover_apple_endpoints()) {
         LOGE("discover_apple_endpoints() thất bại");

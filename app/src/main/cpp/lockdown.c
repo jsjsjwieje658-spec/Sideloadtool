@@ -110,15 +110,20 @@ int lockdown_get_value(lockdown_t *ld, const char *domain,
         plist_free(resp);
         return -1;
     }
-    /* FIX ROOT CAUSE #2: Try <string> first, then <data>.
-     * Apple sends DevicePublicKey, DeviceCertificate etc. as <data> type.
-     * plist_get_str() returns NULL for <data> entries → pairing fails.
-     * Using plist_get_data_str() as fallback captures base64-encoded data. */
+    /*
+     * FIX (Bug 6 — CRITICAL): plist_get_str() chỉ match PTYPE_STR.
+     * Nhiều giá trị quan trọng từ lockdownd dùng <data> (PTYPE_DATA):
+     *   - DevicePublicKey → cần để build pair record
+     *   - RootCertificate, HostCertificate, DeviceCertificate
+     * Nếu plist_get_str() trả NULL, thử plist_get_data() trước khi fail.
+     * Nếu không có cả hai → pairing_do() thất bại ngay bước GetValue(DevicePublicKey)
+     * → Pair request không bao giờ được gửi → Trust popup không xuất hiện.
+     */
     const char *val = plist_get_str(resp, "Value");
-    if (!val) val = plist_get_data_str(resp, "Value");  /* <data> fallback */
+    if (!val) val = plist_get_data(resp, "Value");  /* FIX: also check <data> type */
     if (val && val_out) *val_out = strdup(val);
     plist_free(resp);
-    if (!val) LOGE("lockdown_get_value(%s): không tìm thấy Value (cả <string> và <data>)", key ? key : "all");
+    if (!val) LOGE("lockdown_get_value(%s): không tìm thấy trường Value trong response (STR hoặc DATA)", key ? key : "all");
     return val ? 0 : -1;
 }
 

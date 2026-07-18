@@ -70,38 +70,45 @@ static void jni_log(JNIEnv *env, const char *line) {
 }
 
 static void jni_log_ui_cb(const char *msg) {
-    if (!g_jvm) return;
     JNIEnv *env = NULL;
-    bool detach = false;
-    /* FIX ROOT CAUSE #1: GetEnv trả JNI_EDETACHED khi gọi từ Dispatchers.IO
-     * coroutine thread không attach vào JVM. Phải gọi AttachCurrentThread. */
-    jint jres = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
-    if (jres == JNI_EDETACHED) {
-        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != JNI_OK) return;
-        detach = true;
+    if (!g_jvm) return;
+    /*
+     * FIX (Bug 4 — CRITICAL): GetEnv() returns JNI_EDETACHED on native threads
+     * spawned by pthreads (usbmuxd_server threads, mux relay threads) that were
+     * never attached to the JVM.  When env == NULL we silently dropped every log
+     * from C threads.  Must call AttachCurrentThread so callbacks work everywhere.
+     */
+    jint get_env_rc = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
+    int did_attach = 0;
+    if (get_env_rc == JNI_EDETACHED) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) return;
+        did_attach = 1;
     }
     if (!env) return;
     jni_log(env, msg);
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    if (did_attach) (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
 /* ── USB bulk I/O callbacks ───────────────────────────────────────────────── */
 static int usb_bulk_write(const void *buf, int len) {
-    if (!g_jvm) { LOGE("usb_bulk_write: g_jvm NULL"); return -1; }
     JNIEnv *env = NULL;
-    bool detach = false;
-    /* FIX ROOT CAUSE #1 (CRITICAL): usb_bulk_write chạy trên Dispatchers.IO
-     * thread không attach vào JVM. GetEnv trả JNI_EDETACHED → env = NULL →
-     * return -1 → MỌI USB write thất bại → iPhone không nhận được packet nào.
-     * Đây là nguyên nhân chính khiến app không thể giao tiếp với iPhone. */
-    jint jres = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
-    if (jres == JNI_EDETACHED) {
-        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != JNI_OK) {
-            LOGE("usb_bulk_write: AttachCurrentThread thất bại"); return -1;
+    /*
+     * FIX (Bug 1 — CRITICAL): native threads (usbmuxd_server relay threads,
+     * pthreads spawned inside mux code) are NOT attached to the JVM.
+     * GetEnv() returns JNI_EDETACHED → env = NULL → every USB write returns -1
+     * → nothing is ever sent to the iPhone → Trust popup never appears.
+     * Must AttachCurrentThread so JNI calls work from any thread.
+     */
+    jint rc = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
+    int did_attach = 0;
+    if (rc == JNI_EDETACHED) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
+            LOGE("usb_bulk_write: AttachCurrentThread failed");
+            return -1;
         }
-        detach = true;
+        did_attach = 1;
     }
-    if (!env) { LOGE("usb_bulk_write: no JNIEnv sau attach"); return -1; }
+    if (!env) { LOGE("usb_bulk_write: no JNIEnv"); return -1; }
 
     jclass cls = (*env)->FindClass(env, "com/superalpha/sideload/bridge/UsbTransport");
     if (!cls) { LOGE("usb_bulk_write: no UsbTransport"); return -1; }
@@ -114,30 +121,29 @@ static int usb_bulk_write(const void *buf, int len) {
     jint result = (*env)->CallStaticIntMethod(env, cls, mid, jarr, (jint)5000);
     (*env)->DeleteLocalRef(env, jarr);
     (*env)->DeleteLocalRef(env, cls);
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionClear(env);
-        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-        return -1;
-    }
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); if (did_attach) (*g_jvm)->DetachCurrentThread(g_jvm); return -1; }
+    if (did_attach) (*g_jvm)->DetachCurrentThread(g_jvm);
     return (int)result;
 }
 
 static int usb_bulk_read(void *buf, int len) {
-    if (!g_jvm) { LOGE("usb_bulk_read: g_jvm NULL"); return -1; }
     JNIEnv *env = NULL;
-    bool detach = false;
-    /* FIX ROOT CAUSE #1 (CRITICAL): Giống usb_bulk_write — mọi USB read
-     * từ mux_recv()/buf_read() đều trả -1 trên non-JVM threads → không đọc
-     * được phản hồi từ iPhone → kết nối luôn thất bại. */
-    jint jres = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
-    if (jres == JNI_EDETACHED) {
-        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != JNI_OK) {
-            LOGE("usb_bulk_read: AttachCurrentThread thất bại"); return -1;
+    /*
+     * FIX (Bug 2 — CRITICAL): same attach problem as usb_bulk_write.
+     * GetEnv() returns JNI_EDETACHED on native threads → env = NULL →
+     * every USB read returns -1 → iPhone response packets are never
+     * received → lockdown handshake hangs → Trust popup never appears.
+     */
+    jint rc = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
+    int did_attach = 0;
+    if (rc == JNI_EDETACHED) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
+            LOGE("usb_bulk_read: AttachCurrentThread failed");
+            return -1;
         }
-        detach = true;
+        did_attach = 1;
     }
-    if (!env) { LOGE("usb_bulk_read: no JNIEnv sau attach"); return -1; }
+    if (!env) { LOGE("usb_bulk_read: no JNIEnv"); return -1; }
 
     jclass cls = (*env)->FindClass(env, "com/superalpha/sideload/bridge/UsbTransport");
     if (!cls) { LOGE("usb_bulk_read: no UsbTransport"); return -1; }
@@ -150,12 +156,8 @@ static int usb_bulk_read(void *buf, int len) {
     if (n > 0) (*env)->GetByteArrayRegion(env, jarr, 0, n, (jbyte*)buf);
     (*env)->DeleteLocalRef(env, jarr);
     (*env)->DeleteLocalRef(env, cls);
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionClear(env);
-        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-        return -1;
-    }
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); if (did_attach) (*g_jvm)->DetachCurrentThread(g_jvm); return -1; }
+    if (did_attach) (*g_jvm)->DetachCurrentThread(g_jvm);
     return (int)n;
 }
 
