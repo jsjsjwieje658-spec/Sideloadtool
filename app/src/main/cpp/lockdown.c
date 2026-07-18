@@ -110,15 +110,10 @@ int lockdown_get_value(lockdown_t *ld, const char *domain,
         plist_free(resp);
         return -1;
     }
-    /* FIX ROOT CAUSE #2: Try <string> first, then <data>.
-     * Apple sends DevicePublicKey, DeviceCertificate etc. as <data> type.
-     * plist_get_str() returns NULL for <data> entries → pairing fails.
-     * Using plist_get_data_str() as fallback captures base64-encoded data. */
     const char *val = plist_get_str(resp, "Value");
-    if (!val) val = plist_get_data_str(resp, "Value");  /* <data> fallback */
     if (val && val_out) *val_out = strdup(val);
     plist_free(resp);
-    if (!val) LOGE("lockdown_get_value(%s): không tìm thấy Value (cả <string> và <data>)", key ? key : "all");
+    if (!val) LOGE("lockdown_get_value(%s): không tìm thấy trường Value trong response", key ? key : "all");
     return val ? 0 : -1;
 }
 

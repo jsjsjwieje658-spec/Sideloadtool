@@ -187,22 +187,6 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
 
     LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
 
-    /* FIX ROOT CAUSE #3: KHÔNG gọi libusb_reset_device().
-     *
-     * libusb_reset_device() gây USB bus reset → iPhone ngắt kết nối khỏi
-     * Android USB host → Android nhận USB_DEVICE_DETACHED event → Android
-     * huỷ UsbDeviceConnection → fd không còn hợp lệ → mọi libusb operation
-     * sau đó thất bại với LIBUSB_ERROR_NO_DEVICE hoặc LIBUSB_ERROR_IO.
-     *
-     * termux-usbmuxd KHÔNG cần reset vì nó nhận fd SẠCH (UsbAPI.java chỉ
-     * openDevice, không claim). Sideloadtool v27+ cũng dùng fd sạch
-     * (UsbTransport.open() không claimInterface nữa). Không cần reset.
-     *
-     * Thay thế: dùng clear_halt + flush sau khi discover endpoints — đủ để
-     * xóa trạng thái STALL mà không gây re-enumeration.
-     */
-    LOGI("usb_bridge_init: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3 — gây re-enum)");
-
     if (!discover_apple_endpoints()) {
         LOGE("discover_apple_endpoints() thất bại");
         libusb_close(g_handle);
