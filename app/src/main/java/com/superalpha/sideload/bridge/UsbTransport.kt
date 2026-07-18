@@ -209,6 +209,18 @@ object UsbTransport {
 
         Log.i(TAG, "prepareForBulkTransfers: claiming interface ${iface.id}...")
 
+        /* FIX ROOT CAUSE #4: setConfiguration() trước claimInterface().
+         * Một số Android OEM (Samsung Exynos, MediaTek) không tự đặt USB device
+         * vào đúng configuration khi openDevice() được gọi. Thiếu setConfiguration()
+         * khiến claimInterface() thất bại hoặc bulkTransfer() trả -1 liên tục.
+         * FIX_NOTES.md đề cập fix này nhưng chưa implement trong code. */
+        try {
+            val setConfResult = conn.setConfiguration(1)
+            Log.i(TAG, "setConfiguration(1) = $setConfResult")
+        } catch (e: Exception) {
+            Log.w(TAG, "setConfiguration() exception (non-fatal): ${e.message}")
+        }
+
         // Claim với retry (8 lần, exponential backoff)
         var claimed = false
         val delays = longArrayOf(0, 150, 300, 500, 800, 1200, 1800, 2500)

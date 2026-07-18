@@ -249,6 +249,27 @@ const char *plist_get_str(const plist_dict_t *d, const char *key) {
     return NULL;
 }
 
+/*
+ * FIX ROOT CAUSE #2 (CRITICAL): plist_get_data_str()
+ *
+ * Apple lockdownd trả DevicePublicKey dưới dạng <data>BASE64</data>, KHÔNG
+ * phải <string>. Hàm plist_get_str() chỉ match PTYPE_STR nên LUÔN trả NULL
+ * cho trường này. Kết quả: pairing_do() gọi lockdown_get_value("DevicePublicKey")
+ * → nhận NULL → không thể tạo cert chain → pairing LUÔN thất bại.
+ *
+ * Hàm này trả base64 thô (chưa decode) của trường <data>. Caller tự decode.
+ * Con trỏ hợp lệ đến khi plist_free() được gọi.
+ */
+const char *plist_get_data_str(const plist_dict_t *d, const char *key) {
+    if (!d || !key) return NULL;
+    for (int i = 0; i < d->count; i++) {
+        if (d->entries[i].type == PTYPE_DATA &&
+            strcmp(d->entries[i].key, key) == 0)
+            return d->entries[i].str_val;
+    }
+    return NULL;
+}
+
 int plist_get_bool(const plist_dict_t *d, const char *key) {
     if (!d || !key) return 0;
     for (int i = 0; i < d->count; i++) {

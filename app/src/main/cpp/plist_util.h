@@ -17,7 +17,9 @@ void          plist_free   (plist_dict_t *d);
 
 /* ── Getters ───────────────────────────────────────────────────────────── */
 /* Trả con trỏ nội bộ — KHÔNG free, hợp lệ đến khi plist_free() */
-const char *plist_get_str (const plist_dict_t *d, const char *key);
+const char *plist_get_str     (const plist_dict_t *d, const char *key);
+/* FIX ROOT CAUSE #2: Read <data> type values (e.g. DevicePublicKey) */
+const char *plist_get_data_str(const plist_dict_t *d, const char *key);
 int         plist_get_bool(const plist_dict_t *d, const char *key);
 long long   plist_get_int (const plist_dict_t *d, const char *key);
 

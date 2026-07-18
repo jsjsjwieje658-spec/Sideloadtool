@@ -1,6 +1,8 @@
 package com.superalpha.sideload.ui
 
 import android.hardware.usb.UsbManager
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -8,9 +10,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PhoneIphone
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -21,6 +26,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.superalpha.sideload.bridge.NativeLog
@@ -48,9 +54,11 @@ import com.superalpha.sideload.bridge.UsbPermissionManager
 @Composable
 fun PairingScreen(viewModel: HomeViewModel) {
     val context = LocalContext.current
-    val logLines    by viewModel.log.collectAsState()
+    val logLines     by viewModel.log.collectAsState()
     val usbConnected by viewModel.usbConnected.collectAsState()
-    val busy        by viewModel.busy.collectAsState()
+    val busy         by viewModel.busy.collectAsState()
+    /* FIX v28: Observe trustRequired để hiện hướng dẫn inline trong PairingScreen */
+    val trustRequired by viewModel.trustRequired.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text(
@@ -98,6 +106,85 @@ fun PairingScreen(viewModel: HomeViewModel) {
         )
 
         Spacer(Modifier.height(24.dp))
+
+        /*
+         * FIX v28: Hiển thị hướng dẫn Trust inline trong PairingScreen.
+         *
+         * VẤN ĐỀ CŨ: Trust notification chỉ được set vào StateFlow nhưng
+         * không có UI nào observe để hiện. Người dùng không biết phải bấm Trust.
+         * Navigation.kt đã thêm TrustBanner toàn màn hình, nhưng cũng cần
+         * hướng dẫn chi tiết ở màn hình Pairing để giải thích các bước cụ thể.
+         *
+         * Card này hiện khi: (a) đang trong quá trình ghép nối (busy=true)
+         * hoặc (b) NativeBridge.trustRequired=true. Nó mô tả rõ các bước
+         * người dùng cần làm trên iPhone.
+         */
+        if (trustRequired || (busy && usbConnected)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = if (trustRequired) Color(0xFFE65100) else Color(0xFF1565C0),
+                        shape = MaterialTheme.shapes.medium
+                    )
+                    .padding(16.dp)
+            ) {
+                if (trustRequired) {
+                    /* Trạng thái đang chờ Trust — hướng dẫn cụ thể */
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Filled.PhoneIphone,
+                                contentDescription = null,
+                                tint = Color.White
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "⏳ Đang chờ xác nhận 'Tin cậy' trên iPhone",
+                                color = Color.White,
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "1. Mở khoá iPhone (không để màn hình tối)\n" +
+                            "2. Bấm 'Tin cậy Máy tính này' trên popup vừa xuất hiện\n" +
+                            "3. Nhập mã PIN nếu được yêu cầu\n" +
+                            "4. Bấm 'Đã bấm Trust' bên dưới để tiếp tục",
+                            color = Color.White.copy(alpha = 0.9f),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Button(
+                            onClick = { viewModel.dismissTrust() },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.White,
+                                contentColor = Color(0xFFE65100)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Đã bấm Trust ✓")
+                        }
+                    }
+                } else {
+                    /* Đang ghép nối — hiện hướng dẫn chuẩn bị */
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            color = Color.White,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.width(20.dp).height(20.dp)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Đang kết nối... Giữ iPhone mở khoá và sẵn sàng bấm 'Trust'",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+        }
 
         // FIX v21 (Bug 5): Dùng viewModel.connectAndPair() thay vì DeviceNative.connectAndPair()
         // viewModel.connectAndPair() dùng cùng bridge instance và tự gọi connect() trước.
