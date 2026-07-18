@@ -1,0 +1,11 @@
+libdir=/home/runner/work/Sideloadtool/Sideloadtool/app/src/main/cpp/prebuilt/arm64-v8a/lib
+includedir=/home/runner/work/Sideloadtool/Sideloadtool/app/src/main/cpp/prebuilt/arm64-v8a/include
+enginesdir=/home/runner/work/Sideloadtool/Sideloadtool/app/src/main/cpp/prebuilt/arm64-v8a/lib/engines-3
+modulesdir=/home/runner/work/Sideloadtool/Sideloadtool/app/src/main/cpp/prebuilt/arm64-v8a/lib/ossl-modules
+
+Name: OpenSSL-libcrypto
+Description: OpenSSL cryptography library
+Version: 3.3.1
+Libs: -L${libdir} -lcrypto
+Libs.private: -ldl -pthread
+Cflags: -I${includedir}

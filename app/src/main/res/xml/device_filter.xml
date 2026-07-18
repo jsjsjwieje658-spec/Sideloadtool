@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Matches any USB device with Apple's vendor ID (0x05AC = 1452), regardless of
+    product ID, so any iPhone/iPad model is recognized. This drives:
+      1. The USB_DEVICE_ATTACHED intent-filter on MainActivity (so plugging in a
+         phone can auto-launch the app).
+      2. Nothing else — the actual interface/endpoint selection (class 255,
+         subclass 254, protocol 2 — Apple's proprietary "usbmux" function) is done
+         in code at runtime, see UsbTransport.kt.
+-->
+<resources>
+    <usb-device vendor-id="1452" />
+</resources>

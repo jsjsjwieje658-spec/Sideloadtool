@@ -1,0 +1,33 @@
+/**
+ * python-config.gradle  (Groovy DSL)
+ *
+ * File này tách riêng cấu hình Chaquopy ra khỏi app/build.gradle.kts vì
+ * Kotlin DSL không thể giải quyết extension `python {}` mà Chaquopy thêm
+ * động vào DefaultConfig (dynamic Groovy extension → không có type-safe
+ * accessor được sinh ra khi compile .kts).
+ *
+ * Cách khắc phục chuẩn: đặt cấu hình vào file .gradle (Groovy DSL) rồi
+ * dùng `apply(from = "python-config.gradle")` trong .kts — Groovy dispatch
+ * động, thấy extension ngay khi chạy.
+ *
+ * Xem: https://chaquo.com/chaquopy/doc/current/android.html
+ */
+android {
+    defaultConfig {
+        python {
+            // FIX: Chỉ định rõ Python 3.11 để khớp với CI runner (GitHub Actions).
+            // Chaquopy mặc định 3.10 nhưng CI chỉ cài 3.11 nên build thất bại.
+            version "3.11"
+
+            // Gói Python cần thiết cho apple_auth.py / developer_api.py / sideload_core.py:
+            //   requests     — HTTP client (tất cả Apple API calls)
+            //   cryptography — RSA/ECDSA cho CertHelper và device_link SSL
+            //   srp          — SRP auth cho Apple ID login (apple_auth.py)
+            pip {
+                install 'requests'
+                install 'cryptography'
+                install 'srp'
+            }
+        }
+    }
+}

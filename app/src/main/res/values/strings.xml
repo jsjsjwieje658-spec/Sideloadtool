@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SUPER ALPHA Sideload</string>
+    <string name="usb_service_channel_name">Kết nối iPhone (USB)</string>
+    <string name="usb_service_notification_title">Đang duy trì kết nối USB với iPhone</string>
+</resources>

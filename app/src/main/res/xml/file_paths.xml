@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Khai báo thư mục app-private mà FileProvider được phép cấp quyền tạm thời
+    khi chia sẻ (Intent.ACTION_SEND). Dùng cho tab "Ghép nối" để chia sẻ/lưu
+    file pairing .plist đã xuất (nằm dưới filesDir/exported_pairing/).
+-->
+<paths>
+    <files-path name="exported_pairing" path="exported_pairing/" />
+</paths>

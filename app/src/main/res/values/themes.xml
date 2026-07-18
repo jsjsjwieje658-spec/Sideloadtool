@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose supplies the real theme (see ui/theme/Theme.kt); this base theme only
+         needs to exist so the manifest has a valid android:theme before Compose sets
+         its own content, and to control the splash/launch background. -->
+    <style name="Theme.SuperAlphaSideload" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_background</item>
+        <item name="android:statusBarColor">@color/brand_background</item>
+        <item name="android:navigationBarColor">@color/brand_background</item>
+    </style>
+</resources>

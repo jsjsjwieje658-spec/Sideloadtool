@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Marks this app as a USB host-mode app. required=true means the Play Store (or
+         any store) would hide this app from devices without USB host support — correct,
+         since the whole point of the app is talking to an iPhone over a USB-C/Lightning
+         cable. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Needed to show the "USB connection active" notification for the foreground
+         service that keeps the raw USB link alive while the app is backgrounded. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <application
+        android:name=".SuperAlphaApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.SuperAlphaSideload"
+        android:usesCleartextTraffic="false"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Lets Android auto-launch (or offer to launch) this app the moment the
+                 user plugs an iPhone into the USB-C port, without needing to open the
+                 app manually first. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+
+        <!-- Foreground service that owns the UsbDeviceConnection and keeps pumping the
+             mux transport's background I/O thread even if the Activity is not in the
+             foreground (installing an app can take a while). -->
+        <service
+            android:name=".bridge.UsbBridgeService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- Cần cho tab "Ghép nối": chia sẻ/lưu file pairing .plist (nằm dưới
+             app-private storage) ra ngoài qua Intent.ACTION_SEND, vì Android
+             10+ chặn truy cập trực tiếp file:// URI từ app khác. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+</manifest>
