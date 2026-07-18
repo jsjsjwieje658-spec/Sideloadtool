@@ -55,11 +55,19 @@ endif()
 # =============================================================================
 if(BUILD_MODE EQUAL 1)
 
+  # LƯU Ý (dọn dẹp — không đổi hành vi runtime): usbmux.c đã bị GỠ khỏi danh
+  # sách này. Đó là implementation TCP-over-USB của Mode 2/3 (mux_conn_init,
+  # mux_connect, ...) — không có hàm nào trong usbmux.c được gọi bởi ba file
+  # dưới đây (đã kiểm chứng bằng grep, không có tham chiếu "mux_conn_" hay
+  # #include "usbmux.h"). Mode 1 tự cài đặt lại v1 protocol của riêng nó ngay
+  # trong usbmuxd_server.c (usb_send_version/usb_recv_version/do_usb_v1_connect).
+  # Trước đây usbmux.c vẫn được build vào .so Mode 1 dù không dùng — không gây
+  # lỗi (không trùng tên symbol) nhưng làm phình file .so và dễ khiến người
+  # đọc sau này tưởng nhầm đây là code đang chạy thật.
   add_library(sideloadnative SHARED
     jni_bridge_imd.c    # JNI API: nativeInit/Connect/Pair/Sideload (libimobiledevice)
     usb_fd_bridge.c     # Android USB fd → libusb handle + endpoint discovery
-    usbmuxd_server.c    # Mini usbmuxd Unix socket server (cho libusbmuxd kết nối)
-    usbmux.c            # usbmux TCP-over-USB protocol (dùng bởi usbmuxd_server)
+    usbmuxd_server.c    # Mini usbmuxd Unix socket server + v1 USB protocol (cho libusbmuxd kết nối)
   )
 
   # Import static libraries (thứ tự: cao → thấp level)

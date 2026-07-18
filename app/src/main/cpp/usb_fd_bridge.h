@@ -23,8 +23,14 @@
  *     hoặc LIBUSB_ERROR_BUSY (cả hai đều được xử lý đúng)
  *   - Proactive libusb_clear_halt() sau discover: bắt buộc
  *   - usb_bridge_clear_endpoints_halt(): có thể gọi lại bất cứ lúc nào
- *   - VERSION_TIMEOUT tăng lên 12000ms, MAX_SKIP tăng lên 20
- *   - rx_seq=0x0000 (đúng spec usbmuxd thật — tag=0)
+ *
+ * LƯU Ý (dọn doc — không đổi hành vi): dòng cũ ở đây từng ghi "rx_seq=0x0000"
+ * và các con số VERSION_TIMEOUT/MAX_SKIP của một bản fix đã lỗi thời. Giá trị
+ * ĐÚNG và đang chạy thật nằm trong usbmuxd_server.c: rx_seq=0xFFFF (xem "FIX
+ * v28 CRITICAL" trong usb_send_version() — 0x0000 đã được xác nhận SAI và gây
+ * regression một lần rồi), VERSION_TIMEOUT_MS=3000, MAX_SKIP=30. usb_fd_bridge.h
+ * không tự ý lặp lại các con số này nữa để tránh hai nơi lệch nhau — luôn coi
+ * usbmuxd_server.c là nguồn sự thật (source of truth) cho các hằng số đó.
  */
 #include <stdbool.h>
 #include <stdint.h>

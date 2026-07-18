@@ -231,9 +231,13 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
      * flush ở usb_bridge_init_from_fd(), không phải nhờ reset_device().
      * Chờ lâu hơn trong outer retry loop bên dưới nếu cần.
      */
-    emit_log("[usb] FIX v28: clear endpoint halts trước khi settle...");
+    emit_log("[usb] Clear endpoint halts trước khi settle...");
     usb_bridge_clear_endpoints_halt();
-    emit_log("[usb] Chờ USB endpoint sẵn sàng (500ms — sau reset)...");
+    /* Không có libusb_reset_device() nào chạy ở đây — usb_bridge_init_from_fd()
+     * cố tình KHÔNG reset device (xem "FIX Bug 3 — CRITICAL" trong
+     * usb_fd_bridge.c). Log cũ ghi "sau reset" là sai/gây hiểu lầm; endpoint
+     * sạch nhờ clear_halt() + flush ở trên, không phải nhờ reset. */
+    emit_log("[usb] Chờ USB endpoint ổn định (500ms)...");
     usleep(500 * 1000);
 
     emit_log("[usb] Flush stale USB data trước version exchange (15 packets, 100ms/packet)...");
@@ -290,9 +294,15 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
          * FIX v28: Full USB re-init — khác với v27 chỉ clear_halt + flush.
          *
          * usb_bridge_close() giải phóng toàn bộ libusb state (context, handle).
-         * usb_bridge_init_from_fd() khởi tạo lại từ đầu với cùng fd — bao gồm
-         * libusb_reset_device() để xóa stale state (FIX v28 trong usb_fd_bridge.c).
-         * Đây là cách tiếp cận của termux-usbmuxd: kill + restart usbmuxd process.
+         * usb_bridge_init_from_fd() khởi tạo lại từ đầu với cùng fd.
+         *
+         * SỬA COMMENT SAI (không đổi hành vi): bản trước ghi nhầm là bước này
+         * "bao gồm libusb_reset_device()". Điều đó KHÔNG ĐÚNG và đã bị xoá bỏ có
+         * chủ đích (xem "FIX Bug 3 — CRITICAL" trong usb_fd_bridge.c) vì reset
+         * làm fd do Android cấp bị invalid. Re-init ở đây chỉ là: đóng handle
+         * libusb cũ → mở lại libusb_wrap_sys_device() với CÙNG fd (fd vẫn sống
+         * vì Kotlin giữ UsbDeviceConnection) → discover + clear_halt lại từ đầu.
+         * Không có USB bus reset nào xảy ra trong toàn bộ vòng lặp này.
          */
         usb_bridge_close();
         snprintf(log_buf, sizeof(log_buf),
