@@ -519,6 +519,20 @@ static char *make_device_list(void) {
     return out;
 }
 
+
+static char *make_empty_device_list(void) {
+    char *out = NULL;
+    asprintf(&out,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"
+        "<plist version=\"1.0\"><dict>"
+        "<key>MessageType</key><string>Result</string>"
+        "<key>Number</key><integer>0</integer>"
+        "<key>DeviceList</key><array/>"
+        "</dict></plist>");
+    return out;
+}
 static char *make_connect_result(uint32_t code) {
     char *out = NULL;
     asprintf(&out,
@@ -1561,9 +1575,21 @@ static void *handle_client(void *arg) {
              * usbmuxd_server_update_udid()/usbmuxd_server_broadcast_attached().
              */
             register_listener(client_fd);
-            broadcast_attached(); // FIX v22 Bug A: Gửi Attached event ngay sau khi Listen OK (tới mọi client Listen)
+            /* FIX: Only broadcast Attached when real UDID is present. */
+            pthread_mutex_lock(&g_udid_mutex);
+            int has_udid = (g_udid[0] != '\0');
+            pthread_mutex_unlock(&g_udid_mutex);
+            if (has_udid) {
+                broadcast_attached();
+            } else {
+                LOGI("handle_listen: fd=%d registered, UDID not ready — will auto-broadcast later", client_fd);
+            }
         } else if (strcmp(msg_type, "ListDevices") == 0) {
-            char *resp = make_device_list();
+            /* FIX: Return empty list when UDID not ready. */
+            pthread_mutex_lock(&g_udid_mutex);
+            int has_udid = (g_udid[0] != '\0');
+            pthread_mutex_unlock(&g_udid_mutex);
+            char *resp = has_udid ? make_device_list() : make_empty_device_list();
             if (resp) { send_plist(client_fd, hdr.tag, resp); free(resp); }
             free(xml);
 
@@ -1895,3 +1921,4 @@ void usbmuxd_server_stop(void) {
     }
     LOGI("usbmuxd_server_stop: done");
 }
+

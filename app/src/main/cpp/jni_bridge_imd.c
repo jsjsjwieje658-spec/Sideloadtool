@@ -372,6 +372,33 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         emit_log(buf);
         /* Set env var ngay lập tức */
         setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_socket_path(), 1);
+
+        /* FIX CRITICAL: Fetch UDID early before nativeConnect() runs. */
+        setenv("USBMUXD_SOCKET_PATH", usbmuxd_server_socket_path(), 1);
+        usleep(300000); /* 300ms let server bind */
+
+        idevice_t temp_dev = NULL;
+        idevice_error_t early_err = idevice_new_with_options(&temp_dev, NULL, IDEVICE_LOOKUP_USBMUX);
+        if (early_err == IDEVICE_E_SUCCESS && temp_dev) {
+            char *early_udid = NULL;
+            if (idevice_get_udid(temp_dev, &early_udid) == IDEVICE_E_SUCCESS && early_udid) {
+                snprintf(buf, sizeof(buf),
+                         "[bridge] ✅ Early UDID obtained: %s", early_udid);
+                emit_log(buf);
+                strncpy(g_udid, early_udid, sizeof(g_udid) - 1);
+                g_udid[sizeof(g_udid) - 1] = '\0';
+                usbmuxd_server_update_udid(g_udid);
+                free(early_udid);
+            } else {
+                emit_log("[bridge] ⚠️ Early device found but no UDID yet");
+            }
+            idevice_free(temp_dev);
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "[bridge] ⚠️ Early idevice_new err=%d — will retry in nativeConnect()",
+                     (int)early_err);
+            emit_log(buf);
+        }
     } else {
         emit_log("[usbmuxd_srv] \u274c Không khởi động được server — kiểm tra filesDir và quyền ghi");
         return JNI_FALSE;
@@ -462,18 +489,18 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
      * chưa kịp process ListDevices request.
      */
     idevice_error_t err = IDEVICE_E_UNKNOWN_ERROR;
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < 30; attempt++) {
         enum idevice_options opts = IDEVICE_LOOKUP_USBMUX;
         err = idevice_new_with_options(&g_device, NULL, opts);
         if (err == IDEVICE_E_SUCCESS) break;
         {
             char msg[200];
             snprintf(msg, sizeof(msg),
-                     "[imd] idevice_new_with_options() err=%d (lần %d/3)",
+                     "[imd] idevice_new_with_options() err=%d (lần %d/30) — đợi UDID sẵn sàng...",
                      (int)err, attempt + 1);
             emit_log(msg);
         }
-        if (attempt < 2) usleep(500000);  /* chờ 500ms */
+        if (attempt < 29) usleep(500000);  /* chờ 500ms */
     }
 
     if (err != IDEVICE_E_SUCCESS) {
@@ -894,3 +921,4 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeDiagnostics(
     );
     return (*env)->NewStringUTF(env, buf);
 }
+
