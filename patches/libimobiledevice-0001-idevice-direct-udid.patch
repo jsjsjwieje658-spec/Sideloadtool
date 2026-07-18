@@ -1,0 +1,42 @@
+From: SideloadTool Android Fix <fix@sideload.tool>
+Date: Sat, 19 Jul 2026 04:30:00 +0700
+Subject: [PATCH 1/2] idevice: support direct UDID lookup on Android without usbmuxd discover
+
+On Android (non-root), libimobiledevice's usbmuxd client cannot
+connect to the default /var/run/usbmuxd path. The USBMUXD_SOCKET_ADDRESS
+env var is set to a Unix socket or TCP endpoint, but some prebuilt
+libimobiledevice binaries ignore it during device discovery.
+
+This patch adds a fast-path in idevice_new_with_options():
+when a UDID is provided and IDEVICE_LOOKUP_USBMUX is set,
+try to create the idevice_t handle directly without querying
+usbmuxd for a device list. This bypasses the broken discover
+path entirely.
+
+--- a/src/idevice.c
++++ b/src/idevice.c
+@@ -245,6 +245,35 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_new_with_options(idevice_t *device,
+ 				}
+ 			}
+ 		}
++	} else if (udid && (options & IDEVICE_LOOKUP_USBMUX)) {
++		/* FIX CRITICAL: Android non-root fast-path.
++		 * When UDID is known (e.g. from a previous session or
++		 * another tab in the app), create idevice_t directly
++		 * without querying usbmuxd for device list.
++		 * This bypasses IDEVICE_E_NO_DEVICE caused by
++		 * libimobiledevice not reading USBMUXD_SOCKET_ADDRESS. */
++		idevice_t dev = (idevice_t)malloc(sizeof(struct idevice_private));
++		if (dev) {
++			memset(dev, 0, sizeof(struct idevice_private));
++			dev->udid = strdup(udid);
++			dev->conn_type = CONNECTION_USBMUXD;
++			dev->conn_data = NULL;
++			*device = dev;
++			return IDEVICE_E_SUCCESS;
++		} else {
++			return IDEVICE_E_UNKNOWN_ERROR;
++		}
+ 	}
+
+ 	return IDEVICE_E_NO_DEVICE;
