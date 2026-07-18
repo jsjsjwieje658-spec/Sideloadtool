@@ -67,6 +67,7 @@ object UsbTransport {
 
     @Volatile private var connection:       UsbDeviceConnection? = null
     @Volatile private var usbInterface:     UsbInterface?        = null
+    @Volatile private var usbConfiguration: UsbConfiguration?    = null
     @Volatile private var endpointIn:       UsbEndpoint?         = null
     @Volatile private var endpointOut:      UsbEndpoint?         = null
     @Volatile private var currentDevice:    UsbDevice?           = null
@@ -175,6 +176,7 @@ object UsbTransport {
          */
         connection      = conn
         usbInterface    = found.iface
+        usbConfiguration = found.config
         endpointIn      = found.epIn
         endpointOut     = found.epOut
         currentDevice   = device
@@ -215,8 +217,13 @@ object UsbTransport {
          * khiến claimInterface() thất bại hoặc bulkTransfer() trả -1 liên tục.
          * FIX_NOTES.md đề cập fix này nhưng chưa implement trong code. */
         try {
-            val setConfResult = conn.setConfiguration(1)
-            Log.i(TAG, "setConfiguration(1) = $setConfResult")
+            val cfg = usbConfiguration
+            if (cfg != null) {
+                val setConfResult = conn.setConfiguration(cfg)
+                Log.i(TAG, "setConfiguration(id=${cfg.id}) = $setConfResult")
+            } else {
+                Log.w(TAG, "setConfiguration() bỏ qua: chưa có UsbConfiguration (open() chưa gọi?)")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "setConfiguration() exception (non-fatal): ${e.message}")
         }
@@ -273,6 +280,7 @@ object UsbTransport {
         try { connection?.close() } catch (_: Exception) {}
         connection      = null
         usbInterface    = null
+        usbConfiguration = null
         endpointIn      = null
         endpointOut     = null
         currentDevice   = null
