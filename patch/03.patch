@@ -1,0 +1,109 @@
+--- a/app/src/main/cpp/jni_bridge_imd.c
++++ b/app/src/main/cpp/jni_bridge_imd.c
+@@ -358,12 +358,27 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
+          * usbmuxd_server_start() bắt đầu chấp nhận "Connect" request từ
+          * libusbmuxd. Nếu không, mỗi Connect (lockdownd/AFC/instproxy...) sẽ
+          * lặp lại version exchange bên trong do_usb_v1_connect() và khiến
+          * iPhone nhận packet version không mong đợi trong
+-     * FIX: Dùng UDID placeholder khi chưa biết UDID thật.
+-     * Sau khi idevice_get_udid() trả về, gọi usbmuxd_server_update_udid()
+-     * KHÔNG restart server (tránh race condition).
++     * FIX UDID (CRITICAL): Lấy UDID thật từ USB descriptor NGAY SAU KHI
++     * libusb init thành công. iSerialNumber của iPhone chính là UDID.
++     * Truyền UDID thật vào usbmuxd_server_start() để server tạo "Attached"
++     * event với UDID đúng từ đầu, thay vì placeholder.
+      */
+-    bool srv = usbmuxd_server_start(
+-        g_files_dir,
+-        g_udid[0] ? g_udid : "00000000-0000-0000-0000-000000000000",
+-        (int)productId
+-    );
++    const char *usb_udid = usb_bridge_get_udid();
++    if (usb_udid && usb_udid[0]) {
++        strncpy(g_udid, usb_udid, sizeof(g_udid) - 1);
++        g_udid[sizeof(g_udid) - 1] = '\0';
++        android_fix_set_device(g_udid, (int)productId);
++        char udid_log[128];
++        snprintf(udid_log, sizeof(udid_log),
++                 "[imd] ✅ Early UDID từ USB descriptor: %s", g_udid);
++        emit_log(udid_log);
++    } else {
++        emit_log("[imd] ⚠️ Không đọc được UDID từ USB descriptor — dùng placeholder");
++    }
++
++    /*
++     * Khởi động usbmuxd server với UDID thật (nếu có) hoặc placeholder.
++     * FIX: Không cần restart server sau này để cập nhật UDID vì UDID đã
++     * được đọc từ USB descriptor từ đầu.
++     */
++    bool srv = usbmuxd_server_start(
++        g_files_dir,
++        g_udid[0] ? g_udid : "00000000-0000000000000000",
++        (int)productId
++    );
+ 
+     if (srv) {
+         snprintf(buf, sizeof(buf),
+@@ -430,18 +445,6 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
+         return JNI_FALSE;
+     }
+ 
+-    /* Luôn set lại env var (có thể bị xóa bởi system) */
+-    setenv("USBMUXD_SOCKET_ADDRESS", sock_path, 1);
+-    {
+-        char buf[300];
+-        snprintf(buf, sizeof(buf), "[imd] USBMUXD_SOCKET_ADDRESS=%s", sock_path);
+-        emit_log(buf);
+-    }
+-
+     /*
+      * ── FIX RACE CONDITION: Chờ socket sẵn sàng ──
+      *
+@@ -506,15 +509,17 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
+     /* Lấy UDID và cập nhật server (KHÔNG restart) */
+     char *udid = NULL;
+     idevice_get_udid(g_device, &udid);
+-    if (udid) {
+-        strncpy(g_udid, udid, sizeof(g_udid) - 1);
+-        free(udid);
+-        /* FIX: dùng update_udid thay vì restart (tránh race condition) */
+-        usbmuxd_server_update_udid(g_udid);
+-        android_fix_set_device(g_udid, 0x12a8);
++    
++    /* FIX UDID (CRITICAL): Ưu tiên UDID từ USB descriptor (đã đọc trong
++     * nativeSetUsbFd) thay vì idevice_get_udid(). idevice_get_udid() có
++     * thể trả về placeholder nếu usbmuxd server chưa cập nhật.
++     */
++    const char *real_udid = usb_bridge_get_udid();
++    if (real_udid && real_udid[0] && strcmp(real_udid, "00000000-0000000000000000") != 0) {
++        strncpy(g_udid, real_udid, sizeof(g_udid) - 1);
++        g_udid[sizeof(g_udid) - 1] = '\0';
++        if (udid) free(udid);
++    } else if (udid && udid[0]) {
++        strncpy(g_udid, udid, sizeof(g_udid) - 1);
++        g_udid[sizeof(g_udid) - 1] = '\0';
++        free(udid);
++    } else {
++        if (udid) free(udid);
++        emit_log("[imd] ⚠️ Không lấy được UDID từ cả USB descriptor lẫn idevice");
++    }
+ 
+-        /*
+-         * FIX (báo cáo lỗi #7): usbmuxd_server_update_udid() giờ đã tự
+-         * broadcast "Attached" (UDID mới) cho mọi client đang Listen bên
+-         * trong nó, nhưng gọi tường minh usbmuxd_server_broadcast_attached()
+-         * ở đây — ngay sau khi UDID thật được xác nhận qua
+-         * idevice_get_udid() — như một safety-net rõ ràng ở tầng JNI, đảm
+-         * bảo libusbmuxd (và bất kỳ client nào khác đang mở kết nối tới
+-         * server nội bộ) luôn được thông báo lại ngay khi UDID thật sẵn
+-         * sàng, thay vì phụ thuộc hoàn toàn vào side-effect bên trong
+-         * update_udid().
+-         */
++    if (g_udid[0]) {
++        usbmuxd_server_update_udid(g_udid);
++        android_fix_set_device(g_udid, g_product_id);
+         usbmuxd_server_broadcast_attached();
+-
+         char msg[128];
+         snprintf(msg, sizeof(msg), "[imd] ✅ iPhone UDID: %s", g_udid);
+         emit_log(msg);
