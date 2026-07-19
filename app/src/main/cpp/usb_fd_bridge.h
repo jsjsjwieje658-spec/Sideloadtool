@@ -36,34 +36,28 @@
 #include <stdint.h>
 
 /*
- * usb_bridge_init_from_fd — khởi tạo libusb từ Android USB fd.
+ * usb_bridge_init — khởi tạo libusb từ Android USB fd.
  *
- * fd: từ UsbDeviceConnection.getFileDescriptor() (KHÔNG cần claim interface trước)
+ * usb_fd: từ UsbDeviceConnection.getFileDescriptor() (KHÔNG cần claim interface trước)
  *
  * Sau khi init:
  *   1. libusb_wrap_sys_device(ctx, fd, &handle)
- *   2. discover_apple_endpoints() — tìm + claim interface (có thể SUCCESS hoặc BUSY)
- *   3. libusb_clear_halt() trên cả ep_in và ep_out (bắt buộc)
+ *   2. discover_endpoints() — tìm + claim interface (có thể SUCCESS hoặc BUSY)
+ *
+ * @return 0 nếu thành công, -1 nếu lỗi.
  */
-bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id);
-
+int usb_bridge_init(int usb_fd);
 uint8_t usb_bridge_ep_in(void);
 uint8_t usb_bridge_ep_out(void);
-
-int  usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout);
-int  usb_bridge_bulk_read(void *buf, int len, unsigned int timeout);
-void usb_bridge_flush_in(int max_packets, int timeout_ms);
-void usb_bridge_close(void);
-
+int  usb_bridge_bulk_write(const uint8_t *data, int len);
+int  usb_bridge_bulk_read(uint8_t *buf, int len);
+/*
+ * usb_bridge_cleanup — giải phóng libusb handle/context, reset trạng thái
+ * nội bộ. Gọi khi đóng kết nối USB.
+ */
+void usb_bridge_cleanup(void);
 /*
  * usb_bridge_clear_endpoints_halt — clear halt trên cả ep_in và ep_out.
  * Gọi trước version exchange hoặc khi gặp nhiều lỗi PIPE liên tiếp.
  */
 bool usb_bridge_clear_endpoints_halt(void);
-
-/*
- * usb_bridge_get_udid — Trả về UDID đã đọc từ USB descriptor (iSerialNumber)
- * khi khởi tạo. Trả về NULL nếu chưa init hoặc không đọc được.
- * Đây là UDID THẬT từ iPhone, không phải placeholder.
- */
-const char *usb_bridge_get_udid(void);

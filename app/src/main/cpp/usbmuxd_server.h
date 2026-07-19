@@ -7,9 +7,9 @@
  * /var/run/usbmuxd (không tồn tại trên Android không root).
  *
  * Sử dụng:
- *   1. Gọi usb_bridge_init_from_fd() trước (cần libusb handle)
+ *   1. Gọi usb_bridge_init() trước (cần libusb handle)
  *   2. Gọi usbmuxd_server_start(filesDir, udid, productId)
- *   3. setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_socket_path(), 1)
+ *   3. setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_get_socket_path(), 1)
  *   4. Gọi idevice_new_with_options() → libusbmuxd tự kết nối socket
  *   5. Gọi usbmuxd_server_stop() khi xong
  *
@@ -23,7 +23,7 @@
  *
  * QUAN TRỌNG: iPhone v1 mux protocol chỉ chấp nhận MỘT version exchange
  * cho mỗi USB session. Hàm này PHẢI được gọi đúng một lần, ngay sau khi
- * usb_bridge_init_from_fd() (libusb) khởi tạo xong và TRƯỚC KHI gọi
+ * usb_bridge_init() (libusb) khởi tạo xong và TRƯỚC KHI gọi
  * usbmuxd_server_start(). Idempotent: các lần gọi lại sau đó chỉ trả về
  * true ngay lập tức mà không lặp lại exchange thật (an toàn để gọi lại
  * như một safety check ở nơi khác).
@@ -35,7 +35,7 @@ bool usbmux_version_exchange(void);
 /*
  * usbmuxd_server_reset_version_state — cho phép usbmux_version_exchange()
  * thực hiện lại. Gọi hàm này khi bắt đầu một USB session THẬT SỰ MỚI
- * (fd mới / thiết bị mới) — ví dụ ngay sau usb_bridge_init_from_fd()
+ * (fd mới / thiết bị mới) — ví dụ ngay sau usb_bridge_init()
  * thành công và TRƯỚC KHI gọi usbmux_version_exchange() — để tránh việc
  * flag idempotent từ session trước làm session mới bị bỏ qua version
  * exchange (điều này sẽ khiến session mới treo/reject giống Bug B).
@@ -92,10 +92,10 @@ void usbmuxd_server_update_udid(const char *udid);
 void usbmuxd_server_broadcast_attached(void);
 
 /*
- * usbmuxd_server_socket_path — trả đường dẫn đến Unix socket.
+ * usbmuxd_server_get_socket_path — trả đường dẫn đến Unix socket.
  * Trả NULL nếu server chưa start.
  */
-const char *usbmuxd_server_socket_path(void);
+const char *usbmuxd_server_get_socket_path(void);
 
 /*
  * usbmuxd_server_stop — dừng server và giải phóng tài nguyên.
