@@ -45,7 +45,6 @@
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
-#include <libimobiledevice/userpref.h>
 #include <libimobiledevice/afc.h>
 #include <libimobiledevice/installation_proxy.h>
 #include <plist/plist.h>
@@ -562,6 +561,20 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
 
     /* Mở lockdownd session với TLS handshake */
     emit_log("[lockdown] Mở lockdownd session...");
+    /*
+     * FIX lockdownd err=-8: Xóa pairing record cũ (nếu có) để buộc
+     * iPhone hiển thị popup "Tin cậy" lại.
+     */
+    if (g_udid[0]) {
+        emit_log("[lockdown] Kiểm tra/xóa pairing record cũ...");
+        char pairing_path[512];
+        snprintf(pairing_path, sizeof(pairing_path), "%s/Lockdown/%s.plist", g_files_dir, g_udid);
+        if (remove(pairing_path) == 0) {
+            emit_log("[lockdown] Đã xóa pairing record cũ");
+        } else {
+            emit_log("[lockdown] Không có pairing record cũ");
+        }
+    }
     lockdownd_error_t ld_err = lockdownd_client_new_with_handshake(
             g_device, &g_lockdown, "sideloadtool");
     if (ld_err != LOCKDOWN_E_SUCCESS) {
