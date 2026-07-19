@@ -76,7 +76,8 @@ class NativeBridge(private val context: Context) {
         withContext(Dispatchers.IO) {
             try {
                 NativeLog.emit("[bridge] libusb_wrap_sys_device(fd=$fd vid=0x${vendorId.toString(16)})...")
-                val ok = nativeSetUsbFd(fd, vendorId, productId)
+                val udid = UsbTransport.getSerialNumber()
+                val ok = nativeSetUsbFd(fd, vendorId, productId, udid)
                 if (ok) NativeLog.emit("[bridge] ✅ libusb sẵn sàng")
                 else    NativeLog.emit("[bridge] ❌ nativeSetUsbFd thất bại")
                 ok
@@ -135,7 +136,8 @@ class NativeBridge(private val context: Context) {
                          * Tổng: 5 × 5 = 25 lần thử với đủ clear_halt + flush + delay.
                          */
                         val retryDelays = longArrayOf(3_000L, 5_000L, 5_000L, 8_000L, 10_000L)
-                        var fdOk = nativeSetUsbFd(fd, vid, pid)
+                        val udid = UsbTransport.getSerialNumber()
+                        var fdOk = nativeSetUsbFd(fd, vid, pid, udid)
                         if (fdOk) {
                             NativeLog.emit("[bridge] ✅ libusb bridge ready — fd sạch (termux-api pattern)")
                         } else {
@@ -144,7 +146,7 @@ class NativeBridge(private val context: Context) {
                                 NativeLog.emit("[bridge] ⚠️ nativeSetUsbFd lần $attempt thất bại — thử lại sau ${delay/1000}s...")
                                 NativeLog.emit("[bridge] 💡 Giữ cáp USB, không rút ra. iPhone đã unlock + bấm Trust chưa?")
                                 Thread.sleep(delay)
-                                fdOk = nativeSetUsbFd(fd, vid, pid)
+                                fdOk = nativeSetUsbFd(fd, vid, pid, udid)
                                 if (fdOk) {
                                     NativeLog.emit("[bridge] ✅ libusb bridge ready (lần thử ${attempt+1})")
                                     break
@@ -284,7 +286,7 @@ class NativeBridge(private val context: Context) {
 
     // ── JNI declarations ───────────────────────────────────────────────────────
     private external fun nativeInit(filesDir: String)
-    private external fun nativeSetUsbFd(fd: Int, vendorId: Int, productId: Int): Boolean
+    private external fun nativeSetUsbFd(fd: Int, vendorId: Int, productId: Int, udid: String?): Boolean
     private external fun nativeConnect(): Boolean
     private external fun nativePair(): Boolean
     private external fun nativeSideload(ipaPath: String): Boolean

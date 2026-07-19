@@ -143,10 +143,35 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
  */
 JNIEXPORT jboolean JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
-        JNIEnv *env, jobject obj, jint fd, jint vendorId, jint productId) {
+        JNIEnv *env, jobject obj, jint fd, jint vendorId, jint productId, jstring udid_jstr) {
     (void)env; (void)obj;
 
     g_product_id = (int)productId;
+
+    /*
+     * FIX UDID (CRITICAL): Lấy UDID thật từ Android UsbDevice.serialNumber
+     * qua JNI. Android API getSerialNumber() đọc đúng UDID từ USB descriptor
+     * iSerialNumber, trong khi libusb_wrap_sys_device() trên Android thường
+     * chỉ đọc được placeholder. UDID thật là bắt buộc để lockdownd chấp nhận
+     * kết nối (err=-8 nếu dùng placeholder).
+     */
+    if (udid_jstr) {
+        const char *udid_java = (*env)->GetStringUTFChars(env, udid_jstr, NULL);
+        if (udid_java && udid_java[0]
+            && strcmp(udid_java, "00000000-0000000000000000") != 0
+            && strcmp(udid_java, "00000000-0000-0000-0000-000000000000") != 0) {
+            strncpy(g_udid, udid_java, sizeof(g_udid) - 1);
+            g_udid[sizeof(g_udid) - 1] = '\0';
+            char udid_log[128];
+            snprintf(udid_log, sizeof(udid_log), "[imd] ✅ UDID từ Android API: %s", g_udid);
+            emit_log(udid_log);
+        } else {
+            emit_log("[imd] ⚠️ Android API trả UDID rỗng hoặc placeholder");
+        }
+        (*env)->ReleaseStringUTFChars(env, udid_jstr, udid_java);
+    } else {
+        emit_log("[imd] ⚠️ Không nhận được UDID từ Java (null)");
+    }
 
     /* FIX: Dup fd để tránh invalid khi Java GC thu hồi UsbDeviceConnection */
     int fd_copy = dup((int)fd);
@@ -362,7 +387,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
      */
     bool srv = usbmuxd_server_start(
         g_files_dir,
-        g_udid[0] ? g_udid : "00000000-0000-0000-0000-000000000000",
+        g_udid[0] ? g_udid : "00000000-0000000000000000",
         (int)productId
     );
 
@@ -377,28 +402,14 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         /* FIX: Inject UDID into shim so usbmuxd_get_device() can bypass discover */
         android_fix_set_device(g_udid[0] ? g_udid : "00000000-0000000000000000", (int)productId);
 
-        /* FIX CRITICAL: Fetch UDID early before nativeConnect() runs. */
-        setenv("USBMUXD_SOCKET_PATH", usbmuxd_server_socket_path(), 1);
-        usleep(300000); /* 300ms let server bind */
+        /* FIX: Nếu đã có UDID thật từ Java, broadcast Attached ngay */
+        if (g_udid[0]) {
+            usbmuxd_server_update_udid(g_udid);
+            usbmuxd_server_broadcast_attached();
+            emit_log("[imd] ✅ Server đã cập nhật UDID thật từ Android API");
+        }
 
-        idevice_t temp_dev = NULL;
-        idevice_error_t early_err = idevice_new_with_options(&temp_dev, NULL, IDEVICE_LOOKUP_USBMUX);
-        if (early_err == IDEVICE_E_SUCCESS && temp_dev) {
-            char *early_udid = NULL;
-            if (idevice_get_udid(temp_dev, &early_udid) == IDEVICE_E_SUCCESS && early_udid) {
-                snprintf(buf, sizeof(buf),
-                         "[bridge] ✅ Early UDID obtained: %s", early_udid);
-                emit_log(buf);
-                strncpy(g_udid, early_udid, sizeof(g_udid) - 1);
-                g_udid[sizeof(g_udid) - 1] = '\0';
-                usbmuxd_server_update_udid(g_udid);
-                android_fix_set_device(g_udid, (int)productId);
-                free(early_udid);
-            } else {
-                emit_log("[bridge] ⚠️ Early device found but no UDID yet");
-            }
-            idevice_free(temp_dev);
-        } else {
+         else {
             snprintf(buf, sizeof(buf),
                      "[bridge] ⚠️ Early idevice_new err=%d — will retry in nativeConnect()",
                      (int)early_err);

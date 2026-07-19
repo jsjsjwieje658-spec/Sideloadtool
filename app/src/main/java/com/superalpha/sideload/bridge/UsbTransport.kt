@@ -84,6 +84,8 @@ object UsbTransport {
     fun getFileDescriptor(): Int = connection?.fileDescriptor ?: -1
     fun getVendorId():  Int = currentDevice?.vendorId  ?: 0
     fun getProductId(): Int = currentDevice?.productId ?: 0
+    /** FIX UDID: Lấy UDID thật từ Android UsbDevice.serialNumber */
+    fun getSerialNumber(): String? = currentDevice?.serialNumber
 
     // ── Tìm thiết bị Apple ────────────────────────────────────────────────────
     fun findAppleDevice(usbManager: UsbManager): UsbDevice? =
