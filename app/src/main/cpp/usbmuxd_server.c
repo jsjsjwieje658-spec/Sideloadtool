@@ -1172,31 +1172,33 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
 
     /* Bước 1: SYN */
     uint32_t isn = st->local_seq;
+    LOGI("do_usb_v1_connect: Đang gửi SYN đến iPhone port %d...", port);
     if (usb_send_tcp(st, TH_SYN, NULL, 0) < 0) {
-        LOGE("do_usb_v1_connect: gửi SYN thất bại");
+        LOGE("do_usb_v1_connect: ❌ gửi SYN thất bại");
         return false;
     }
-    LOGI("do_usb_v1_connect: Đã gửi SYN đến port %d, chờ SYN+ACK...", port);
+    LOGI("do_usb_v1_connect: ✅ SYN đã gửi, chờ SYN+ACK...");
 
-    /* FIX: Chờ lâu hơn nếu iPhone chưa unlock (lockdownd chưa sẵn sàng) */
-    int synack_timeout = 10000; /* 10 giây cho user unlock iPhone */
+    /* FIX: Chờ lâu hơn nếu iPhone chưa unlock */
+    int synack_timeout = 15000; /* 15 giây cho user unlock/trust */
 
     /* Bước 2: Nhận SYN+ACK từ iPhone */
     uint8_t flags = 0;
     uint8_t dummy[1];
     int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, synack_timeout);
     if (n < 0) {
-        LOGE("do_usb_v1_connect: nhận SYN+ACK thất bại (timeout %dms) — iPhone có thể đang khoá hoặc chưa Trust", synack_timeout);
+        LOGE("do_usb_v1_connect: ❌ timeout chờ SYN+ACK (%dms) — iPhone có thể đang khoá hoặc chưa Trust", synack_timeout);
         return false;
     }
     if (!(flags & TH_SYN) || !(flags & TH_ACK)) {
         if (flags & TH_RST) {
-            LOGE("do_usb_v1_connect: iPhone gửi RST — port %d không mở (iPhone đang khoá?)", port);
+            LOGE("do_usb_v1_connect: ❌ iPhone gửi RST — port %d bị từ chối (chưa Trust hoặc iPhone khoá)", port);
         } else {
-            LOGE("do_usb_v1_connect: nhận flags=0x%02x (không phải SYN+ACK)", flags);
+            LOGE("do_usb_v1_connect: ❌ nhận flags=0x%02x (không phải SYN+ACK)", flags);
         }
         return false;
     }
+    LOGI("do_usb_v1_connect: ✅ Nhận SYN+ACK, gửi ACK...");
     LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u", st->remote_seq);
 
     /* Bước 3: ACK */
