@@ -10,17 +10,9 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <arpa/inet.h>      /* htons/htonl/ntohs/ntohl */
-#include <netinet/in.h>
-#include <netinet/tcp.h>    /* struct tcphdr — trước đây bị thiếu, khiến
-                               trình biên dịch coi 'struct tcphdr' là kiểu
-                               chưa đầy đủ (forward declaration) và báo lỗi
-                               "invalid application of 'sizeof' to an
-                               incomplete type" */
 #include <pthread.h>
 #include "usbmuxd_server.h"
 #include "android_usbmuxd_fix.h"
-#include "usb_fd_bridge.h"  /* usb_bridge_bulk_read/usb_bridge_bulk_write */
 
 #define TAG "USBMUX_SRV"
 

@@ -7,10 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <libusb.h>          /* libusb_context, libusb_device_handle, struct
-                                 libusb_config_descriptor, LIBUSB_ERROR_*, ...
-                                 — trước đây bị thiếu dù CMakeLists.txt đã có
-                                 sẵn include path prebuilt/<abi>/include/libusb-1.0 */
 #include "usb_fd_bridge.h"
 #include "android_usbmuxd_fix.h"
 
