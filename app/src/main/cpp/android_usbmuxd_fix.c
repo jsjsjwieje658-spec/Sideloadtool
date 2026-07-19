@@ -2,6 +2,17 @@
  *
  * Android non-root link-time override for libusbmuxd.
  *
+ * Implemented via the linker's --wrap mechanism (see CMakeLists.txt:
+ * "-Wl,--wrap=usbmuxd_get_device" / "-Wl,--wrap=usbmuxd_connect"), so the
+ * functions below are named __wrap_usbmuxd_get_device() /
+ * __wrap_usbmuxd_connect() rather than usbmuxd_get_device()/
+ * usbmuxd_connect() directly. The linker transparently redirects every
+ * call to the real symbol name (including calls made from inside the
+ * prebuilt libimobiledevice-1.0.a) to these __wrap_ versions instead —
+ * without ever defining a second symbol with the same name as the one
+ * already in libusbmuxd-2.0.a (which would be a fatal "duplicate symbol"
+ * link error under NDK r25's lld).
+ *
  * CRITICAL FIXES:
  * 1. usbmuxd_get_device() now returns a placeholder device even when UDID
  *    is not yet known. This breaks the deadlock:
@@ -45,7 +56,7 @@ void android_fix_set_device(const char *udid, int product_id)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * OVERRIDE: usbmuxd_get_device()
+ * OVERRIDE (via -Wl,--wrap=usbmuxd_get_device): __wrap_usbmuxd_get_device()
  *
  * CRITICAL FIX: Return a placeholder device with handle=1 even when
  * UDID is not yet known. This allows idevice_new_with_options() to
@@ -57,7 +68,7 @@ void android_fix_set_device(const char *udid, int product_id)
  * returns -ENOENT when no UDID is cached.
  * ═══════════════════════════════════════════════════════════════════════ */
 __attribute__((visibility("default")))
-int usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
+int __wrap_usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
                        enum usbmux_lookup_options options)
 {
     (void)options;
@@ -97,7 +108,7 @@ int usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * OVERRIDE: usbmuxd_connect()
+ * OVERRIDE (via -Wl,--wrap=usbmuxd_connect): __wrap_usbmuxd_connect()
  *
  * CRITICAL FIX: Read USBMUXD_SOCKET_ADDRESS from environment.
  * usbmuxd_server.c creates a Unix domain socket and jni_bridge_imd.c
@@ -107,7 +118,7 @@ int usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
  * usbmuxd server → iPhone never paired.
  * ═══════════════════════════════════════════════════════════════════════ */
 __attribute__((visibility("default")))
-int usbmuxd_connect(const uint32_t handle, const unsigned short port)
+int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
 {
     (void)handle;
 

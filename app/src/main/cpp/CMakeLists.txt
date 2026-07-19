@@ -1,8 +1,3 @@
-# Fix for Android NDK r25+ lld linker: allow duplicate symbols between
-# object files and static archives (android_usbmuxd_fix.c overrides
-# symbols from libusbmuxd-2.0.a)
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition")
-
 cmake_minimum_required(VERSION 3.22)
 project(sideloadnative C)
 
@@ -74,6 +69,33 @@ if(BUILD_MODE EQUAL 1)
     usb_fd_bridge.c     # Android USB fd → libusb handle + endpoint discovery
     android_usbmuxd_fix.c  # Android non-root: override usbmuxd_get_device/connect
     usbmuxd_server.c    # Mini usbmuxd Unix socket server + v1 USB protocol (cho libusbmuxd kết nối)
+  )
+
+  # android_usbmuxd_fix.c cung cấp bản thay thế (Android, non-root) cho
+  # usbmuxd_get_device()/usbmuxd_connect() — 2 hàm client API vốn được
+  # định nghĩa sẵn trong libusbmuxd-2.0.a (static archive) và được
+  # libimobiledevice-1.0.a gọi nội bộ.
+  #
+  # KHÔNG dùng "-Wl,--allow-multiple-definition" (cách cũ): NDK r25 CMake
+  # toolchain luôn thêm sẵn "-Wl,--fatal-warnings" vào linker flags mặc
+  # định, nên cảnh báo "duplicate symbol" mà --allow-multiple-definition
+  # sinh ra vẫn bị nâng thành lỗi fatal → build luôn FAILED bất kể có cờ
+  # này hay không. Ngoài ra set(CMAKE_SHARED_LINKER_FLAGS ...) đặt TRƯỚC
+  # project() cũng bị NDK toolchain ghi đè mất, không bao giờ tới được
+  # lệnh link thật sự (đã kiểm chứng qua log build lỗi).
+  #
+  # Dùng "--wrap" của linker thay thế: mọi tham chiếu tới ký hiệu
+  # usbmuxd_get_device / usbmuxd_connect ở BẤT KỲ đâu trong quá trình
+  # link (kể cả từ bên trong libimobiledevice-1.0.a) sẽ được linker tự
+  # động chuyển hướng sang __wrap_usbmuxd_get_device /
+  # __wrap_usbmuxd_connect (định nghĩa trong android_usbmuxd_fix.c).
+  # Bản gốc trong libusbmuxd-2.0.a vẫn được giữ nguyên tên (không đổi),
+  # chỉ đơn giản là không còn ai gọi tới nó nữa — vì vậy KHÔNG hề có
+  # xung đột tên ký hiệu (=> không cảnh báo, không lỗi, không phụ thuộc
+  # thứ tự cờ linker).
+  target_link_options(sideloadnative PRIVATE
+    "-Wl,--wrap=usbmuxd_get_device"
+    "-Wl,--wrap=usbmuxd_connect"
   )
 
   # Import static libraries (thứ tự: cao → thấp level)
