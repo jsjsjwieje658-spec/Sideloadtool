@@ -1176,19 +1176,25 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
         LOGE("do_usb_v1_connect: gửi SYN thất bại");
         return false;
     }
-    LOGI("do_usb_v1_connect: SYN gửi (sport=%u dport=%u seq=%u)",
-         st->sport, st->dport, st->local_seq);
+    LOGI("do_usb_v1_connect: Đã gửi SYN đến port %d, chờ SYN+ACK...", port);
+
+    /* FIX: Chờ lâu hơn nếu iPhone chưa unlock (lockdownd chưa sẵn sàng) */
+    int synack_timeout = 10000; /* 10 giây cho user unlock iPhone */
 
     /* Bước 2: Nhận SYN+ACK từ iPhone */
     uint8_t flags = 0;
     uint8_t dummy[1];
-    int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, 5000);
+    int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, synack_timeout);
     if (n < 0) {
-        LOGE("do_usb_v1_connect: nhận SYN+ACK thất bại");
+        LOGE("do_usb_v1_connect: nhận SYN+ACK thất bại (timeout %dms) — iPhone có thể đang khoá hoặc chưa Trust", synack_timeout);
         return false;
     }
     if (!(flags & TH_SYN) || !(flags & TH_ACK)) {
-        LOGE("do_usb_v1_connect: nhận flags=0x%02x (không phải SYN+ACK)", flags);
+        if (flags & TH_RST) {
+            LOGE("do_usb_v1_connect: iPhone gửi RST — port %d không mở (iPhone đang khoá?)", port);
+        } else {
+            LOGE("do_usb_v1_connect: nhận flags=0x%02x (không phải SYN+ACK)", flags);
+        }
         return false;
     }
     LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u", st->remote_seq);
@@ -1835,6 +1841,7 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
      * KHÔNG hiểu đường dẫn Unix socket thuần tuý — sẽ crash với:
      *   AddrParseError(Socket) (học từ termux-usbmuxd fix_shell_rc() comment).
      * Nếu TCP bind thất bại → fallback dùng Unix socket path (chỉ C tools). */
+    /* FIX TCP: Thử nhiều port nếu 27015 bị chiếm */
     g_tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_tcp_fd >= 0) {
         int tcp_opt = 1;
@@ -1843,26 +1850,34 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
         memset(&tcp_addr, 0, sizeof(tcp_addr));
         tcp_addr.sin_family      = AF_INET;
         tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        tcp_addr.sin_port        = htons(USBMUXD_TCP_PORT);
-        if (bind(g_tcp_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) == 0
-            && listen(g_tcp_fd, 8) == 0) {
-            char tcp_sock_str[32];
-            snprintf(tcp_sock_str, sizeof(tcp_sock_str), "127.0.0.1:%d", USBMUXD_TCP_PORT);
-            setenv("USBMUXD_SOCKET_ADDRESS", tcp_sock_str, 1);
-            g_tcp_running = 1;
-            if (pthread_create(&g_tcp_thread, NULL, tcp_server_thread, NULL) == 0) {
-                pthread_detach(g_tcp_thread);
-                LOGI("usbmuxd_server_start: ✅ TCP dual-socket: %s (udid=%s)", tcp_sock_str, g_udid);
+
+        int ports[] = {USBMUXD_TCP_PORT, 27016, 27017, 27018, 27019};
+        int tcp_ok = 0;
+        for (int p = 0; p < 5; p++) {
+            tcp_addr.sin_port = htons(ports[p]);
+            if (bind(g_tcp_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) == 0
+                && listen(g_tcp_fd, 8) == 0) {
+                char tcp_sock_str[32];
+                snprintf(tcp_sock_str, sizeof(tcp_sock_str), "127.0.0.1:%d", ports[p]);
+                setenv("USBMUXD_SOCKET_ADDRESS", tcp_sock_str, 1);
+                g_tcp_running = 1;
+                if (pthread_create(&g_tcp_thread, NULL, tcp_server_thread, NULL) == 0) {
+                    pthread_detach(g_tcp_thread);
+                    LOGI("usbmuxd_server_start: ✅ TCP dual-socket: %s (udid=%s)", tcp_sock_str, g_udid);
+                    tcp_ok = 1;
+                    break;
+                } else {
+                    LOGE("usbmuxd_server_start: TCP pthread_create thất bại port %d", ports[p]);
+                    g_tcp_running = 0;
+                    close(g_tcp_fd); g_tcp_fd = -1;
+                }
             } else {
-                LOGE("usbmuxd_server_start: TCP pthread_create thất bại — fallback Unix");
-                g_tcp_running = 0;
-                close(g_tcp_fd); g_tcp_fd = -1;
-                setenv("USBMUXD_SOCKET_ADDRESS", g_sock_path, 1);
+                if (p == 4) {
+                    LOGE("usbmuxd_server_start: Tất cả TCP port đều bị chiếm — fallback Unix");
+                    close(g_tcp_fd); g_tcp_fd = -1;
+                    setenv("USBMUXD_SOCKET_ADDRESS", g_sock_path, 1);
+                }
             }
-        } else {
-            LOGE("usbmuxd_server_start: TCP bind/listen lỗi %d — fallback Unix socket", errno);
-            close(g_tcp_fd); g_tcp_fd = -1;
-            setenv("USBMUXD_SOCKET_ADDRESS", g_sock_path, 1);
         }
     } else {
         setenv("USBMUXD_SOCKET_ADDRESS", g_sock_path, 1);
