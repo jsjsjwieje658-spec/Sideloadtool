@@ -409,12 +409,6 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
             emit_log("[imd] ✅ Server đã cập nhật UDID thật từ Android API");
         }
 
-         else {
-            snprintf(buf, sizeof(buf),
-                     "[bridge] ⚠️ Early idevice_new err=%d — will retry in nativeConnect()",
-                     (int)early_err);
-            emit_log(buf);
-        }
     } else {
         emit_log("[usbmuxd_srv] \u274c Không khởi động được server — kiểm tra filesDir và quyền ghi");
         return JNI_FALSE;

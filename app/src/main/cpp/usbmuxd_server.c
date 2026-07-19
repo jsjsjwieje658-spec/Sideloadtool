@@ -1852,7 +1852,6 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
         tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
         int ports[] = {USBMUXD_TCP_PORT, 27016, 27017, 27018, 27019};
-        int tcp_ok = 0;
         for (int p = 0; p < 5; p++) {
             tcp_addr.sin_port = htons(ports[p]);
             if (bind(g_tcp_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) == 0
@@ -1864,7 +1863,6 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
                 if (pthread_create(&g_tcp_thread, NULL, tcp_server_thread, NULL) == 0) {
                     pthread_detach(g_tcp_thread);
                     LOGI("usbmuxd_server_start: ✅ TCP dual-socket: %s (udid=%s)", tcp_sock_str, g_udid);
-                    tcp_ok = 1;
                     break;
                 } else {
                     LOGE("usbmuxd_server_start: TCP pthread_create thất bại port %d", ports[p]);
