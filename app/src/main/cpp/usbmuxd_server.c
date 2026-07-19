@@ -1779,7 +1779,7 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
     }
 
     pthread_mutex_lock(&g_udid_mutex);
-    strncpy(g_udid, udid ? udid : "00000000-0000-0000-0000-000000000000",
+    strncpy(g_udid, (udid && udid[0]) ? udid : "00000000-0000000000000000",
             sizeof(g_udid) - 1);
     g_udid[63] = '\0';
     pthread_mutex_unlock(&g_udid_mutex);

@@ -125,9 +125,10 @@ int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
     const char *addr_env = getenv("USBMUXD_SOCKET_ADDRESS");
     int sfd = -1;
 
-    if (addr_env && strncmp(addr_env, "unix:", 5) == 0) {
+    if (addr_env && (strncmp(addr_env, "unix:", 5) == 0 || addr_env[0] == '/')) {
         /* ── Unix domain socket (correct path) ── */
-        const char *path = addr_env + 5;
+        const char *path = addr_env;
+        if (strncmp(addr_env, "unix:", 5) == 0) path = addr_env + 5;
         struct sockaddr_un sun;
         memset(&sun, 0, sizeof(sun));
         sun.sun_family = AF_UNIX;

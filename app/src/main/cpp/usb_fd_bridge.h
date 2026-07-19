@@ -60,3 +60,10 @@ void usb_bridge_close(void);
  * Gọi trước version exchange hoặc khi gặp nhiều lỗi PIPE liên tiếp.
  */
 bool usb_bridge_clear_endpoints_halt(void);
+
+/*
+ * usb_bridge_get_udid — Trả về UDID đã đọc từ USB descriptor (iSerialNumber)
+ * khi khởi tạo. Trả về NULL nếu chưa init hoặc không đọc được.
+ * Đây là UDID THẬT từ iPhone, không phải placeholder.
+ */
+const char *usb_bridge_get_udid(void);

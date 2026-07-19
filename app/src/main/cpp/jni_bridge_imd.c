@@ -441,11 +441,17 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         return JNI_FALSE;
     }
 
-    /* Luôn set lại env var (có thể bị xóa bởi system) */
-    setenv("USBMUXD_SOCKET_ADDRESS", sock_path, 1);
+    /*
+     * FIX: KHÔNG setenv USBMUXD_SOCKET_ADDRESS ở đây.
+     * usbmuxd_server_start() đã set đúng giá trị TCP 127.0.0.1:27015
+     * (hoặc Unix socket path nếu TCP thất bại). Việc setenv lại ở đây
+     * với sock_path (Unix path không có unix: prefix) sẽ overwrite giá
+     * trị đúng và khiến __wrap_usbmuxd_connect() không nhận diện được.
+     */
     {
+        const char *env_sock = getenv("USBMUXD_SOCKET_ADDRESS");
         char buf[300];
-        snprintf(buf, sizeof(buf), "[imd] USBMUXD_SOCKET_ADDRESS=%s", sock_path);
+        snprintf(buf, sizeof(buf), "[imd] USBMUXD_SOCKET_ADDRESS=%s", env_sock ? env_sock : "(not set)");
         emit_log(buf);
     }
 

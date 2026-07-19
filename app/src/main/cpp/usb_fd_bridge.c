@@ -69,6 +69,7 @@ static uint8_t               g_ep_out     = 0;
 static int                   g_iface_num  = -1;
 static int                   g_initialized = 0;
 static int                   g_fd_copy    = -1;  /* dup của fd Android */
+static char                  g_usb_udid[64] = {0};  /* UDID từ USB descriptor iSerialNumber */
 
 
 /* ── Helper: dup fd để tránh invalid khi Java GC ─────────────────────── */
@@ -257,6 +258,35 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
     LOGI("libusb_wrap_sys_device OK: fd_copy=%d pid=0x%04x", g_fd_copy, product_id);
 
     /*
+     * FIX UDID: Đọc UDID thật từ USB descriptor (iSerialNumber) NGAY SAU KHI
+     * libusb wrap fd thành công. iSerialNumber của iPhone chính là UDID.
+     * Điều này cho phép chúng ta có UDID thật TRƯỚC KHI cần kết nối lockdownd,
+     * tránh phụ thuộc vào idevice_get_udid() trả về placeholder từ usbmuxd.
+     */
+    {
+        struct libusb_device_descriptor dev_desc;
+        libusb_device *dev = libusb_get_device(g_handle);
+        if (dev && libusb_get_device_descriptor(dev, &dev_desc) == 0) {
+            if (dev_desc.iSerialNumber > 0) {
+                unsigned char serial[64] = {0};
+                int r = libusb_get_string_descriptor_ascii(g_handle, dev_desc.iSerialNumber,
+                                                            serial, sizeof(serial));
+                if (r > 0) {
+                    strncpy(g_usb_udid, (char*)serial, sizeof(g_usb_udid) - 1);
+                    g_usb_udid[sizeof(g_usb_udid) - 1] = '\0';
+                    LOGI("usb_bridge_init: ✅ UDID từ USB descriptor: %s", g_usb_udid);
+                } else {
+                    LOGW("usb_bridge_init: không đọc được iSerialNumber (r=%d)", r);
+                }
+            } else {
+                LOGW("usb_bridge_init: iSerialNumber = 0 trong descriptor");
+            }
+        } else {
+            LOGW("usb_bridge_init: không đọc được device descriptor");
+        }
+    }
+
+    /*
      * FIX (Bug 3 — CRITICAL): libusb_reset_device() REMOVED.
      *
      * PROBLEM: On Android, the fd comes from UsbDeviceConnection which the OS
@@ -340,6 +370,10 @@ bool usb_bridge_clear_endpoints_halt(void) {
 
 uint8_t usb_bridge_ep_in(void)  { return g_ep_in;  }
 uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
+
+const char *usb_bridge_get_udid(void) {
+    return g_usb_udid[0] ? g_usb_udid : NULL;
+}
 
 /* ════════════════════════════════════════════════════════════════════════
  * usb_bridge_bulk_write — 5 retry, 80ms delay
@@ -446,5 +480,6 @@ void usb_bridge_close(void) {
     g_ep_in       = 0;
     g_ep_out      = 0;
     g_initialized = 0;
+    g_usb_udid[0] = '\0';
     LOGI("usb_bridge_close: done");
 }
