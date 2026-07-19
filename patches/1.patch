@@ -1,0 +1,167 @@
+--- a/app/src/main/cpp/usbmuxd_server.c
++++ b/app/src/main/cpp/usbmuxd_server.c
+@@ -1,6 +1,6 @@
+ /*
+  * usbmuxd_server.c  v20
+- * Mini usbmuxd server nội bộ (in-process, Mode 1)
++ * Mini usbmuxd server nội bộ (in-process, Mode 1) — FIXED for Android Bionic
+  *
+  * Chạy một Unix domain socket server mô phỏng usbmuxd.
+  * libimobiledevice (libusbmuxd) sẽ kết nối đến socket này thay vì
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include <netinet/in.h>
+@@ -29,6 +30,24 @@
+ 
+ #include "usbmuxd_server.h"
+ 
++/* ════════════════════════════════════════════════════════════════════════
++ * FIX: Android Bionic libc có struct tcphdr với field names KHÁC glibc.
++ * Định nghĩa struct riêng để tránh phụ thuộc libc.
++ * ════════════════════════════════════════════════════════════════════════ */
++#ifdef __ANDROID__
++struct tcphdr {
++    uint16_t th_sport;
++    uint16_t th_dport;
++    uint32_t th_seq;
++    uint32_t th_ack;
++#if __BYTE_ORDER == __LITTLE_ENDIAN
++    uint8_t th_x2:4, th_off:4;
++#else
++    uint8_t th_off:4, th_x2:4;
++#endif
++    uint8_t  th_flags;
++    uint16_t th_win;
++    uint16_t th_sum;
++    uint16_t th_urp;
++};
++#endif
++
+ #define TAG "usbmuxd_srv"
+ #define LOGI(fmt, ...) do { \
+     char _buf[512]; \
+@@ -85,7 +104,7 @@ static int usb_send_all(const uint8_t *data, int len) {
+     int total = 0;
+     while (total < len) {
+         int remain = len - total;
+-        int n = usb_bridge_bulk_write(data + total, remain);
++        int n = usb_bridge_bulk_write(data + total, remain, 5000);
+         if (n <= 0) {
+             LOGE("usb_send_all: write failed (%d)", n);
+             return -1;
+@@ -96,7 +115,7 @@ static int usb_send_all(const uint8_t *data, int len) {
+ }
+ 
+ static int usb_recv_all(uint8_t *rxbuf, int len) {
+-    int n = usb_bridge_bulk_read(rxbuf, len);
++    int n = usb_bridge_bulk_read(rxbuf, len, 5000);
+     if (n != len) {
+         LOGE("usb_recv_all: expected %d got %d", len, n);
+         return -1;
+@@ -131,7 +150,7 @@ bool usbmux_version_exchange(void) {
+ 
+     /* 2. Nhận 4-byte length */
+     uint8_t rx[4];
+-    int n = usb_bridge_bulk_read(rx, 4);
++    int n = usb_bridge_bulk_read(rx, 4, 5000);
+     if (n != 4) {
+         LOGE("version_exchange: read len failed (%d)", n);
+         return false;
+@@ -232,22 +251,22 @@ static int recv_tcp(uint16_t *sport_out, uint16_t *dport_out,
+         if (body_len < (int)sizeof(struct tcphdr)) {
+             LOGE("recv_tcp: TCP body too small %d < %zu", body_len, sizeof(struct tcphdr));
+             return -1;
+         }
+-        uint16_t dport = ntohs(tcp->dest);
+-        uint16_t sport = ntohs(tcp->source);
++        uint16_t dport = ntohs(tcp->th_dport);
++        uint16_t sport = ntohs(tcp->th_sport);
+ 
+         if (sport_out) *sport_out = sport;
+         if (dport_out) *dport_out = dport;
+-        *flags_out = tcp->th_flags;
+-        *seq_out = ntohl(tcp->seq);
+-        *ack_out = ntohl(tcp->ack_seq);
++        *flags_out = tcp->th_flags;
++        *seq_out = ntohl(tcp->th_seq);
++        *ack_out = ntohl(tcp->th_ack);
+         int plen = body_len - sizeof(struct tcphdr);
+         if (plen > 0 && payload && payload_len) {
+             if (plen > *payload_len) plen = *payload_len;
+-            memcpy(payload, body + sizeof(struct tcphdr), plen);
++            memcpy(payload, body + sizeof(struct tcphdr), plen);
+         }
+         *payload_len = plen;
+         return 0;
+@@ -261,15 +280,15 @@ static int send_tcp(uint16_t sport, uint16_t dport,
+     int total = sizeof(struct tcphdr) + payload_len;
+     uint8_t pkt[total];
+     struct tcphdr *tcp = (struct tcphdr *)pkt;
+-    memset(tcp, 0, sizeof(*tcp));
+-    tcp->source = htons(sport);
+-    tcp->dest   = htons(dport);
+-    tcp->seq    = htonl(seq);
+-    tcp->ack_seq = htonl(ack);
+-    tcp->doff   = sizeof(struct tcphdr) / 4;
+-    tcp->th_flags = flags;
+-    tcp->window = htons(65535);
++    memset(tcp, 0, sizeof(*tcp));
++    tcp->th_sport = htons(sport);
++    tcp->th_dport = htons(dport);
++    tcp->th_seq   = htonl(seq);
++    tcp->th_ack   = htonl(ack);
++    tcp->th_off   = sizeof(struct tcphdr) / 4;
++    tcp->th_flags = flags;
++    tcp->th_win   = htons(65535);
+     if (payload_len > 0) {
+         memcpy(pkt + sizeof(struct tcphdr), payload, payload_len);
+     }
+@@ -415,7 +434,7 @@ static void *client_thread(void *arg) {
+                     send_pkt(c, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                 } else {
+                     /* Data payload */
+-                    int n = usb_bridge_bulk_read(usb_rx, usb_rx_len);
++                    int n = usb_bridge_bulk_read(usb_rx, usb_rx_len, 5000);
+                     if (n == usb_rx_len) {
+                         send_pkt(c, MSG_DATA, tag, usb_rx, usb_rx_len);
+                     } else {
+@@ -448,7 +467,7 @@ static void *client_thread(void *arg) {
+                 }
+                 if (usb_tx_len > 0) {
+                     /* Forward to USB */
+-                    int n = usb_bridge_bulk_write(usb_tx, usb_tx_len);
++                    int n = usb_bridge_bulk_write(usb_tx, usb_tx_len, 5000);
+                     if (n == usb_tx_len) {
+                         uint32_t res = 0;
+                         send_pkt(c, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+@@ -614,7 +633,7 @@ static void *usb_rx_thread(void *arg) {
+ 
+     while (g_running) {
+         uint8_t buf[4096];
+-        int n = usb_bridge_bulk_read(buf, sizeof(buf));
++        int n = usb_bridge_bulk_read(buf, sizeof(buf), 5000);
+         if (n > 0) {
+             pthread_mutex_lock(&g_clients_mutex);
+             client_t *c = find_client_by_usb_tag(g_current_usb_tag);
+@@ -713,7 +732,7 @@ bool usbmuxd_server_start(const char *sock_dir) {
+     return true;
+ }
+ 
+-void usbmuxd_server_update_udid(const char *udid) {
++void usbmuxd_server_update_udid(const char *udid) {
+     if (!udid) return;
+     pthread_mutex_lock(&g_udid_mutex);
+     strncpy(g_udid, udid, sizeof(g_udid) - 1);
+@@ -724,7 +743,7 @@ void usbmuxd_server_update_udid(const char *udid) {
+     pthread_mutex_unlock(&g_udid_mutex);
+ }
+ 
+-const char *usbmuxd_server_socket_path(void) {
++const char *usbmuxd_server_socket_path(void) {
+     return g_sock_path[0] ? g_sock_path : NULL;
+ }

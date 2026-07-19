@@ -1,0 +1,18 @@
+--- a/app/src/main/cpp/usb_fd_bridge.c
++++ b/app/src/main/cpp/usb_fd_bridge.c
+@@ -1,12 +1,13 @@
+ /*
+  * usb_fd_bridge.c  v12
+- * Android USB fd → libusb handle + endpoint discovery
++ * Android USB fd → libusb handle + endpoint discovery — FIXED header path
+  *
+  * FIX v12: Dùng libusb_wrap_sys_device() để wrap Android USB fd thành
+  * libusb device handle, thay vì mở lại bằng libusb_open().
+  */
+ 
+-#include <libusb-1.0/libusb.h>
++/* FIX: CMakeLists.txt đã thêm ${PREBUILT_INC}/libusb-1.0 vào include path */
++#include <libusb.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <stdlib.h>
