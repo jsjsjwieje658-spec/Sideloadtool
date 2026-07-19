@@ -114,7 +114,7 @@ JNIEXPORT jstring JNICALL
 Java_com_sideloadtool_usbmuxd_NativeBridge_nativeGetSocketPath(
     JNIEnv *env, jobject thiz) {
     (void)thiz;
-    return (*env)->NewStringUTF(env, usbmuxd_server_get_socket_path());
+    return (*env)->NewStringUTF(env, usbmuxd_server_socket_path());
 }
 
 JNIEXPORT jint JNICALL

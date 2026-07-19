@@ -2,6 +2,10 @@
  * usb_fd_bridge.c
  * Android USB bridge qua libusb với fd từ UsbDeviceConnection
  */
+/* Fix v36: Include libusb header first */
+#include <libusb-1.0/libusb.h>
+
+
 
 #include <stdio.h>
 #include <stdlib.h>

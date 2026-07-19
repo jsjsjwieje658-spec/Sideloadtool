@@ -51,7 +51,8 @@ uint8_t usb_bridge_ep_in(void);
 uint8_t usb_bridge_ep_out(void);
 
 int  usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout);
-int  usb_bridge_bulk_read(void *buf, int len, unsigned int timeout);
+/* Fix v36: Match implementation */
+int  usb_bridge_bulk_read(uint8_t *buf, int len);
 void usb_bridge_flush_in(int max_packets, int timeout_ms);
 void usb_bridge_close(void);
 
