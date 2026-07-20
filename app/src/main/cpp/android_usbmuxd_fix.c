@@ -63,6 +63,14 @@ void android_fix_set_device(const char *udid, int product_id)
     pthread_mutex_unlock(&g_fix_mutex);
 }
 
+/* Alias with namespaced name — called from jni_bridge_imd.c */
+void android_usbmuxd_fix_set_device(const char *udid, int product_id)
+{
+    android_fix_set_device(udid, product_id);
+}roduct_id = product_id;
+    pthread_mutex_unlock(&g_fix_mutex);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  * OVERRIDE (via -Wl,--wrap=usbmuxd_get_device): __wrap_usbmuxd_get_device()
  *

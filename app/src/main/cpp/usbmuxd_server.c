@@ -37,6 +37,9 @@
 #define V1_PROTO_VER     0
 #define V1_PROTO_CONTROL 1
 #define V1_PROTO_SETUP   2
+#ifdef V1_PROTO_TCP
+#undef V1_PROTO_TCP
+#endif
 #define V1_PROTO_TCP     6   /* IPPROTO_TCP */
 
 /* TCP flags */
@@ -836,7 +839,7 @@ static void *handle_client(void *arg) {
             if (s) {
                 s += 8;
                 const char *e = strstr(s, "</string>");
-                if (e && (e - s) < sizeof(msg_type_str)) {
+                if (e && (size_t)(e - s) < sizeof(msg_type_str)) {
                     memcpy(msg_type_str, s, e - s);
                     msg_type_str[e - s] = '\0';
                 }
@@ -997,7 +1000,7 @@ static void *server_thread(void *arg) {
 /* ════════════════════════════════════════════════════════════════════════
  * Public API
  * ════════════════════════════════════════════════════════════════════════ */
-bool usbmuxd_server_start(const char *sock_dir) {
+bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_id) {
     if (g_server_running) return true;
 
     g_version_done = 0;
@@ -1006,13 +1009,22 @@ bool usbmuxd_server_start(const char *sock_dir) {
     g_pktlen = 0;
     set_device_state(DEV_STATE_INIT);
 
+    /* Store UDID and product_id if provided */
+    if (udid && udid[0]) {
+        pthread_mutex_lock(&g_udid_lock);
+        strncpy(g_udid, udid, sizeof(g_udid) - 1);
+        g_udid[sizeof(g_udid) - 1] = '\0';
+        pthread_mutex_unlock(&g_udid_lock);
+    }
+    (void)product_id; /* currently unused — UDID is the key used by ListDevices */
+
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
         LOGE("socket failed: %s", strerror(errno));
         return false;
     }
 
-    snprintf(g_sock_path, sizeof(g_sock_path), "%s/usbmuxd.sock", sock_dir);
+    snprintf(g_sock_path, sizeof(g_sock_path), "%s/usbmuxd.sock", files_dir);
     unlink(g_sock_path);
 
     struct sockaddr_un sa;

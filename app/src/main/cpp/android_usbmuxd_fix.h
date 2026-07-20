@@ -12,6 +12,9 @@ void android_fix_set_device(const char *udid, int product_id);
  * and usbmuxd_server.c. Forwards to __android_log_print. */
 void android_usbmuxd_fix_log(const char *msg);
 
+/* Alias with namespaced name — called from jni_bridge_imd.c */
+void android_usbmuxd_fix_set_device(const char *udid, int product_id);
+
 #ifdef __cplusplus
 }
 #endif
