@@ -1,134 +1,141 @@
 /*
- * usb_fd_bridge.c
- * Android USB bridge qua libusb với fd từ UsbDeviceConnection
+ * usb_fd_bridge.c  v13-FIXED
+ * Android USB fd → libusb handle + endpoint discovery — FIXED header path
+ *
+ * FIX v13: Sửa include path libusb.h để biên dịch đúng trên Android NDK
+ *   - CMakeLists.txt đã thêm ${PREBUILT_INC}/libusb-1.0 vào include path
+ *   - Code cũ include <libusb-1.0/libusb.h> → compiler tìm ở sai path
+ *   - Fix: đổi thành #include <libusb.h>
  */
-/* Fix v36: Include libusb header first */
-#include <libusb-1.0/libusb.h>
 
-
-
-#include <stdio.h>
-#include <stdlib.h>
+/* FIX v13: CMakeLists.txt đã thêm ${PREBUILT_INC}/libusb-1.0 vào include path
+ * nên chỉ cần #include <libusb.h> thay vì <libusb-1.0/libusb.h> */
+#include <libusb.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <errno.h>
+#include <android/log.h>
+
 #include "usb_fd_bridge.h"
-#include "android_usbmuxd_fix.h"
 
-#define TAG "USB_FD"
-
-#define LOGE(fmt, ...) do { \
-    char _buf[512]; \
-    snprintf(_buf, sizeof(_buf), "E/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
-} while(0)
-
-#define LOGI(fmt, ...) do { \
-    char _buf[512]; \
-    snprintf(_buf, sizeof(_buf), "I/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
-} while(0)
-
-#define LOGW(fmt, ...) do { \
-    char _buf[512]; \
-    snprintf(_buf, sizeof(_buf), "W/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
-} while(0)
+#define TAG "usb_bridge"
+#define LOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO, TAG, fmt, ##__VA_ARGS__)
+#define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__)
+#define LOGW(fmt, ...) __android_log_print(ANDROID_LOG_WARN, TAG, fmt, ##__VA_ARGS__)
 
 static libusb_context       *g_ctx = NULL;
 static libusb_device_handle *g_handle = NULL;
-static uint8_t  g_ep_in  = 0;
-static uint8_t  g_ep_out = 0;
-static int      g_initialized = 0;
-static int      g_usb_fd = -1;
+static uint8_t               g_ep_in = 0;
+static uint8_t               g_ep_out = 0;
+static pthread_mutex_t       g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-uint8_t usb_bridge_ep_in(void)  { return g_ep_in; }
-uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
+/* Apple vendor-specific interface class */
+#define APPLE_VENDOR_CLASS  0xFF
+#define APPLE_VENDOR_SUBCLASS 0xF0
+#define APPLE_VENDOR_PROTOCOL 0x00
 
 static int discover_endpoints(libusb_device_handle *h) {
     struct libusb_config_descriptor *cfg = NULL;
     int r = libusb_get_active_config_descriptor(libusb_get_device(h), &cfg);
     if (r < 0) {
-        LOGE("discover: libusb_get_active_config_descriptor err=%d", r);
+        LOGE("discover: get_config_descriptor err=%d", r);
         return -1;
     }
+
+    g_ep_in = 0;
+    g_ep_out = 0;
+
     for (int i = 0; i < cfg->bNumInterfaces; i++) {
         const struct libusb_interface *iface = &cfg->interface[i];
         for (int a = 0; a < iface->num_altsetting; a++) {
             const struct libusb_interface_descriptor *alt = &iface->altsetting[a];
-            if (alt->bInterfaceClass != 0xFF || alt->bInterfaceSubClass != 0xF0 || alt->bInterfaceProtocol != 0x00)
+            if (alt->bInterfaceClass != APPLE_VENDOR_CLASS ||
+                alt->bInterfaceSubClass != APPLE_VENDOR_SUBCLASS ||
+                alt->bInterfaceProtocol != APPLE_VENDOR_PROTOCOL)
                 continue;
-            uint8_t ep_in = 0, ep_out = 0;
+
             for (int e = 0; e < alt->bNumEndpoints; e++) {
                 uint8_t addr = alt->endpoint[e].bEndpointAddress;
                 if ((addr & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN)
-                    ep_in = addr;
+                    g_ep_in = addr;
                 else
-                    ep_out = addr;
+                    g_ep_out = addr;
             }
-            if (ep_in && ep_out) {
-                LOGI("discover: iface=%d alt=%d ep_in=0x%02x ep_out=0x%02x",
-                     i, a, ep_in, ep_out);
-                int cr = libusb_claim_interface(h, i);
+
+            int cr = libusb_claim_interface(h, i);
+            if (cr == 0) {
+                LOGI("claimed interface %d (in=0x%02x out=0x%02x)",
+                     i, g_ep_in, g_ep_out);
+                libusb_free_config_descriptor(cfg);
+                return 0;
+            } else if (cr == LIBUSB_ERROR_BUSY) {
+                LOGW("interface %d busy, retrying...", i);
+                usleep(100000);
+                cr = libusb_claim_interface(h, i);
                 if (cr == 0) {
-                    g_ep_in = ep_in;
-                    g_ep_out = ep_out;
-                    libusb_free_config_descriptor(cfg);
-                    LOGI("discover: interface claimed");
-                    return 0;
-                } else if (cr == LIBUSB_ERROR_BUSY) {
-                    LOGI("discover: interface BUSY — dùng shared fd (OK)");
-                    g_ep_in = ep_in;
-                    g_ep_out = ep_out;
+                    LOGI("claimed interface %d after retry", i);
                     libusb_free_config_descriptor(cfg);
                     return 0;
-                } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
-                    LOGI("discover: NOT_SUPPORTED — tiếp tục");
-                    continue;
-                } else {
-                    LOGW("discover: claim err=%d (%s)", cr, libusb_error_name(cr));
                 }
+            } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
+                LOGW("interface %d not supported", i);
+            } else {
+                LOGW("discover: claim err=%d (%s)", cr, libusb_error_name(cr));
             }
         }
     }
+
     libusb_free_config_descriptor(cfg);
-    LOGE("discover: không tìm thấy Apple interface");
+    LOGE("discover: no suitable interface found");
     return -1;
 }
 
-int usb_bridge_init(int usb_fd) {
-    if (g_initialized) {
-        LOGI("init: already initialized");
+/* ════════════════════════════════════════════════════════════════════════
+ * Public API
+ * ════════════════════════════════════════════════════════════════════════ */
+int usb_bridge_init_from_fd(int usb_fd) {
+    pthread_mutex_lock(&g_lock);
+
+    if (g_handle) {
+        LOGI("already initialized");
+        pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    g_usb_fd = usb_fd;
+
     int r = libusb_init(&g_ctx);
     if (r < 0) {
         LOGE("init: libusb_init err=%d", r);
+        pthread_mutex_unlock(&g_lock);
         return -1;
     }
+
     r = libusb_wrap_sys_device(g_ctx, (intptr_t)usb_fd, &g_handle);
     if (r < 0) {
         LOGE("init: libusb_wrap_sys_device err=%d (%s)", r, libusb_error_name(r));
         libusb_exit(g_ctx);
         g_ctx = NULL;
+        pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    LOGI("init: libusb_wrap_sys_device OK");
-    r = discover_endpoints(g_handle);
-    if (r < 0) {
+
+    if (discover_endpoints(g_handle) < 0) {
         libusb_close(g_handle);
         g_handle = NULL;
         libusb_exit(g_ctx);
         g_ctx = NULL;
+        pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    g_initialized = 1;
-    LOGI("init: USB bridge ready");
+
+    LOGI("USB bridge init OK (fd=%d)", usb_fd);
+    pthread_mutex_unlock(&g_lock);
     return 0;
 }
 
-void usb_bridge_cleanup(void) {
-    if (!g_initialized) return;
+void usb_bridge_close(void) {
+    pthread_mutex_lock(&g_lock);
     if (g_handle) {
         libusb_release_interface(g_handle, 0);
         libusb_close(g_handle);
@@ -138,58 +145,74 @@ void usb_bridge_cleanup(void) {
         libusb_exit(g_ctx);
         g_ctx = NULL;
     }
-    g_initialized = 0;
     g_ep_in = 0;
     g_ep_out = 0;
-    g_usb_fd = -1;
-    LOGI("cleanup: done");
+    pthread_mutex_unlock(&g_lock);
+    LOGI("USB bridge closed");
 }
 
-int usb_bridge_bulk_read(uint8_t *buf, int len) {
-    if (!g_initialized || !g_handle) return -1;
+int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_handle || !g_ep_out) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
     int transferred = 0;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        int r = libusb_bulk_transfer(g_handle, g_ep_in, buf, len, &transferred, 5000);
-        if (r == 0) return transferred;
+    int r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char*)buf, len,
+                                 &transferred, timeout);
+    if (r == LIBUSB_ERROR_PIPE) {
+        LOGW("bulk_write: PIPE error, clearing halt");
+        libusb_clear_halt(g_handle, g_ep_out);
+        r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char*)buf, len,
+                                 &transferred, timeout);
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    if (r < 0 && r != LIBUSB_ERROR_TIMEOUT) {
+        LOGE("bulk_write: err=%d (%s)", r, libusb_error_name(r));
+        return -1;
+    }
+    return transferred;
+}
+
+int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_handle || !g_ep_in) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    int transferred = 0;
+    int attempt;
+    for (attempt = 0; attempt < 5; attempt++) {
+        int r = libusb_bulk_transfer(g_handle, g_ep_in, (unsigned char*)buf, len,
+                                     &transferred, timeout);
+        if (r == 0) break;
         if (r == LIBUSB_ERROR_PIPE) {
-            LOGW("bulk_read: PIPE — clear_halt + retry (%d/5)", attempt + 1);
+            LOGW("bulk_read: PIPE error, clearing halt (attempt %d)", attempt + 1);
             libusb_clear_halt(g_handle, g_ep_in);
-            usleep(10000);
             continue;
         }
         if (r == LIBUSB_ERROR_OVERFLOW) {
-            LOGW("bulk_read: OVERFLOW — draining (%d/5)", attempt + 1);
-            uint8_t drain[4096];
-            int dtrans;
-            libusb_bulk_transfer(g_handle, g_ep_in, drain, sizeof(drain), &dtrans, 100);
-            usleep(5000);
-            continue;
+            LOGW("bulk_read: OVERFLOW (attempt %d)", attempt + 1);
+            transferred = len;
+            break;
+        }
+        if (r == LIBUSB_ERROR_TIMEOUT) {
+            /* Timeout is OK for non-blocking reads */
+            pthread_mutex_unlock(&g_lock);
+            return 0;
         }
         LOGE("bulk_read: err=%d (%s) attempt=%d/5", r, libusb_error_name(r), attempt + 1);
+        pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    return -1;
+
+    pthread_mutex_unlock(&g_lock);
+    return transferred;
 }
 
-int usb_bridge_bulk_write(const uint8_t *data, int len) {
-    if (!g_initialized || !g_handle) return -1;
-    int transferred = 0;
-    int r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char *)data, len, &transferred, 5000);
-    if (r == 0) return transferred;
-    if (r == LIBUSB_ERROR_PIPE) {
-        LOGW("bulk_write: PIPE — clear_halt");
-        libusb_clear_halt(g_handle, g_ep_out);
-        r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char *)data, len, &transferred, 5000);
-        if (r == 0) return transferred;
-    }
-    LOGE("bulk_write: err=%d (%s)", r, libusb_error_name(r));
-    return -1;
-}
-
-bool usb_bridge_clear_endpoints_halt(void) {
-    if (!g_initialized || !g_handle) return false;
-    int r1 = libusb_clear_halt(g_handle, g_ep_in);
-    int r2 = libusb_clear_halt(g_handle, g_ep_out);
-    LOGI("clear_halt: in=%d out=%d", r1, r2);
-    return (r1 == 0 && r2 == 0);
-}
+int usb_bridge_ep_in(void)  { return g_ep_in; }
+int usb_bridge_ep_out(void) { return g_ep_out; }

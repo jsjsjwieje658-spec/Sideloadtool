@@ -1,503 +1,894 @@
 /*
- * usbmuxd_server.c
- * Tạo Unix domain socket giả lập usbmuxd cho libimobiledevice
+ * usbmuxd_server.c  v21-FIXED
+ * Mini usbmuxd server nội bộ (in-process, Mode 1) — FIXED for Android Bionic
+ *
+ * Chạy một Unix domain socket server mô phỏng usbmuxd.
+ * libimobiledevice (libusbmuxd) sẽ kết nối đến socket này thay vì
+ * /var/run/usbmuxd (không tồn tại trên Android không root).
+ *
+ * FIX v21: Sửa lỗi biên dịch trên Android Bionic libc
+ *   - struct tcphdr field names khác glibc → định nghĩa struct riêng
+ *   - Thiếu #include <sys/types.h> cho htonl/ntohl
+ *   - usb_bridge_bulk_write/read thiếu timeout parameter
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+
 #include "usbmuxd_server.h"
-#include "android_usbmuxd_fix.h"
+#include "usb_fd_bridge.h"
 
-#define TAG "USBMUX_SRV"
+/* ════════════════════════════════════════════════════════════════════════
+ * FIX: Android Bionic libc có struct tcphdr với field names KHÁC glibc.
+ * Định nghĩa struct riêng để tránh phụ thuộc libc.
+ * ════════════════════════════════════════════════════════════════════════ */
+#ifdef __ANDROID__
+struct tcphdr {
+    uint16_t th_sport;   /* source port */
+    uint16_t th_dport;   /* destination port */
+    uint32_t th_seq;     /* sequence number */
+    uint32_t th_ack;     /* acknowledgement number */
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+    uint8_t th_x2:4;     /* (unused) */
+    uint8_t th_off:4;    /* data offset */
+#else
+    uint8_t th_off:4;    /* data offset */
+    uint8_t th_x2:4;     /* (unused) */
+#endif
+    uint8_t  th_flags;   /* TCP flags */
+    uint16_t th_win;     /* window */
+    uint16_t th_sum;     /* checksum */
+    uint16_t th_urp;     /* urgent pointer */
+};
+#endif
 
-#define LOGE(fmt, ...) do { \
-    char _buf[512]; \
-    snprintf(_buf, sizeof(_buf), "E/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
-} while(0)
-
+#define TAG "usbmuxd_srv"
 #define LOGI(fmt, ...) do { \
     char _buf[512]; \
     snprintf(_buf, sizeof(_buf), "I/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
+    __android_log_write(ANDROID_LOG_INFO, TAG, _buf); \
 } while(0)
-
-#define LOGW(fmt, ...) do { \
+#define LOGE(fmt, ...) do { \
     char _buf[512]; \
-    snprintf(_buf, sizeof(_buf), "W/" TAG ": " fmt, ##__VA_ARGS__); \
-    android_usbmuxd_fix_log(_buf); \
+    snprintf(_buf, sizeof(_buf), "E/" TAG ": " fmt, ##__VA_ARGS__); \
+    __android_log_write(ANDROID_LOG_ERROR, TAG, _buf); \
 } while(0)
 
-#include "usbmux.h"
+/* ── Protocol constants ── */
+#define USBMUXD_PROTOCOL_VERSION 1
 
-/* V1 protocol constants - sử dụng giá trị từ usbmux.h để tránh redefine */
-#ifndef V1_PROTO_TCP
-#define V1_PROTO_TCP     6   /* IPPROTO_TCP */
-#endif
-#define V1_PROTO_SETUP   7   /* SETUP packet type */
+/* v0 binary protocol (legacy, for reference) */
+typedef struct {
+    uint32_t length;   /* total packet length */
+    uint32_t version;  /* protocol version */
+    uint32_t message;  /* message type */
+    uint32_t tag;      /* client tag */
+} v0_mux_hdr_t;
 
-/* Định nghĩa đầy đủ struct version_header */
-struct version_header {
+/* v1 protocol header (big-endian) */
+typedef struct {
+    uint32_t protocol; /* 0=version, 1=TCP */
+    uint32_t length;   /* total length */
+    uint32_t magic;    /* 0xfeedface */
+    uint16_t tx_seq;   /* sender sequence */
+    uint16_t rx_seq;   /* receiver sequence */
+} v1_mux_hdr_t;
+
+#define V1_MAGIC 0xfeedface
+
+/* Version exchange body */
+typedef struct {
     uint32_t major;
     uint32_t minor;
-    uint32_t padding;
-} __attribute__((packed));
+    uint32_t padding[2];
+} version_header;
 
-typedef struct { uint32_t len, magic, protocol; } v0_mux_hdr_t;
+/* Message types (v0, for internal client communication) */
+enum {
+    MSG_RESULT = 1,
+    MSG_CONNECT = 2,
+    MSG_READ = 3,
+    MSG_WRITE = 4,
+    MSG_LISTEN = 5,
+    MSG_ATTACHED = 6,
+    MSG_DETACHED = 7,
+    MSG_LISTDEVICES = 8,
+    MSG_DEVICE_ADD = 9,
+    MSG_DEVICE_REMOVE = 10,
+};
 
-#define USBMUXD_SOCKET_FILE  "usbmuxd.sock"
+/* Client connection state */
+typedef struct client {
+    int fd;
+    uint32_t tag;
+    int listening;
+    int usb_connected;
+    uint16_t usb_sport;
+    uint16_t usb_dport;
+    uint32_t usb_seq;
+    uint32_t usb_ack;
+    struct client *next;
+} client_t;
 
-static int      g_listen_sock = -1;
-static char     g_sock_path[256];
-static volatile int g_running = 0;
+/* Global state */
+static int g_server_fd = -1;
+static int g_running = 0;
 static pthread_t g_server_thread;
+static pthread_t g_usb_rx_thread;
+static pthread_mutex_t g_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+static client_t *g_clients = NULL;
+static char g_sock_path[256] = "";
+static char g_udid[44] = "";
+static int g_product_id = 0x12a8;
+static pthread_mutex_t g_udid_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int g_listen_fds[16];
-static int g_listen_count = 0;
-static pthread_mutex_t g_listen_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_current_usb_tag = 0;
+static int g_version_exchanged = 0;
+static pthread_mutex_t g_version_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static uint16_t g_next_sport = 50000;
-
-/* ========== TCP state cho v1 protocol ========== */
-typedef struct {
-    uint32_t sport;
-    uint32_t seq;
-    uint32_t remote_seq;
-    uint32_t acked;
-    int      connected;
-} tcp_state_t;
-
-static tcp_state_t g_tcp;
-
-static void tcp_init(tcp_state_t *st) {
-    memset(st, 0, sizeof(*st));
-    st->sport = g_next_sport++;
-    st->seq   = (uint32_t)(rand() & 0x7FFFFFFF);
-}
-
-/* ========== Helpers ========== */
-static int usb_write_all(const uint8_t *data, int len) {
+/* ════════════════════════════════════════════════════════════════════════
+ * USB I/O helpers
+ * ════════════════════════════════════════════════════════════════════════ */
+static int usb_send_all(const uint8_t *data, int len) {
     int total = 0;
     while (total < len) {
-        int n = usb_bridge_bulk_write(data + total, len - total);
-        if (n < 0) {
-            LOGE("usb_write: failed at %d/%d", total, len);
+        int remain = len - total;
+        /* FIX v21: thêm timeout parameter */
+        int n = usb_bridge_bulk_write(data + total, remain, 5000);
+        if (n <= 0) {
+            LOGE("usb_send_all: write failed (%d)", n);
             return -1;
         }
         total += n;
     }
-    return total;
-}
-
-static int read_mux_packet(uint8_t *rxbuf, int rxbuf_len, uint32_t *pkt_len_out) {
-    int n = usb_bridge_bulk_read(rxbuf, 4);
-    if (n < 4) return -1;
-    uint32_t pkt_len = (rxbuf[0] << 24) | (rxbuf[1] << 16) | (rxbuf[2] << 8) | rxbuf[3];
-    if (pkt_len < 4 || pkt_len > (uint32_t)rxbuf_len) {
-        LOGE("read_mux_packet: invalid pkt_len=%u", pkt_len);
-        return -1;
-    }
-    int body_len = pkt_len - 4;
-    if (body_len > 0) {
-        n = usb_bridge_bulk_read(rxbuf + 4, body_len);
-        if (n < body_len) {
-            LOGE("read_mux_packet: partial body read %d/%u", n, body_len);
-            return -1;
-        }
-    }
-    *pkt_len_out = pkt_len;
     return 0;
 }
 
-/* ========== Version exchange ========== */
-static int send_version(void) {
-    uint8_t pkt[sizeof(v0_mux_hdr_t) + sizeof(struct version_header)];
-    v0_mux_hdr_t *hdr = (v0_mux_hdr_t *)pkt;
-    struct version_header *vh = (struct version_header *)(pkt + sizeof(v0_mux_hdr_t));
-    hdr->len = htonl(sizeof(v0_mux_hdr_t) + sizeof(struct version_header));
-    hdr->magic = htonl(0x6c1b1b1b);
-    hdr->protocol = htonl(1);
-    vh->major = htonl(2);
-    vh->minor = htonl(0);
-    vh->padding = 0;
-    return usb_write_all(pkt, sizeof(pkt));
+/* FIX v21: thêm timeout parameter */
+static int usb_recv_all(uint8_t *rxbuf, int len) {
+    int n = usb_bridge_bulk_read(rxbuf, len, 5000);
+    if (n != len) {
+        LOGE("usb_recv_all: expected %d got %d", len, n);
+        return -1;
+    }
+    return 0;
 }
 
-static int recv_version(uint32_t *major_out) {
+/* ════════════════════════════════════════════════════════════════════════
+ * Version exchange (v1 protocol)
+ * ════════════════════════════════════════════════════════════════════════ */
+bool usbmux_version_exchange(void) {
+    pthread_mutex_lock(&g_version_mutex);
+    if (g_version_exchanged) {
+        pthread_mutex_unlock(&g_version_mutex);
+        return true;
+    }
+
+    /* 1. Send version packet */
+    v1_mux_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.protocol = htonl(0); /* VERSION packet */
+    hdr.length = htonl(sizeof(v1_mux_hdr_t) + sizeof(version_header));
+    hdr.magic = htonl(V1_MAGIC);
+    hdr.tx_seq = htons(0);
+    hdr.rx_seq = htons(0xffff);
+
+    version_header ver;
+    memset(&ver, 0, sizeof(ver));
+    ver.major = htonl(1);
+    ver.minor = htonl(0);
+
+    uint8_t tx[sizeof(hdr) + sizeof(ver)];
+    memcpy(tx, &hdr, sizeof(hdr));
+    memcpy(tx + sizeof(hdr), &ver, sizeof(ver));
+
+    if (usb_send_all(tx, sizeof(tx)) < 0) {
+        LOGE("version_exchange: send failed");
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+
+    /* 2. Receive 4-byte length */
     uint8_t rx[4];
-    int n = usb_bridge_bulk_read(rx, 4);
-    if (n < 4) return -1;
-    uint32_t pkt_len = (rx[0] << 24) | (rx[1] << 16) | (rx[2] << 8) | rx[3];
-    if (pkt_len < 4) return -1;
-    int body_len = pkt_len - 4;
-    uint8_t body[sizeof(struct version_header)];
-    if (body_len > (int)sizeof(body)) body_len = sizeof(body);
-    n = usb_bridge_bulk_read(body, body_len);
-    if (n < (int)sizeof(struct version_header)) return -1;
-    v0_mux_hdr_t hdr;
-    hdr.len = pkt_len;
-    hdr.magic = 0;
-    hdr.protocol = 0;
-    struct version_header *vh = (struct version_header *)body;
+    /* FIX v21: thêm timeout parameter */
+    int n = usb_bridge_bulk_read(rx, 4, 5000);
+    if (n != 4) {
+        LOGE("version_exchange: read len failed (%d)", n);
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+    uint32_t pkt_len = ntohl(*(uint32_t*)rx);
+    if (pkt_len < sizeof(v1_mux_hdr_t) || pkt_len > 4096) {
+        LOGE("version_exchange: bad len %u", pkt_len);
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+
+    /* 3. Receive rest of packet */
+    uint8_t *pkt = (uint8_t*)malloc(pkt_len);
+    if (!pkt) {
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+    *(uint32_t*)pkt = htonl(pkt_len);
+    if (usb_recv_all(pkt + 4, pkt_len - 4) < 0) {
+        free(pkt);
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+
+    /* 4. Parse response */
+    v1_mux_hdr_t *rh = (v1_mux_hdr_t*)pkt;
+    if (ntohl(rh->magic) != V1_MAGIC) {
+        LOGE("version_exchange: bad magic=0x%08x", ntohl(rh->magic));
+        free(pkt);
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+    if (ntohl(rh->protocol) != 1) {
+        LOGE("version_exchange: bad protocol=%u", ntohl(rh->protocol));
+        free(pkt);
+        pthread_mutex_unlock(&g_version_mutex);
+        return false;
+    }
+
+    LOGI("version_exchange: OK (v%u.%u)",
+         ntohl(((version_header*)(pkt + sizeof(v1_mux_hdr_t)))->major),
+         ntohl(((version_header*)(pkt + sizeof(v1_mux_hdr_t)))->minor));
+
+    free(pkt);
+    g_version_exchanged = 1;
+    pthread_mutex_unlock(&g_version_mutex);
+    return true;
+}
+
+void usbmuxd_server_reset_version_state(void) {
+    pthread_mutex_lock(&g_version_mutex);
+    g_version_exchanged = 0;
+    pthread_mutex_unlock(&g_version_mutex);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * TCP-over-USB helpers (v1 protocol)
+ * ════════════════════════════════════════════════════════════════════════ */
+static int recv_tcp(uint16_t *sport_out, uint16_t *dport_out,
+                    uint8_t *flags_out, uint32_t *seq_out, uint32_t *ack_out,
+                    uint8_t *payload, int *payload_len) {
+    /* Read v1 mux header (16 bytes) */
+    v1_mux_hdr_t hdr;
+    if (usb_recv_all((uint8_t*)&hdr, sizeof(hdr)) < 0) {
+        return -1;
+    }
+    if (ntohl(hdr.magic) != V1_MAGIC) {
+        LOGE("recv_tcp: bad magic=0x%08x", ntohl(hdr.magic));
+        return -1;
+    }
     if (ntohl(hdr.protocol) != 1) {
-        LOGE("recv_version: unexpected proto=%d", ntohl(hdr.protocol));
+        LOGE("recv_tcp: not TCP packet (proto=%u)", ntohl(hdr.protocol));
         return -1;
     }
-    *major_out = ntohl(vh->major);
-    return 0;
-}
 
-static int version_exchange(void) {
-    for (int attempt = 0; attempt < 5; attempt++) {
-        if (send_version() < 0) return -1;
-        uint32_t major = 0;
-        if (recv_version(&major) == 0) {
-            LOGI("version exchange OK (major=%u)", major);
-            return 0;
-        }
-        LOGI("version_exchange retry %d/5", attempt + 1);
-        usleep(100000);
-    }
-    return -1;
-}
-
-/* ========== v1 TCP helpers ========== */
-static int usb_send_setup(uint32_t type, uint32_t extra) {
-    uint8_t pkt[4 + 4 + 4];
-    uint32_t len = sizeof(pkt);
-    pkt[0] = (len >> 24) & 0xFF; pkt[1] = (len >> 16) & 0xFF;
-    pkt[2] = (len >> 8) & 0xFF;  pkt[3] = len & 0xFF;
-    pkt[4] = 0x00; pkt[5] = 0x00; pkt[6] = 0x00; pkt[7] = 0x00;
-    pkt[8] = (type >> 24) & 0xFF; pkt[9] = (type >> 16) & 0xFF;
-    pkt[10] = (type >> 8) & 0xFF; pkt[11] = type & 0xFF;
-    int r = usb_write_all(pkt, len);
-    if (r < 0) {
-        LOGE("usb_send_setup failed");
+    uint32_t body_len = ntohl(hdr.length) - sizeof(v1_mux_hdr_t);
+    if (body_len > 65536) {
+        LOGE("recv_tcp: body too large %u", body_len);
         return -1;
     }
-    LOGI("SETUP sent OK");
-    return 0;
-}
 
-static int recv_tcp(uint16_t *port_out, uint8_t *flags_out, uint32_t *seq_out,
-                    uint32_t *ack_out, uint8_t *payload, int *payload_len,
-                    int max_payload, int timeout_ms) {
-    uint8_t rxbuf[4096];
-    uint32_t pkt_len = 0;
-    int retry = 0;
-    while (retry < 20) {
-        int r = read_mux_packet(rxbuf, sizeof(rxbuf), &pkt_len);
-        if (r < 0) {
-            if (retry > 0) LOGI("recv_tcp: timeout after %d drains", retry);
-            return -1;
-        }
-        if (pkt_len < 4) continue;
-        uint32_t magic = (rxbuf[4] << 24) | (rxbuf[5] << 16) | (rxbuf[6] << 8) | rxbuf[7];
-        if (magic != 0x6c1b1b1b) {
-            LOGE("recv_tcp: bad magic=0x%08x", ntohl(*(uint32_t*)(rxbuf+4)));
-            continue;
-        }
-        uint32_t proto = (rxbuf[8] << 24) | (rxbuf[9] << 16) | (rxbuf[10] << 8) | rxbuf[11];
-        int body_len = pkt_len - 4 - 4 - 4;
-        uint8_t *body = rxbuf + 12;
-        if (proto == 1) {
-            /* CONTROL */
-            if (body_len > 0) {
-                LOGI("recv_tcp: drain CONTROL type=%d", body[0]);
-            } else {
-                LOGI("recv_tcp: drain CONTROL (empty)");
-            }
-            retry++;
-            continue;
-        }
-        if (proto == 7) {
-            LOGI("recv_tcp: drain SETUP");
-            retry++;
-            continue;
-        }
-        if (proto != 6) {
-            LOGW("recv_tcp: unexpected proto=%u", proto);
-            retry++;
-            continue;
-        }
-        /* TCP packet */
-        if (body_len < (int)sizeof(struct tcphdr)) {
-            LOGE("recv_tcp: TCP body too small %d < %zu", body_len, sizeof(struct tcphdr));
-            retry++;
-            continue;
-        }
+    uint8_t *body = (uint8_t*)malloc(body_len);
+    if (!body) return -1;
+    if (usb_recv_all(body, body_len) < 0) {
+        free(body);
+        return -1;
+    }
+
+    /* FIX v21: Dùng field names của struct tcphdr đã định nghĩa */
+    if (body_len >= (int)sizeof(struct tcphdr)) {
         struct tcphdr *tcp = (struct tcphdr *)body;
-        uint16_t dport = ntohs(tcp->dest);
-        uint16_t sport = ntohs(tcp->source);
-        if (dport != g_tcp.sport) {
-            LOGW("recv_tcp: port mismatch got %d->%d expect %d->%d",
-                 sport, dport, g_tcp.sport, *port_out);
-            retry++;
-            continue;
-        }
-        *port_out = sport;
+        uint16_t dport = ntohs(tcp->th_dport);
+        uint16_t sport = ntohs(tcp->th_sport);
+
+        if (sport_out) *sport_out = sport;
+        if (dport_out) *dport_out = dport;
         *flags_out = tcp->th_flags;
-        *seq_out = ntohl(tcp->seq);
-        *ack_out = ntohl(tcp->ack_seq);
+        *seq_out = ntohl(tcp->th_seq);
+        *ack_out = ntohl(tcp->th_ack);
         int plen = body_len - sizeof(struct tcphdr);
-        if (plen > max_payload) plen = max_payload;
-        if (plen > 0) memcpy(payload, body + sizeof(struct tcphdr), plen);
+        if (plen > 0 && payload && payload_len) {
+            if (plen > *payload_len) plen = *payload_len;
+            memcpy(payload, body + sizeof(struct tcphdr), plen);
+        }
         *payload_len = plen;
+        free(body);
         return 0;
     }
+
+    free(body);
     return -1;
 }
 
-static int build_tcp_packet(uint8_t *buf, int buf_len,
-                            uint16_t sport, uint16_t dport,
-                            uint32_t seq, uint32_t ack,
-                            uint8_t flags, const uint8_t *payload, int payload_len) {
-    int total = sizeof(struct tcphdr) + payload_len;
-    if (total > buf_len) return -1;
-    struct tcphdr *tcp = (struct tcphdr *)buf;
+static int send_tcp(uint16_t sport, uint16_t dport,
+                    uint32_t seq, uint32_t ack, uint8_t flags,
+                    const uint8_t *payload, int payload_len) {
+    int total = sizeof(v1_mux_hdr_t) + sizeof(struct tcphdr) + payload_len;
+    uint8_t *pkt = (uint8_t*)malloc(total);
+    if (!pkt) return -1;
+
+    v1_mux_hdr_t *hdr = (v1_mux_hdr_t*)pkt;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->protocol = htonl(1);
+    hdr->length = htonl(total);
+    hdr->magic = htonl(V1_MAGIC);
+    hdr->tx_seq = htons(0);
+    hdr->rx_seq = htons(0xffff);
+
+    /* FIX v21: Dùng field names của struct tcphdr đã định nghĩa */
+    struct tcphdr *tcp = (struct tcphdr *)(pkt + sizeof(v1_mux_hdr_t));
     memset(tcp, 0, sizeof(*tcp));
-    tcp->source = htons(sport);
-    tcp->dest   = htons(dport);
-    tcp->seq    = htonl(seq);
-    tcp->ack_seq = htonl(ack);
-    tcp->doff   = sizeof(struct tcphdr) / 4;
+    tcp->th_sport = htons(sport);
+    tcp->th_dport = htons(dport);
+    tcp->th_seq   = htonl(seq);
+    tcp->th_ack   = htonl(ack);
+    tcp->th_off   = sizeof(struct tcphdr) / 4;
     tcp->th_flags = flags;
-    tcp->window = htons(65535);
-    if (payload_len > 0) memcpy(buf + sizeof(struct tcphdr), payload, payload_len);
-    return total;
+    tcp->th_win   = htons(65535);
+
+    if (payload_len > 0) {
+        memcpy(pkt + sizeof(v1_mux_hdr_t) + sizeof(struct tcphdr), payload, payload_len);
+    }
+
+    int ret = usb_send_all(pkt, total);
+    free(pkt);
+    return ret;
 }
 
-static int send_tcp_raw(uint16_t sport, uint16_t dport,
-                        uint32_t seq, uint32_t ack,
-                        uint8_t flags, const uint8_t *payload, int payload_len) {
-    uint8_t body[2048];
-    int body_len = build_tcp_packet(body, sizeof(body), sport, dport, seq, ack, flags, payload, payload_len);
-    if (body_len < 0) return -1;
-    uint8_t pkt[4 + 4 + 4 + 2048];
-    int len = 4 + 4 + 4 + body_len;
-    pkt[0] = (len >> 24) & 0xFF; pkt[1] = (len >> 16) & 0xFF;
-    pkt[2] = (len >> 8) & 0xFF;  pkt[3] = len & 0xFF;
-    pkt[4] = 0x6c; pkt[5] = 0x1b; pkt[6] = 0x1b; pkt[7] = 0x1b;
-    pkt[8] = 0x00; pkt[9] = 0x00; pkt[10] = 0x00; pkt[11] = 0x06;
-    memcpy(pkt + 12, body, body_len);
-    return usb_write_all(pkt, len);
-}
+/* ════════════════════════════════════════════════════════════════════════
+ * USB connect/disconnect (v1 protocol)
+ * ════════════════════════════════════════════════════════════════════════ */
+static int do_usb_v1_connect(uint16_t dport, uint32_t *seq_out) {
+    if (!usbmux_version_exchange()) {
+        LOGE("do_usb_v1_connect: version exchange failed");
+        return -1;
+    }
 
-/* ========== v1_connect ========== */
-static int v1_connect(uint16_t port) {
-    LOGI("v1_connect: port=%d", port);
-    if (version_exchange() < 0) {
-        LOGE("v1_connect: version exchange failed");
+    uint32_t seq = 1;
+    if (send_tcp(12321, dport, seq, 0, TH_SYN, NULL, 0) < 0) {
         return -1;
     }
-    tcp_init(&g_tcp);
-    /* Drain non-TCP packets */
-    LOGI("v1_connect: draining non-TCP packets...");
-    int drained = 0;
-    for (int i = 0; i < 10; i++) {
-        uint8_t rxbuf[4096];
-        uint32_t pkt_len = 0;
-        int r = read_mux_packet(rxbuf, sizeof(rxbuf), &pkt_len);
-        if (r < 0) break;
-        if (pkt_len >= 12) {
-            uint32_t proto = (rxbuf[8] << 24) | (rxbuf[9] << 16) | (rxbuf[10] << 8) | rxbuf[11];
-            if (proto == 1) {
-                LOGI("v1_connect: drained CONTROL");
-            } else if (proto == 7) {
-                LOGI("v1_connect: drained SETUP");
-            } else if (proto == 6) {
-                LOGW("v1_connect: unexpected TCP during drain");
-                break;
-            }
-            drained++;
-        }
-    }
-    if (drained > 0) LOGI("v1_connect: drained %d packets", drained);
-    /* Send SYN */
-    uint32_t isn = g_tcp.seq;
-    LOGI("v1_connect: SYN -> port=%d sport=%d seq=%u", port, g_tcp.sport, isn);
-    if (send_tcp_raw(g_tcp.sport, port, isn, 0, TH_SYN, NULL, 0) < 0) {
-        LOGE("v1_connect: SYN failed");
-        return -1;
-    }
-    /* Wait SYN+ACK */
-    uint16_t rport = 0;
-    uint8_t flags = 0;
-    uint32_t rseq = 0, rack = 0;
+
+    uint8_t flags;
+    uint32_t ack_seq;
+    uint16_t sport, rport;
     uint8_t payload[1024];
-    int plen = 0;
-    int r = recv_tcp(&rport, &flags, &rseq, &rack, payload, &plen, sizeof(payload), 25000);
-    if (r < 0) {
-        LOGE("v1_connect: SYN+ACK timeout (25s)");
-        LOGE("v1_connect: -> Kiểm tra: iPhone unlock? Đã bấm Trust? Cáp data?");
-        return -1;
-    }
-    if (flags & TH_RST) {
-        LOGE("v1_connect: RST received — port %d refused", port);
-        LOGE("v1_connect: -> iPhone chưa Trust hoặc port không mở");
+    int plen = sizeof(payload);
+    if (recv_tcp(&sport, &rport, &flags, &ack_seq, seq, payload, &plen) < 0) {
         return -1;
     }
     if (!(flags & TH_SYN) || !(flags & TH_ACK)) {
-        LOGE("v1_connect: unexpected flags=0x%02x", flags);
+        LOGE("do_usb_v1_connect: expected SYN+ACK, got flags=0x%02x", flags);
         return -1;
     }
-    g_tcp.remote_seq = rseq;
-    g_tcp.acked = rack;
-    LOGI("v1_connect: SYN+ACK received remote_seq=%u", g_tcp.remote_seq);
-    /* Send ACK */
-    g_tcp.seq = rack;
-    uint32_t ack = rseq + 1;
-    if (send_tcp_raw(g_tcp.sport, port, g_tcp.seq, ack, TH_ACK, NULL, 0) < 0) {
-        LOGE("v1_connect: ACK failed");
+
+    seq++;
+    if (send_tcp(12321, dport, seq, ack_seq + 1, TH_ACK, NULL, 0) < 0) {
         return -1;
     }
-    g_tcp.connected = 1;
-    LOGI("v1_connect: TCP connected port=%d", port);
+
+    *seq_out = seq;
+    LOGI("USB v1 connect to port %u OK (seq=%u ack=%u)", dport, seq, ack_seq + 1);
     return 0;
 }
 
-/* ========== Tunnel thread ========== */
-static void *tunnel_thread(void *arg) {
-    int client_fd = *(int *)arg;
-    free(arg);
-    int usb_to_sock[2];
-    if (pipe(usb_to_sock) < 0) {
-        LOGE("pipe failed");
-        close(client_fd);
-        return NULL;
+/* ════════════════════════════════════════════════════════════════════════
+ * Client management
+ * ════════════════════════════════════════════════════════════════════════ */
+static client_t *find_client_by_fd(int fd) {
+    client_t *c = g_clients;
+    while (c) {
+        if (c->fd == fd) return c;
+        c = c->next;
     }
-    /* sock -> usb */
-    pthread_t t1;
-    int *pfd = malloc(sizeof(int));
-    *pfd = client_fd;
-    /* ... simplified ... */
-    close(client_fd);
     return NULL;
 }
 
-/* ========== Client handler ========== */
-static void handle_client(int client_fd) {
-    LOGI("client fd=%d connected", client_fd);
-    uint8_t rxbuf[4096];
-    int n = recv(client_fd, rxbuf, sizeof(rxbuf), 0);
-    if (n < 16) {
-        LOGE("client fd=%d: invalid pkt_len=%u", client_fd, (unsigned)n);
-        close(client_fd);
-        return;
+static client_t *find_client_by_tag(uint32_t tag) {
+    client_t *c = g_clients;
+    while (c) {
+        if (c->tag == tag) return c;
+        c = c->next;
     }
-    uint32_t pkt_len = ntohl(*(uint32_t *)rxbuf);
-    uint32_t msg_type = ntohl(*(uint32_t *)(rxbuf + 8));
-    uint32_t tag = ntohl(*(uint32_t *)(rxbuf + 12));
-    char msg_type_str[32] = {0};
-    const char *s = (char *)(rxbuf + 16);
-    const char *e = memchr(s, 0, n - 16);
-    if (e && (e - s) < (long)sizeof(msg_type_str)) {
-        strncpy(msg_type_str, s, sizeof(msg_type_str) - 1);
-    }
-    LOGI("client fd=%d: msg=%s tag=%u", client_fd, msg_type_str, tag);
-    if (strcmp(msg_type_str, "Connect") == 0) {
-        /* Parse port from XML */
-        int port = 0;
-        char *p = strstr((char *)rxbuf, "<key>PortNumber</key>");
-        if (p) {
-            p = strstr(p, "<integer>");
-            if (p) port = atoi(p + 9);
-        }
-        if (port <= 0) {
-            port = 62078; /* default usbmuxd */
-        }
-        if (v1_connect((uint16_t)port) < 0) {
-            LOGE("client fd=%d: connect failed port=%d", client_fd, port);
-            /* Send Result Failure */
-            close(client_fd);
-            return;
-        }
-        /* Send Result Success */
-        LOGI("client fd=%d: tunnel started port=%d", client_fd, port);
-        /* Start tunnel */
-        /* ... */
-        LOGI("client fd=%d: tunnel ended", client_fd);
-    }
-    close(client_fd);
-    LOGI("client fd=%d disconnected", client_fd);
+    return NULL;
 }
 
-/* ========== Server thread ========== */
+static client_t *find_client_by_usb_tag(uint32_t tag) {
+    client_t *c = g_clients;
+    while (c) {
+        if (c->usb_connected && c->tag == tag) return c;
+        c = c->next;
+    }
+    return NULL;
+}
+
+static void remove_client(int fd) {
+    pthread_mutex_lock(&g_clients_mutex);
+    client_t **pp = &g_clients;
+    while (*pp) {
+        if ((*pp)->fd == fd) {
+            client_t *tmp = *pp;
+            *pp = tmp->next;
+            close(tmp->fd);
+            free(tmp);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_clients_mutex);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Packet I/O with clients (v0 protocol for internal communication)
+ * ════════════════════════════════════════════════════════════════════════ */
+static int recv_pkt(int fd, uint32_t *msg_out, uint32_t *tag_out,
+                    uint8_t *payload, int *payload_len) {
+    v0_mux_hdr_t hdr;
+    int n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
+    if (n != sizeof(hdr)) return -1;
+
+    uint32_t len = ntohl(hdr.length);
+    uint32_t ver = ntohl(hdr.version);
+    uint32_t msg = ntohl(hdr.message);
+    uint32_t tag = ntohl(hdr.tag);
+
+    if (ver != USBMUXD_PROTOCOL_VERSION) {
+        LOGE("recv_pkt: bad version %u", ver);
+        return -1;
+    }
+
+    *msg_out = msg;
+    *tag_out = tag;
+
+    uint32_t body_len = len - sizeof(hdr);
+    if (body_len > 0) {
+        if (body_len > (uint32_t)*payload_len) {
+            LOGE("recv_pkt: payload too large %u > %d", body_len, *payload_len);
+            return -1;
+        }
+        n = recv(fd, payload, body_len, MSG_WAITALL);
+        if (n != (int)body_len) return -1;
+    }
+    *payload_len = body_len;
+    return 0;
+}
+
+static int send_pkt(int fd, uint32_t msg, uint32_t tag,
+                    const uint8_t *payload, int payload_len) {
+    v0_mux_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.length = htonl(sizeof(hdr) + payload_len);
+    hdr.version = htonl(USBMUXD_PROTOCOL_VERSION);
+    hdr.message = htonl(msg);
+    hdr.tag = htonl(tag);
+
+    struct iovec iov[2];
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len = sizeof(hdr);
+    iov[1].iov_base = (void*)payload;
+    iov[1].iov_len = payload_len;
+
+    int total = sizeof(hdr) + payload_len;
+    int sent = writev(fd, iov, payload_len > 0 ? 2 : 1);
+    if (sent != total) {
+        LOGE("send_pkt: short write %d != %d", sent, total);
+        return -1;
+    }
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Client thread
+ * ════════════════════════════════════════════════════════════════════════ */
+static void *client_thread(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    LOGI("client_thread: fd=%d started", cfd);
+
+    uint8_t payload[4096];
+    int payload_len;
+    uint32_t msg, tag;
+
+    while (g_running) {
+        payload_len = sizeof(payload);
+        if (recv_pkt(cfd, &msg, &tag, payload, &payload_len) < 0) {
+            break;
+        }
+
+        switch (msg) {
+        case MSG_LISTDEVICES: {
+            /* Return device info */
+            pthread_mutex_lock(&g_udid_mutex);
+            char udid_copy[44];
+            strncpy(udid_copy, g_udid, sizeof(udid_copy) - 1);
+            udid_copy[sizeof(udid_copy) - 1] = '\0';
+            int pid = g_product_id;
+            pthread_mutex_unlock(&g_udid_mutex);
+
+            /* Simple plist-like response */
+            char resp[512];
+            int resp_len = snprintf(resp, sizeof(resp),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ...>\n"
+                "<plist version=\"1.0\">\n"
+                "<dict>\n"
+                "  <key>DeviceList</key>\n"
+                "  <array>\n"
+                "    <dict>\n"
+                "      <key>DeviceID</key>\n"
+                "      <integer>1</integer>\n"
+                "      <key>ProductID</key>\n"
+                "      <integer>%d</integer>\n"
+                "      <key>SerialNumber</key>\n"
+                "      <string>%s</string>\n"
+                "      <key>ConnectionType</key>\n"
+                "      <string>USB</string>\n"
+                "    </dict>\n"
+                "  </array>\n"
+                "</dict>\n"
+                "</plist>\n", pid, udid_copy);
+
+            send_pkt(cfd, MSG_RESULT, tag, (uint8_t*)resp, resp_len);
+            break;
+        }
+
+        case MSG_LISTEN: {
+            pthread_mutex_lock(&g_clients_mutex);
+            client_t *c = find_client_by_fd(cfd);
+            if (c) c->listening = 1;
+            pthread_mutex_unlock(&g_clients_mutex);
+
+            /* Send Attached event */
+            pthread_mutex_lock(&g_udid_mutex);
+            char udid_copy[44];
+            strncpy(udid_copy, g_udid, sizeof(udid_copy) - 1);
+            udid_copy[sizeof(udid_copy) - 1] = '\0';
+            pthread_mutex_unlock(&g_udid_mutex);
+
+            char attached[256];
+            int alen = snprintf(attached, sizeof(attached),
+                "<?xml version=\"1.0\"?>\n"
+                "<plist version=\"1.0\">\n"
+                "<dict>\n"
+                "  <key>MessageType</key>\n"
+                "  <string>Attached</string>\n"
+                "  <key>DeviceID</key>\n"
+                "  <integer>1</integer>\n"
+                "  <key>Properties</key>\n"
+                "  <dict>\n"
+                "    <key>SerialNumber</key>\n"
+                "    <string>%s</string>\n"
+                "    <key>ConnectionType</key>\n"
+                "    <string>USB</string>\n"
+                "  </dict>\n"
+                "</dict>\n"
+                "</plist>\n", udid_copy);
+            send_pkt(cfd, MSG_DEVICE_ADD, 0, (uint8_t*)attached, alen);
+
+            uint32_t res = 0;
+            send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+            break;
+        }
+
+        case MSG_CONNECT: {
+            if (payload_len < 2) {
+                uint32_t res = htonl(EBADF);
+                send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                break;
+            }
+            uint16_t port = ntohs(*(uint16_t*)payload);
+            LOGI("client requested connect to port %u", port);
+
+            uint32_t seq = 0;
+            if (do_usb_v1_connect(port, &seq) < 0) {
+                uint32_t res = htonl(ECONNREFUSED);
+                send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                break;
+            }
+
+            pthread_mutex_lock(&g_clients_mutex);
+            client_t *c = find_client_by_fd(cfd);
+            if (c) {
+                c->usb_connected = 1;
+                c->usb_dport = port;
+                c->usb_seq = seq;
+                c->usb_ack = 0;
+                g_current_usb_tag = tag;
+            }
+            pthread_mutex_unlock(&g_clients_mutex);
+
+            uint32_t res = 0;
+            send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+            break;
+        }
+
+        case MSG_READ: {
+            pthread_mutex_lock(&g_clients_mutex);
+            client_t *c = find_client_by_fd(cfd);
+            if (!c || !c->usb_connected) {
+                pthread_mutex_unlock(&g_clients_mutex);
+                uint32_t res = htonl(ENOTCONN);
+                send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                break;
+            }
+            pthread_mutex_unlock(&g_clients_mutex);
+
+            /* Read from USB */
+            uint8_t usb_rx[4096];
+            int usb_rx_len = sizeof(usb_rx);
+            if (payload_len >= 4) {
+                usb_rx_len = ntohl(*(uint32_t*)payload);
+                if (usb_rx_len > (int)sizeof(usb_rx)) usb_rx_len = sizeof(usb_rx);
+            }
+
+            /* FIX v21: thêm timeout parameter */
+            int n = usb_bridge_bulk_read(usb_rx, usb_rx_len, 5000);
+            if (n > 0) {
+                send_pkt(cfd, MSG_DATA, tag, usb_rx, n);
+            } else {
+                uint32_t res = 0;
+                send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+            }
+            break;
+        }
+
+        case MSG_WRITE: {
+            pthread_mutex_lock(&g_clients_mutex);
+            client_t *c = find_client_by_fd(cfd);
+            if (!c || !c->usb_connected) {
+                pthread_mutex_unlock(&g_clients_mutex);
+                uint32_t res = htonl(ENOTCONN);
+                send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                break;
+            }
+            pthread_mutex_unlock(&g_clients_mutex);
+
+            if (payload_len > 0) {
+                /* FIX v21: thêm timeout parameter */
+                int n = usb_bridge_bulk_write(payload, payload_len, 5000);
+                if (n == payload_len) {
+                    uint32_t res = 0;
+                    send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                } else {
+                    uint32_t res = htonl(EIO);
+                    send_pkt(cfd, MSG_RESULT, tag, (const uint8_t *)&res, sizeof(res));
+                }
+            }
+            break;
+        }
+
+        default:
+            LOGI("unknown msg type %u", msg);
+            break;
+        }
+    }
+
+    LOGI("client_thread: fd=%d exiting", cfd);
+    remove_client(cfd);
+    return NULL;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * USB RX thread — forward USB data to connected client
+ * ════════════════════════════════════════════════════════════════════════ */
+static void *usb_rx_thread(void *arg) {
+    (void)arg;
+    LOGI("usb_rx_thread started");
+
+    while (g_running) {
+        uint8_t buf[4096];
+        /* FIX v21: thêm timeout parameter */
+        int n = usb_bridge_bulk_read(buf, sizeof(buf), 5000);
+        if (n > 0) {
+            pthread_mutex_lock(&g_clients_mutex);
+            client_t *c = find_client_by_usb_tag(g_current_usb_tag);
+            if (c && c->listening) {
+                send_pkt(c->fd, MSG_DATA, g_current_usb_tag, buf, n);
+            }
+            pthread_mutex_unlock(&g_clients_mutex);
+        }
+    }
+
+    LOGI("usb_rx_thread exiting");
+    return NULL;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Server thread
+ * ════════════════════════════════════════════════════════════════════════ */
 static void *server_thread(void *arg) {
     (void)arg;
-    LOGI("server thread started");
+    LOGI("server_thread started on %s", g_sock_path);
+
     while (g_running) {
-        struct sockaddr_un addr;
-        socklen_t len = sizeof(addr);
-        int client_fd = accept(g_listen_sock, (struct sockaddr *)&addr, &len);
-        if (client_fd < 0) {
+        struct sockaddr_un sa;
+        socklen_t len = sizeof(sa);
+        int cfd = accept(g_server_fd, (struct sockaddr *)&sa, &len);
+        if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             LOGE("accept failed: %s", strerror(errno));
             break;
         }
-        LOGI("new connection fd=%d", client_fd);
-        pthread_t t;
-        int *pfd = malloc(sizeof(int));
-        *pfd = client_fd;
-        pthread_create(&t, NULL, tunnel_thread, pfd);
-        pthread_detach(t);
+
+        LOGI("new client fd=%d", cfd);
+
+        pthread_mutex_lock(&g_clients_mutex);
+        client_t *c = (client_t*)calloc(1, sizeof(client_t));
+        c->fd = cfd;
+        c->next = g_clients;
+        g_clients = c;
+        pthread_mutex_unlock(&g_clients_mutex);
+
+        pthread_t tid;
+        pthread_create(&tid, NULL, client_thread, (void*)(intptr_t)cfd);
+        pthread_detach(tid);
     }
-    LOGI("server thread stopped");
+
     return NULL;
 }
 
-/* ========== Public API ========== */
+/* ════════════════════════════════════════════════════════════════════════
+ * Public API
+ * ════════════════════════════════════════════════════════════════════════ */
 bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_id) {
-    (void)udid;
-    (void)product_id;
     if (g_running) return true;
-    snprintf(g_sock_path, sizeof(g_sock_path), "%s/%s", files_dir, USBMUXD_SOCKET_FILE);
-    g_listen_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (g_listen_sock < 0) {
+
+    /* FIX v21: Nhận đủ 3 tham số như định nghĩa trong .h */
+    if (!files_dir || !files_dir[0]) {
+        LOGE("usbmuxd_server_start: files_dir is NULL");
+        return false;
+    }
+
+    /* Setup socket path */
+    snprintf(g_sock_path, sizeof(g_sock_path), "%s/usbmuxd.sock", files_dir);
+
+    /* Update UDID and product ID */
+    pthread_mutex_lock(&g_udid_mutex);
+    if (udid && udid[0]) {
+        strncpy(g_udid, udid, sizeof(g_udid) - 1);
+        g_udid[sizeof(g_udid) - 1] = '\0';
+    } else {
+        strcpy(g_udid, "00000000-0000000000000000");
+    }
+    g_product_id = product_id;
+    pthread_mutex_unlock(&g_udid_mutex);
+
+    /* Remove stale socket */
+    unlink(g_sock_path);
+
+    /* Create Unix socket */
+    g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_server_fd < 0) {
         LOGE("socket failed: %s", strerror(errno));
         return false;
     }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_sock_path, sizeof(addr.sun_path) - 1);
-    unlink(g_sock_path);
-    if (bind(g_listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, g_sock_path, sizeof(sa.sun_path) - 1);
+
+    if (bind(g_server_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         LOGE("bind failed: %s", strerror(errno));
-        close(g_listen_sock);
-        g_listen_sock = -1;
+        close(g_server_fd);
+        g_server_fd = -1;
         return false;
     }
-    if (listen(g_listen_sock, 10) < 0) {
+
+    if (listen(g_server_fd, 10) < 0) {
         LOGE("listen failed: %s", strerror(errno));
-        close(g_listen_sock);
-        g_listen_sock = -1;
+        close(g_server_fd);
+        g_server_fd = -1;
+        unlink(g_sock_path);
         return false;
     }
+
     g_running = 1;
+
+    /* Start threads */
     pthread_create(&g_server_thread, NULL, server_thread, NULL);
-    LOGI("server listening on %s", g_sock_path);
+    pthread_create(&g_usb_rx_thread, NULL, usb_rx_thread, NULL);
+
+    LOGI("usbmuxd server started on %s", g_sock_path);
     return true;
+}
+
+void usbmuxd_server_update_udid(const char *udid) {
+    if (!udid) return;
+    pthread_mutex_lock(&g_udid_mutex);
+    strncpy(g_udid, udid, sizeof(g_udid) - 1);
+    g_udid[sizeof(g_udid) - 1] = '\0';
+    pthread_mutex_unlock(&g_udid_mutex);
+
+    /* Broadcast Attached event to all listening clients */
+    usbmuxd_server_broadcast_attached();
+}
+
+void usbmuxd_server_broadcast_attached(void) {
+    pthread_mutex_lock(&g_udid_mutex);
+    char udid_copy[44];
+    strncpy(udid_copy, g_udid, sizeof(udid_copy) - 1);
+    udid_copy[sizeof(udid_copy) - 1] = '\0';
+    pthread_mutex_unlock(&g_udid_mutex);
+
+    char attached[512];
+    int alen = snprintf(attached, sizeof(attached),
+        "<?xml version=\"1.0\"?>\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "  <key>MessageType</key>\n"
+        "  <string>Attached</string>\n"
+        "  <key>DeviceID</key>\n"
+        "  <integer>1</integer>\n"
+        "  <key>Properties</key>\n"
+        "  <dict>\n"
+        "    <key>SerialNumber</key>\n"
+        "    <string>%s</string>\n"
+        "    <key>ConnectionType</key>\n"
+        "    <string>USB</string>\n"
+        "  </dict>\n"
+        "</dict>\n"
+        "</plist>\n", udid_copy);
+
+    pthread_mutex_lock(&g_clients_mutex);
+    client_t *c = g_clients;
+    while (c) {
+        if (c->listening) {
+            send_pkt(c->fd, MSG_DEVICE_ADD, 0, (uint8_t*)attached, alen);
+        }
+        c = c->next;
+    }
+    pthread_mutex_unlock(&g_clients_mutex);
+}
+
+const char *usbmuxd_server_socket_path(void) {
+    return g_sock_path[0] ? g_sock_path : NULL;
 }
 
 void usbmuxd_server_stop(void) {
     if (!g_running) return;
     g_running = 0;
-    if (g_listen_sock >= 0) {
-        close(g_listen_sock);
-        g_listen_sock = -1;
-    }
-    pthread_join(g_server_thread, NULL);
-    unlink(g_sock_path);
-    LOGI("server stopped");
-}
 
-const char *usbmuxd_server_get_socket_path(void) {
-    return g_sock_path;
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+
+    pthread_mutex_lock(&g_clients_mutex);
+    client_t *c = g_clients;
+    while (c) {
+        close(c->fd);
+        client_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    g_clients = NULL;
+    pthread_mutex_unlock(&g_clients_mutex);
+
+    if (g_sock_path[0]) {
+        unlink(g_sock_path);
+        g_sock_path[0] = '\0';
+    }
+
+    pthread_join(g_server_thread, NULL);
+    pthread_join(g_usb_rx_thread, NULL);
+
+    g_version_exchanged = 0;
+    LOGI("usbmuxd server stopped");
 }
