@@ -67,8 +67,6 @@ void android_fix_set_device(const char *udid, int product_id)
 void android_usbmuxd_fix_set_device(const char *udid, int product_id)
 {
     android_fix_set_device(udid, product_id);
-}roduct_id = product_id;
-    pthread_mutex_unlock(&g_fix_mutex);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

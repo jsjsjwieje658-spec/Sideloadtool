@@ -74,9 +74,7 @@ struct version_header {
  * Packet reassembly buffer
  * ════════════════════════════════════════════════════════════════════════ */
 #define DEV_MRU 65536
-static uint8_t  g_pktbuf[DEV_MRU];
 static uint32_t g_pktlen = 0;
-static pthread_mutex_t g_pktbuf_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Device state */
 typedef enum {
@@ -826,10 +824,8 @@ static void *handle_client(void *arg) {
         }
         if (rxlen < (int)pkt_len) continue;
 
-        uint32_t msg_type = ntohl(*(uint32_t *)(rxbuf + 8));
         uint32_t tag = ntohl(*(uint32_t *)(rxbuf + 12));
         char *xml = (char *)(rxbuf + 16);
-        int xml_len = pkt_len - 16;
 
         /* Parse MessageType */
         char msg_type_str[32] = "";
