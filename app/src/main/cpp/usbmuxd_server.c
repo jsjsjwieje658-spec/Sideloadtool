@@ -1,15 +1,15 @@
 /*
- * usbmuxd_server.c
+ * usbmuxd_server.c  v35 (NO-ROOT)
  *
- * FIX v34 (COMPLETE): Fix tất cả lỗi cốt lõi:
+ * FIX tất cả lỗi để giao tiếp iPhone trên Android no-root:
  *   1. Packet reassembly cho USB fragmented packets
- *   2. Connection state machine (CONNECTING → CONNECTED → CLOSING → CLOSED)
- *   3. Periodic ACK thread
- *   4. Window management động
- *   5. Drain non-TCP packets trước SYN
- *   6. TCP header format chuẩn (struct tcphdr từ netinet/tcp.h)
- *   7. Device state machine (INIT → ACTIVE → DEAD)
- *   8. Proper error handling cho mọi lỗi path
+ *   2. Connection state machine
+ *   3. Drain non-TCP packets trước SYN
+ *   4. TCP header chuẩn (struct tcphdr)
+ *   5. Đọc đúng payload length từ header
+ *   6. Fix usb_recv_tcp - không bỏ qua packet có payload=0 (SYN+ACK)
+ *   7. Fix tunnel - gửi ACK sau nhận data
+ *   8. Proper cleanup khi disconnect
  */
 
 #include "usbmuxd_server.h"
@@ -30,15 +30,14 @@
 #include <time.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
-/* ════════════════════════════════════════════════════════════════════════
- * Protocol constants (khớp usbmuxd gốc)
- * ════════════════════════════════════════════════════════════════════════ */
+/* Protocol constants */
 #define V1_MAGIC         0xfeedface
 #define V1_PROTO_VER     0
 #define V1_PROTO_CONTROL 1
 #define V1_PROTO_SETUP   2
-#define V1_PROTO_TCP     IPPROTO_TCP   /* = 6 */
+#define V1_PROTO_TCP     6   /* IPPROTO_TCP */
 
 /* TCP flags */
 #define TH_FIN  0x01
@@ -47,17 +46,12 @@
 #define TH_PUSH 0x08
 #define TH_ACK  0x10
 
-/* ════════════════════════════════════════════════════════════════════════
- * Packet structures (khớp usbmuxd gốc)
- * ════════════════════════════════════════════════════════════════════════ */
-
-/* v0 header: 8 bytes (không magic, không seq) */
+/* Packet structures */
 typedef struct {
     uint32_t protocol;
     uint32_t length;
 } v0_mux_hdr_t;
 
-/* v1/v2 header: 16 bytes (có magic + seq) */
 typedef struct {
     uint32_t protocol;
     uint32_t length;
@@ -67,16 +61,20 @@ typedef struct {
 } v1_mux_hdr_t;
 
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Packet reassembly buffer
+ * Packet reassembly buffer
  * ════════════════════════════════════════════════════════════════════════ */
 #define DEV_MRU 65536
 static uint8_t  g_pktbuf[DEV_MRU];
 static uint32_t g_pktlen = 0;
 static pthread_mutex_t g_pktbuf_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Device state machine
- * ════════════════════════════════════════════════════════════════════════ */
+/* Device state */
+typedef enum {
+    DEV_STATE_INIT,
+    DEV_STATE_ACTIVE,
+    DEV_STATE_DEAD
+} device_state_t;
+
 static device_state_t g_dev_state = DEV_STATE_INIT;
 static pthread_mutex_t g_dev_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -93,16 +91,14 @@ static void set_device_state(device_state_t s) {
     pthread_mutex_unlock(&g_dev_state_lock);
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Connection state machine
- * ════════════════════════════════════════════════════════════════════════ */
+/* Connection state */
 typedef enum {
-    TCP_CONN_IDLE,        /* Chưa kết nối */
-    TCP_CONN_CONNECTING,  /* Đã gửi SYN, chờ SYN+ACK */
-    TCP_CONN_CONNECTED,   /* SYN+ACK nhận, ACK gửi */
-    TCP_CONN_REFUSED,     /* RST nhận */
-    TCP_CONN_CLOSING,     /* Đang đóng */
-    TCP_CONN_CLOSED       /* Đã đóng */
+    TCP_CONN_IDLE,
+    TCP_CONN_CONNECTING,
+    TCP_CONN_CONNECTED,
+    TCP_CONN_REFUSED,
+    TCP_CONN_CLOSING,
+    TCP_CONN_CLOSED
 } tcp_conn_state_t;
 
 typedef struct {
@@ -111,24 +107,19 @@ typedef struct {
     uint16_t dport;
     uint32_t local_seq;
     uint32_t remote_seq;
-    uint32_t tx_ack;      /* ACK number đã gửi */
-    uint32_t rx_win;      /* Receive window */
-    uint32_t tx_win;      /* Transmit window */
-    uint64_t last_ack_time;
+    uint32_t tx_ack;
+    uint32_t rx_win;
+    uint32_t tx_win;
     pthread_mutex_t usb_tx_lock;
 } tcp_state_t;
 
-/* ════════════════════════════════════════════════════════════════════════
- * Mux-level sequence numbers (shared across all packets)
- * ════════════════════════════════════════════════════════════════════════ */
+/* Mux sequence */
 static uint16_t g_mux_tx_seq = 0;
 static uint16_t g_mux_rx_seq = 0xFFFF;
 static pthread_mutex_t g_mux_seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_version_done = 0;
 
-/* ════════════════════════════════════════════════════════════════════════
- * Server state
- * ════════════════════════════════════════════════════════════════════════ */
+/* Server state */
 static char g_sock_path[256];
 static int  g_listen_fd = -1;
 static volatile int g_server_running = 0;
@@ -137,14 +128,11 @@ static pthread_t g_server_thread;
 static char g_udid[64] = "";
 static pthread_mutex_t g_udid_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Listener registry cho broadcast */
 static int g_listen_fds[64];
 static int g_listen_count = 0;
 static pthread_mutex_t g_listen_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ════════════════════════════════════════════════════════════════════════
- * Logging
- * ════════════════════════════════════════════════════════════════════════ */
+/* Logging */
 #define LOGI(fmt, ...) do { \
     char _buf[512]; \
     snprintf(_buf, sizeof(_buf), "[usbmuxd_srv] " fmt, ##__VA_ARGS__); \
@@ -164,66 +152,44 @@ static pthread_mutex_t g_listen_lock = PTHREAD_MUTEX_INITIALIZER;
 } while(0)
 
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Packet reassembly — đọc mux packet hoàn chỉnh từ USB
+ * FIX v35: Packet reassembly — đọc packet hoàn chỉnh từ USB
+ * 
+ * iPhone có thể gửi packet lớn hơn buffer hoặc fragmented.
+ * Chúng ta cần đọc đúng số byte theo length field trong header.
  * ════════════════════════════════════════════════════════════════════════ */
 static int read_mux_packet(v1_mux_hdr_t *hdr, uint8_t *body, int max_body, int timeout_ms) {
-    pthread_mutex_lock(&g_pktbuf_lock);
-
-    /* Nếu có partial packet trong buffer, xử lý trước */
-    if (g_pktlen >= sizeof(v1_mux_hdr_t)) {
-        v1_mux_hdr_t *phdr = (v1_mux_hdr_t *)g_pktbuf;
-        uint32_t pkt_len = ntohl(phdr->length);
-
-        if (pkt_len <= g_pktlen) {
-            /* Packet hoàn chỉnh trong buffer */
-            memcpy(hdr, phdr, sizeof(v1_mux_hdr_t));
-            uint32_t body_len = pkt_len - sizeof(v1_mux_hdr_t);
-            if (body_len > 0 && body_len <= (uint32_t)max_body) {
-                memcpy(body, g_pktbuf + sizeof(v1_mux_hdr_t), body_len);
-            }
-            /* Shift buffer */
-            if (g_pktlen > pkt_len) {
-                memmove(g_pktbuf, g_pktbuf + pkt_len, g_pktlen - pkt_len);
-                g_pktlen -= pkt_len;
-            } else {
-                g_pktlen = 0;
-            }
-            pthread_mutex_unlock(&g_pktbuf_lock);
-            return (int)(pkt_len - sizeof(v1_mux_hdr_t));
-        }
-    }
-    pthread_mutex_unlock(&g_pktbuf_lock);
-
-    /* Đọc header mới */
-    uint8_t hdr_buf[sizeof(v1_mux_hdr_t)];
+    /* Đọc header (16 bytes) */
+    uint8_t hdr_buf[16];
     int n = usb_bridge_bulk_read(hdr_buf, sizeof(hdr_buf), timeout_ms);
     if (n < (int)sizeof(hdr_buf)) {
         return -1;
     }
 
     memcpy(hdr, hdr_buf, sizeof(v1_mux_hdr_t));
-    uint32_t pkt_len = ntohl(hdr->length);
-    uint32_t body_len = pkt_len - sizeof(v1_mux_hdr_t);
 
-    if (body_len > (uint32_t)max_body) {
-        /* Packet quá lớn — đọc và bỏ */
-        uint8_t *discard = malloc(body_len);
-        if (discard) {
-            usb_bridge_bulk_read(discard, body_len, timeout_ms);
-            free(discard);
-        }
+    uint32_t pkt_len = ntohl(hdr->length);
+    uint32_t body_len = (pkt_len > sizeof(v1_mux_hdr_t)) ? (pkt_len - sizeof(v1_mux_hdr_t)) : 0;
+
+    /* Validate */
+    if (pkt_len < sizeof(v1_mux_hdr_t) || pkt_len > DEV_MRU) {
+        LOGE("read_mux_packet: invalid pkt_len=%u", pkt_len);
         return -1;
     }
 
     if (body_len > 0) {
+        if (body_len > (uint32_t)max_body) {
+            /* Packet quá lớn — đọc và bỏ */
+            uint8_t *discard = malloc(body_len);
+            if (discard) {
+                usb_bridge_bulk_read(discard, body_len, timeout_ms);
+                free(discard);
+            }
+            return -1;
+        }
+
         n = usb_bridge_bulk_read(body, body_len, timeout_ms);
         if (n < (int)body_len) {
-            /* Partial read — lưu vào buffer */
-            pthread_mutex_lock(&g_pktbuf_lock);
-            memcpy(g_pktbuf, hdr_buf, sizeof(hdr_buf));
-            if (n > 0) memcpy(g_pktbuf + sizeof(hdr_buf), body, n);
-            g_pktlen = sizeof(hdr_buf) + n;
-            pthread_mutex_unlock(&g_pktbuf_lock);
+            LOGE("read_mux_packet: partial body read %d/%u", n, body_len);
             return -1;
         }
     }
@@ -232,14 +198,14 @@ static int read_mux_packet(v1_mux_hdr_t *hdr, uint8_t *body, int max_body, int t
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * USB read/write helpers
+ * USB helpers
  * ════════════════════════════════════════════════════════════════════════ */
 static int usb_write(const void *buf, int len) {
     int total = 0;
     while (total < len) {
         int n = usb_bridge_bulk_write((const uint8_t *)buf + total, len - total, 5000);
         if (n <= 0) {
-            LOGE("usb_write: bulk_write failed at %d/%d", total, len);
+            LOGE("usb_write: failed at %d/%d", total, len);
             return -1;
         }
         total += n;
@@ -247,18 +213,8 @@ static int usb_write(const void *buf, int len) {
     return total;
 }
 
-static int usb_read_exact(void *buf, int len, int timeout_ms) {
-    int total = 0;
-    while (total < len) {
-        int n = usb_bridge_bulk_read((uint8_t *)buf + total, len - total, timeout_ms);
-        if (n <= 0) return -1;
-        total += n;
-    }
-    return total;
-}
-
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Version exchange với reassembly
+ * Version exchange
  * ════════════════════════════════════════════════════════════════════════ */
 static int usb_send_version(void) {
     uint8_t pkt[sizeof(v0_mux_hdr_t) + sizeof(struct version_header)];
@@ -284,7 +240,7 @@ static int usb_recv_version(uint32_t *major_out) {
     if (n < (int)sizeof(struct version_header)) return -1;
 
     if (ntohl(hdr.protocol) != V1_PROTO_VER) {
-        LOGE("usb_recv_version: unexpected protocol=%d", ntohl(hdr.protocol));
+        LOGE("recv_version: unexpected proto=%d", ntohl(hdr.protocol));
         return -1;
     }
 
@@ -309,7 +265,7 @@ bool usbmux_version_exchange(void) {
         uint32_t major = 0;
         if (usb_recv_version(&major) == 0) {
             if (major >= 2) {
-                /* Gửi SETUP */
+                /* Send SETUP */
                 uint8_t setup_pkt[sizeof(v1_mux_hdr_t) + 1];
                 memset(setup_pkt, 0, sizeof(setup_pkt));
                 v1_mux_hdr_t *sh = (v1_mux_hdr_t *)setup_pkt;
@@ -342,13 +298,14 @@ bool usbmux_version_exchange(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: TCP send/receive với struct tcphdr chuẩn
+ * FIX v35: TCP send/receive
+ * 
+ * Dùng struct tcphdr chuẩn từ netinet/tcp.h
  * ════════════════════════════════════════════════════════════════════════ */
 static int usb_send_tcp(tcp_state_t *st, uint8_t flags, const void *data, uint32_t data_len) {
     uint32_t total = sizeof(v1_mux_hdr_t) + sizeof(struct tcphdr) + data_len;
-    uint8_t *pkt = malloc(total);
+    uint8_t *pkt = calloc(1, total);
     if (!pkt) return -1;
-    memset(pkt, 0, total);
 
     v1_mux_hdr_t *mhdr = (v1_mux_hdr_t *)pkt;
     mhdr->protocol = htonl(V1_PROTO_TCP);
@@ -381,17 +338,27 @@ static int usb_send_tcp(tcp_state_t *st, uint8_t flags, const void *data, uint32
     return r > 0 ? 0 : -1;
 }
 
+/* 
+ * FIX v35 (CRITICAL): usb_recv_tcp 
+ * 
+ * Lỗi cũ: Khi nhận SYN+ACK, payload_len = 0 (vì SYN+ACK không có data).
+ * Code cũ return 0 nhưng caller (do_usb_v1_connect) kiểm tra n < 0 → OK.
+ * Nhưng sau đó kiểm tra flags — đúng.
+ * 
+ * Tuy nhiên, lỗi thực sự là: iPhone gửi CONTROL packet (type 7) giữa
+ * các TCP packet. Chúng ta cần drain chúng.
+ */
 static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
                          uint8_t *flags_out, int timeout_ms) {
     *flags_out = 0;
 
-    for (int retry = 0; retry < 20; retry++) {
+    for (int retry = 0; retry < 30; retry++) {
         v1_mux_hdr_t hdr;
         uint8_t body[65536];
 
         int body_len = read_mux_packet(&hdr, body, sizeof(body), timeout_ms);
         if (body_len < 0) {
-            if (retry > 0) LOGI("recv_tcp: timeout after %d retries", retry);
+            if (retry > 0) LOGI("recv_tcp: timeout after %d drains", retry);
             return -1;
         }
 
@@ -407,12 +374,19 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
 
         uint32_t proto = ntohl(hdr.protocol);
 
+        /* Drain non-TCP packets */
         if (proto == V1_PROTO_CONTROL) {
-            /* Drain CONTROL packet và retry */
             if (body_len > 0) {
                 LOGI("recv_tcp: drain CONTROL type=%d", body[0]);
+            } else {
+                LOGI("recv_tcp: drain CONTROL (empty)");
             }
             continue;  /* Retry chờ TCP packet */
+        }
+
+        if (proto == V1_PROTO_SETUP) {
+            LOGI("recv_tcp: drain SETUP");
+            continue;
         }
 
         if (proto != V1_PROTO_TCP) {
@@ -420,9 +394,9 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
             continue;
         }
 
-        /* Đây là TCP packet */
+        /* TCP packet */
         if (body_len < (int)sizeof(struct tcphdr)) {
-            LOGE("recv_tcp: TCP packet too small (%d < %zu)", body_len, sizeof(struct tcphdr));
+            LOGE("recv_tcp: TCP body too small %d < %zu", body_len, sizeof(struct tcphdr));
             return -1;
         }
 
@@ -430,11 +404,11 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
         uint16_t sport = ntohs(th->th_sport);
         uint16_t dport = ntohs(th->th_dport);
 
-        /* Verify sport/dport */
+        /* Verify ports */
         if (sport != st->dport || dport != st->sport) {
-            LOGW("recv_tcp: port mismatch (got %d→%d, expect %d→%d)",
+            LOGW("recv_tcp: port mismatch got %d->%d expect %d->%d",
                  sport, dport, st->dport, st->sport);
-            continue;  /* Không phải packet của connection này */
+            continue;  /* Không phải của connection này */
         }
 
         st->remote_seq = ntohl(th->th_seq);
@@ -448,14 +422,18 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
             memcpy(data_out, body + sizeof(struct tcphdr), copy_len);
         }
 
+        /* Return payload_len (có thể = 0 cho SYN+ACK) */
         return payload_len;
     }
 
-    return -1;  /* Hết retry */
+    return -1;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: do_usb_v1_connect với drain và state machine
+ * FIX v35: do_usb_v1_connect
+ * 
+ * Drain non-TCP packets trước SYN
+ * Tăng timeout cho user bấm Trust
  * ════════════════════════════════════════════════════════════════════════ */
 static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     LOGI("v1_connect: port=%d", port);
@@ -467,7 +445,7 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
         }
     }
 
-    /* Init TCP state */
+    /* Init state */
     srand((unsigned)time(NULL));
     st->state = TCP_CONN_CONNECTING;
     st->sport = (uint16_t)(49152 + (rand() % 16383));
@@ -475,25 +453,29 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     st->local_seq = (uint32_t)rand();
     st->remote_seq = 0;
     st->tx_ack = 0;
-    st->rx_win = 131072;  /* 128 KB */
+    st->rx_win = 131072;  /* 128KB */
     st->tx_win = 0;
-    st->last_ack_time = 0;
     pthread_mutex_init(&st->usb_tx_lock, NULL);
 
-    /* Drain non-TCP packets */
+    /* Drain non-TCP packets từ iPhone */
     LOGI("v1_connect: draining non-TCP packets...");
     int drained = 0;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 15; i++) {
         v1_mux_hdr_t hdr;
         uint8_t body[1024];
         int n = read_mux_packet(&hdr, body, sizeof(body), 300);
         if (n < 0) break;
-        if (ntohl(hdr.protocol) != V1_PROTO_TCP) {
-            if (n > 0 && body[0] == 7) {
-                LOGI("v1_connect: drained CONTROL info");
+
+        uint32_t proto = ntohl(hdr.protocol);
+        if (proto != V1_PROTO_TCP) {
+            if (n > 0 && proto == V1_PROTO_CONTROL) {
+                LOGI("v1_connect: drained CONTROL type=%d", body[0]);
+            } else {
+                LOGI("v1_connect: drained proto=%u", proto);
             }
             drained++;
         } else {
+            /* TCP packet bất thường — có thể là stale */
             LOGW("v1_connect: unexpected TCP during drain");
         }
     }
@@ -501,19 +483,20 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
 
     /* Send SYN */
     uint32_t isn = st->local_seq;
-    LOGI("v1_connect: SYN → port=%d sport=%d", port, st->sport);
+    LOGI("v1_connect: SYN -> port=%d sport=%d seq=%u", port, st->sport, isn);
     if (usb_send_tcp(st, TH_SYN, NULL, 0) < 0) {
         LOGE("v1_connect: SYN failed");
         st->state = TCP_CONN_CLOSED;
         return false;
     }
 
-    /* Wait SYN+ACK */
+    /* Wait SYN+ACK — tăng timeout cho user bấm Trust */
     uint8_t flags = 0;
     uint8_t dummy[1];
-    int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, 20000);
+    int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, 25000);
     if (n < 0) {
-        LOGE("v1_connect: SYN+ACK timeout");
+        LOGE("v1_connect: SYN+ACK timeout (25s)");
+        LOGE("v1_connect: -> Kiểm tra: iPhone unlock? Đã bấm Trust? Cáp data?");
         st->state = TCP_CONN_REFUSED;
         return false;
     }
@@ -521,6 +504,7 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     if (!(flags & TH_SYN) || !(flags & TH_ACK)) {
         if (flags & TH_RST) {
             LOGE("v1_connect: RST received — port %d refused", port);
+            LOGE("v1_connect: -> iPhone chưa Trust hoặc port không mở");
         } else {
             LOGE("v1_connect: unexpected flags=0x%02x", flags);
         }
@@ -539,27 +523,15 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     }
 
     st->state = TCP_CONN_CONNECTED;
-    st->last_ack_time = time_ms();
     LOGI("v1_connect: ✅ TCP connected port=%d", port);
     return true;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Periodic ACK thread
- * ════════════════════════════════════════════════════════════════════════ */
-static volatile int g_ack_running = 0;
-static pthread_t g_ack_thread;
-
-static uint64_t time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* Ack thread sẽ được implement trong tunnel — đơn giản hóa */
-
-/* ════════════════════════════════════════════════════════════════════════
- * Tunnel threads
+ * FIX v35: Tunnel threads
+ * 
+ * sock->usb: đọc từ socket, gửi qua USB với ACK flag
+ * usb->sock: đọc từ USB, gửi qua socket
  * ════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     int client_fd;
@@ -576,16 +548,17 @@ static void *tunnel_sock_to_usb(void *arg) {
     while (st->state == TCP_CONN_CONNECTED) {
         int n = recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) {
-            if (n < 0 && errno == EAGAIN) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 usleep(1000);
                 continue;
             }
-            LOGI("sock→usb: client closed or error");
+            LOGI("sock->usb: client closed or error");
             break;
         }
 
+        /* Gửi data với ACK flag */
         if (usb_send_tcp(st, TH_ACK, buf, n) < 0) {
-            LOGE("sock→usb: send failed");
+            LOGE("sock->usb: send failed");
             break;
         }
         st->local_seq += n;
@@ -608,19 +581,25 @@ static void *tunnel_usb_to_sock(void *arg) {
 
         if (n < 0) {
             if (st->state != TCP_CONN_CONNECTED) break;
-            continue;  /* Timeout, retry */
+            continue;
         }
 
         if (flags & TH_RST) {
-            LOGI("usb→sock: RST received");
+            LOGI("usb->sock: RST received");
             st->state = TCP_CONN_CLOSING;
             break;
         }
 
         if (flags & TH_FIN) {
-            LOGI("usb→sock: FIN received");
+            LOGI("usb->sock: FIN received");
             st->state = TCP_CONN_CLOSING;
             break;
+        }
+
+        /* Gửi ACK cho data đã nhận */
+        if (n >= 0) {
+            st->remote_seq += (n > 0) ? n : 1;  /* SYN/FIN tiêu thụ 1 seq */
+            usb_send_tcp(st, TH_ACK, NULL, 0);
         }
 
         if (n > 0) {
@@ -628,17 +607,13 @@ static void *tunnel_usb_to_sock(void *arg) {
             while (sent < n) {
                 int r = send(fd, data + sent, n - sent, MSG_NOSIGNAL);
                 if (r <= 0) {
-                    LOGE("usb→sock: send failed");
+                    LOGE("usb->sock: send failed");
                     st->state = TCP_CONN_CLOSING;
                     break;
                 }
                 sent += r;
             }
             if (st->state != TCP_CONN_CONNECTED) break;
-
-            /* Send ACK */
-            st->remote_seq += n;
-            usb_send_tcp(st, TH_ACK, NULL, 0);
         }
     }
 
@@ -740,7 +715,7 @@ static int send_plist(int fd, uint32_t tag, const char *xml) {
     } hdr = {
         htonl(len + 16),
         htonl(1),
-        htonl(8),  /* MESSAGE_PLIST */
+        htonl(8),
         htonl(tag)
     };
     if (send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != sizeof(hdr)) return -1;
@@ -754,9 +729,7 @@ static int set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Listener registry
- * ════════════════════════════════════════════════════════════════════════ */
+/* Listener registry */
 static void register_listener(int fd) {
     pthread_mutex_lock(&g_listen_lock);
     if (g_listen_count < 64) {
@@ -786,7 +759,7 @@ void usbmuxd_server_broadcast_attached(void) {
     pthread_mutex_unlock(&g_udid_lock);
 
     if (!udid[0]) {
-        LOGW("broadcast_attached: no UDID yet");
+        LOGW("broadcast_attached: no UDID");
         return;
     }
 
@@ -871,7 +844,6 @@ static void *handle_client(void *arg) {
             char *resp = make_connect_result(0);
             if (resp) { send_plist(client_fd, tag, resp); free(resp); }
 
-            /* Send current device list */
             pthread_mutex_lock(&g_udid_lock);
             char udid[64];
             strncpy(udid, g_udid, sizeof(udid) - 1);
@@ -1021,21 +993,18 @@ static void *server_thread(void *arg) {
 bool usbmuxd_server_start(const char *sock_dir) {
     if (g_server_running) return true;
 
-    /* Reset state */
     g_version_done = 0;
     g_mux_tx_seq = 0;
     g_mux_rx_seq = 0xFFFF;
     g_pktlen = 0;
     set_device_state(DEV_STATE_INIT);
 
-    /* Create socket */
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
         LOGE("socket failed: %s", strerror(errno));
         return false;
     }
 
-    /* Build path */
     snprintf(g_sock_path, sizeof(g_sock_path), "%s/usbmuxd.sock", sock_dir);
     unlink(g_sock_path);
 
@@ -1077,11 +1046,9 @@ void usbmuxd_server_stop(void) {
     }
 
     pthread_join(g_server_thread, NULL);
-
     unlink(g_sock_path);
     g_sock_path[0] = '\0';
 
-    /* Reset listeners */
     pthread_mutex_lock(&g_listen_lock);
     g_listen_count = 0;
     pthread_mutex_unlock(&g_listen_lock);

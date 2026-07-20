@@ -1,10 +1,9 @@
 /*
- * jni_bridge_imd.c
+ * jni_bridge_imd.c  v35 (NO-ROOT)
  *
- * FIX v34 (COMPLETE): Sửa lỗi lockdown_client_new_with_handshake() err=-8
- *   - Check đúng LOCKDOWN_E_MUX_ERROR (-8) và thử pair
- *   - Thêm retry logic cho idevice_new_with_options
- *   - Đảm bảo usbmuxd socket ready trước khi connect
+ * FIX: Bỏ hoàn toàn lockdownd_client_new_with_handshake().
+ * Dùng thẳng lockdownd_client_new() + lockdownd_pair() để giao tiếp.
+ * Sideload không cần TLS — pair trực tiếp là đủ.
  */
 
 #include <jni.h>
@@ -61,13 +60,20 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * nativeConnect - FIX v34: Check đúng MUX_ERROR và thử pair
+ * nativeConnect - v35: Dùng thẳng pair mới, KHÔNG qua handshake
+ * 
+ * Flow mới (no-root):
+ *   1. idevice_new_with_options() — kết nối usbmuxd
+ *   2. lockdownd_client_new() — kết nối KHÔNG TLS
+ *   3. lockdownd_pair() — pair với iPhone (hiện Trust popup)
+ *   4. Done! Không cần handshake — sideload dùng no-TLS session
  * ════════════════════════════════════════════════════════════════════════ */
 JNIEXPORT jboolean JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         JNIEnv *env, jobject obj) {
     (void)env; (void)obj;
 
+    /* Cleanup cũ */
     if (g_lockdown) { lockdownd_client_free(g_lockdown); g_lockdown = NULL; }
     if (g_device)   { idevice_free(g_device);              g_device   = NULL; }
 
@@ -75,7 +81,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
     extern int usb_bridge_ep_in(void);
     extern int usb_bridge_ep_out(void);
     if (!usb_bridge_ep_in() || !usb_bridge_ep_out()) {
-        emit_log("[imd] ❌ USB bridge chưa khởi tạo");
+        emit_log("[imd] ❌ USB bridge chưa khởi tạo — gọi nativeSetUsbFd() trước");
         return JNI_FALSE;
     }
 
@@ -88,7 +94,6 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
 
     /* Chờ socket ready */
     {
-        char buf[128];
         int ready = 0;
         for (int i = 0; i < SOCKET_READY_RETRIES && !ready; i++) {
             int test_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -108,7 +113,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         }
     }
 
-    /* Thử idevice_new_with_options */
+    /* idevice_new_with_options */
     emit_log("[imd] idevice_new_with_options(USBMUX)...");
     idevice_error_t err = IDEVICE_E_UNKNOWN_ERROR;
     for (int attempt = 0; attempt < 30; attempt++) {
@@ -147,158 +152,109 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
     }
 
     /*
-     * FIX v34 (CRITICAL): lockdownd_client_new_with_handshake() KHÔNG tự động pair.
-     * Nếu err=-8 (MUX_ERROR) hoặc err=-21 (INVALID_HOST_ID) → cần pair mới.
+     * ════════════════════════════════════════════════════════════════════════
+     * v35 (NO-ROOT): Dùng thẳng lockdownd_client_new() + pair()
+     * 
+     * KHÔNG dùng lockdownd_client_new_with_handshake() nữa vì:
+     *   - Nó yêu cầu TLS certificate (cần root để đọc pairing keys)
+     *   - Sideload chỉ cần kết nối no-TLS để cài app
+     *   - Pair trực tiếp qua lockdownd_pair() là đủ
+     * ════════════════════════════════════════════════════════════════════════
      */
-    emit_log("[lockdown] Mở lockdownd session...");
+    emit_log("[lockdown] Kết nối lockdownd (no-TLS)...");
 
-    lockdownd_error_t ld_err = lockdownd_client_new_with_handshake(
-            g_device, &g_lockdown, "sideloadtool");
-
-    if (ld_err == LOCKDOWN_E_SUCCESS) {
-        emit_log("[lockdown] ✅ lockdownd OK (đã pair)");
-        return JNI_TRUE;
-    }
-
-    /* Cần pair mới cho cả MUX_ERROR (-8) và INVALID_HOST_ID (-21) */
-    if (ld_err == LOCKDOWN_E_MUX_ERROR ||
-        ld_err == LOCKDOWN_E_INVALID_HOST_ID || 
-        ld_err == LOCKDOWN_E_PASSWORD_PROTECTED ||
-        ld_err == LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING) {
-
+    lockdownd_error_t ld_err = lockdownd_client_new(g_device, &g_lockdown, "sideloadtool");
+    if (ld_err != LOCKDOWN_E_SUCCESS) {
         char msg[256];
-        if (ld_err == LOCKDOWN_E_MUX_ERROR) {
-            snprintf(msg, sizeof(msg), "[lockdown] err=%d (MUX_ERROR) — thử pair mới", (int)ld_err);
-        } else {
-            snprintf(msg, sizeof(msg), "[lockdown] err=%d — cần pair mới", (int)ld_err);
-        }
+        snprintf(msg, sizeof(msg), "[lockdown] ❌ lockdownd_client_new err=%d", (int)ld_err);
         emit_log(msg);
+        idevice_free(g_device); g_device = NULL;
+        return JNI_FALSE;
+    }
+    emit_log("[lockdown] ✅ lockdownd_client_new OK (no-TLS)");
 
-        emit_log("[lockdown] Bắt đầu pairing flow...");
+    /* Pair với iPhone */
+    emit_log("[lockdown] Bắt đầu pair...");
 
-        /* Kết nối KHÔNG TLS */
-        lockdownd_client_t tmp_client = NULL;
-        ld_err = lockdownd_client_new(g_device, &tmp_client, "sideloadtool");
-        if (ld_err != LOCKDOWN_E_SUCCESS) {
-            snprintf(msg, sizeof(msg), "[lockdown] ❌ lockdownd_client_new err=%d", (int)ld_err);
-            emit_log(msg);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
+    int pair_attempts = 0;
+    while (pair_attempts < PAIR_RETRY_MAX) {
+        ld_err = lockdownd_pair(g_lockdown, NULL);
+
+        if (ld_err == LOCKDOWN_E_SUCCESS) {
+            emit_log("[lockdown] ✅ Pair thành công!");
+            break;
         }
-        emit_log("[lockdown] ✅ lockdownd_client_new OK (no-TLS)");
 
-        /* Pair */
-        int pair_attempts = 0;
-        while (pair_attempts < PAIR_RETRY_MAX) {
-            ld_err = lockdownd_pair(tmp_client, NULL);
+        if (ld_err == LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "[lockdown] ⏳ Chờ bấm 'Tin cậy' trên iPhone... (%d/%d)",
+                     pair_attempts + 1, PAIR_RETRY_MAX);
+            emit_log(msg);
 
-            if (ld_err == LOCKDOWN_E_SUCCESS) {
-                emit_log("[lockdown] ✅ Pair thành công!");
-                break;
-            }
-
-            if (ld_err == LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING) {
-                snprintf(msg, sizeof(msg), "[lockdown] ⏳ Chờ bấm 'Tin cậy'... (%d/%d)",
-                         pair_attempts + 1, PAIR_RETRY_MAX);
-                emit_log(msg);
-
-                /* Hiện notification */
-                if (g_jvm) {
-                    JNIEnv *e = NULL; int dt = 0;
-                    if ((*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
-                        (*g_jvm)->AttachCurrentThread(g_jvm, &e, NULL); dt = 1;
-                    }
-                    jclass cls = (*e)->FindClass(e, "com/superalpha/sideload/bridge/NativeBridge");
-                    if (cls) {
-                        jmethodID mid = (*e)->GetStaticMethodID(e, cls, "onTrustRequired", "()V");
-                        if (mid) (*e)->CallStaticVoidMethod(e, cls, mid);
-                        (*e)->DeleteLocalRef(e, cls);
-                    }
-                    if (dt) (*g_jvm)->DetachCurrentThread(g_jvm);
+            /* Hiện notification */
+            if (g_jvm) {
+                JNIEnv *e = NULL; int dt = 0;
+                if ((*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
+                    (*g_jvm)->AttachCurrentThread(g_jvm, &e, NULL); dt = 1;
                 }
-
-                usleep(PAIR_RETRY_SLEEP_MS * 1000);
-                pair_attempts++;
-                continue;
+                jclass cls = (*e)->FindClass(e, "com/superalpha/sideload/bridge/NativeBridge");
+                if (cls) {
+                    jmethodID mid = (*e)->GetStaticMethodID(e, cls, "onTrustRequired", "()V");
+                    if (mid) (*e)->CallStaticVoidMethod(e, cls, mid);
+                    (*e)->DeleteLocalRef(e, cls);
+                }
+                if (dt) (*g_jvm)->DetachCurrentThread(g_jvm);
             }
 
-            if (ld_err == LOCKDOWN_E_PASSWORD_PROTECTED) {
-                emit_log("[lockdown] ❌ iPhone đang khoá");
-                lockdownd_client_free(tmp_client);
-                idevice_free(g_device); g_device = NULL;
-                return JNI_FALSE;
-            }
+            usleep(PAIR_RETRY_SLEEP_MS * 1000);
+            pair_attempts++;
+            continue;
+        }
 
-            snprintf(msg, sizeof(msg), "[lockdown] ❌ lockdownd_pair err=%d", (int)ld_err);
-            emit_log(msg);
-            lockdownd_client_free(tmp_client);
+        if (ld_err == LOCKDOWN_E_PASSWORD_PROTECTED) {
+            emit_log("[lockdown] ❌ iPhone đang khoá — mở khoá trước");
+            lockdownd_client_free(g_lockdown); g_lockdown = NULL;
             idevice_free(g_device); g_device = NULL;
             return JNI_FALSE;
         }
 
-        if (pair_attempts >= PAIR_RETRY_MAX) {
-            emit_log("[lockdown] ❌ Hết thờigian chờ Trust");
-            lockdownd_client_free(tmp_client);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-
-        /* Đóng session không TLS */
-        lockdownd_client_free(tmp_client);
-
-        /* Kết nối CÓ TLS sau pair */
-        emit_log("[lockdown] Mở lại lockdownd với TLS...");
-        ld_err = lockdownd_client_new_with_handshake(
-                g_device, &g_lockdown, "sideloadtool");
-
-        if (ld_err != LOCKDOWN_E_SUCCESS) {
-            snprintf(msg, sizeof(msg), "[lockdown] ❌ handshake sau pair err=%d", (int)ld_err);
-            emit_log(msg);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-
-        emit_log("[lockdown] ✅ lockdownd OK (sau pair mới)");
-        return JNI_TRUE;
+        /* Lỗi khác */
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[lockdown] ❌ lockdownd_pair err=%d", (int)ld_err);
+        emit_log(msg);
+        lockdownd_client_free(g_lockdown); g_lockdown = NULL;
+        idevice_free(g_device); g_device = NULL;
+        return JNI_FALSE;
     }
 
-    /* Lỗi khác */
-    char msg[256];
-    snprintf(msg, sizeof(msg), "[lockdown] ❌ lockdownd_client_new_with_handshake err=%d", (int)ld_err);
-    emit_log(msg);
-    idevice_free(g_device); g_device = NULL;
-    return JNI_FALSE;
+    if (pair_attempts >= PAIR_RETRY_MAX) {
+        emit_log("[lockdown] ❌ Hết thờigian chờ Trust");
+        lockdownd_client_free(g_lockdown); g_lockdown = NULL;
+        idevice_free(g_device); g_device = NULL;
+        return JNI_FALSE;
+    }
+
+    emit_log("[lockdown] ✅ Kết nối OK (no-TLS, đã pair)");
+    return JNI_TRUE;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * nativePair - giữ nguyên logic cũ
+ * nativePair - giữ nguyên
  * ════════════════════════════════════════════════════════════════════════ */
 JNIEXPORT jboolean JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
         JNIEnv *env, jobject obj) {
     (void)env; (void)obj;
 
-    if (!g_device) {
-        emit_log("[imd] ❌ Chưa connect — gọi nativeConnect() trước");
+    if (!g_device || !g_lockdown) {
+        emit_log("[imd] ❌ Chưa connect");
         return JNI_FALSE;
     }
 
-    emit_log("[imd] Bắt đầu pair...");
-
-    lockdownd_client_t client = NULL;
-    lockdownd_error_t err = lockdownd_client_new(g_device, &client, "sideloadtool");
-    if (err != LOCKDOWN_E_SUCCESS) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[imd] ❌ lockdownd_client_new err=%d", (int)err);
-        emit_log(msg);
-        return JNI_FALSE;
-    }
-
-    err = lockdownd_pair(client, NULL);
-    lockdownd_client_free(client);
-
+    emit_log("[imd] Pair...");
+    lockdownd_error_t err = lockdownd_pair(g_lockdown, NULL);
     if (err == LOCKDOWN_E_SUCCESS) {
-        emit_log("[imd] ✅ Pair thành công");
+        emit_log("[imd] ✅ Pair OK");
         return JNI_TRUE;
     }
 
@@ -309,7 +265,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * nativeGetUdid - giữ nguyên
+ * nativeGetUdid
  * ════════════════════════════════════════════════════════════════════════ */
 JNIEXPORT jstring JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetUdid(
@@ -322,7 +278,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetUdid(
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * nativeDisconnect - giữ nguyên
+ * nativeDisconnect
  * ════════════════════════════════════════════════════════════════════════ */
 JNIEXPORT void JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeDisconnect(

@@ -1,10 +1,8 @@
 /*
- * usb_fd_bridge.c
+ * usb_fd_bridge.c  v35 (NO-ROOT)
  *
- * FIX v34 (COMPLETE): 
- *   - Không retry claim khi BUSY (Android đã claim)
- *   - Thêm OVERFLOW handling với drain + retry
- *   - Thêm flush_in/flush_out helpers
+ * FIX: Không retry claim interface khi BUSY (Android đã claim).
+ * Dùng shared fd với Android UsbDeviceConnection.
  */
 
 #include "usb_fd_bridge.h"
@@ -15,8 +13,6 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-#define LOG_TAG "usb_bridge"
-
 static libusb_context       *g_ctx = NULL;
 static libusb_device_handle *g_handle = NULL;
 static int                   g_fd = -1;
@@ -26,9 +22,6 @@ static int                   g_iface = -1;
 static int                   g_altsetting = -1;
 static pthread_mutex_t       g_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ════════════════════════════════════════════════════════════════════════
- * Logging
- * ════════════════════════════════════════════════════════════════════════ */
 #define LOGE(fmt, ...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), "[usb] " fmt, ##__VA_ARGS__); \
@@ -47,15 +40,9 @@ static pthread_mutex_t       g_write_lock = PTHREAD_MUTEX_INITIALIZER;
     android_usbmuxd_fix_log(_buf); \
 } while(0)
 
-/* ════════════════════════════════════════════════════════════════════════
- * Public API
- * ════════════════════════════════════════════════════════════════════════ */
 int  usb_bridge_ep_in(void)  { return g_ep_in; }
 int  usb_bridge_ep_out(void) { return g_ep_out; }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Discover Apple endpoints
- * ════════════════════════════════════════════════════════════════════════ */
 static int discover_apple_endpoints(void) {
     struct libusb_config_descriptor *cfg = NULL;
     int r = libusb_get_active_config_descriptor(libusb_get_device(g_handle), &cfg);
@@ -83,18 +70,20 @@ static int discover_apple_endpoints(void) {
             g_iface = alt->bInterfaceNumber;
             g_altsetting = alt->bAlternateSetting;
 
-            LOGI("discover: found iface=%d alt=%d ep_in=0x%02x ep_out=0x%02x",
+            LOGI("discover: iface=%d alt=%d ep_in=0x%02x ep_out=0x%02x",
                  g_iface, g_altsetting, g_ep_in, g_ep_out);
 
             /* 
-             * FIX v34: Android UsbDeviceConnection đã claim interface.
-             * libusb_claim_interface() sẽ trả BUSY. Không retry — dùng shared fd.
+             * v35: Android đã claim interface → libusb_claim_interface() trả BUSY.
+             * Không retry — dùng shared fd. Điều này hoạt động vì:
+             *   - libusb_wrap_sys_device() share fd với Android
+             *   - bulk transfers vẫn đi qua cùng fd
              */
             int cr = libusb_claim_interface(g_handle, g_iface);
             if (cr == 0) {
                 LOGI("discover: ✅ interface claimed");
             } else if (cr == LIBUSB_ERROR_BUSY) {
-                LOGI("discover: interface BUSY — Android đã claim, dùng shared fd (OK)");
+                LOGI("discover: interface BUSY — dùng shared fd (OK)");
             } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
                 LOGI("discover: NOT_SUPPORTED — tiếp tục");
             } else {
@@ -111,9 +100,6 @@ static int discover_apple_endpoints(void) {
     return -1;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Init / Cleanup
- * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_init(int fd) {
     if (g_handle) {
         LOGI("init: already initialized");
@@ -146,19 +132,16 @@ int usb_bridge_init(int fd) {
         return -1;
     }
 
-    /* Clear halt */
     libusb_clear_halt(g_handle, g_ep_in);
     libusb_clear_halt(g_handle, g_ep_out);
 
-    LOGI("init: ✅ USB bridge ready (ep_in=0x%02x ep_out=0x%02x)", g_ep_in, g_ep_out);
+    LOGI("init: ✅ USB bridge ready");
     return 0;
 }
 
 void usb_bridge_cleanup(void) {
     if (g_handle) {
-        if (g_iface >= 0) {
-            libusb_release_interface(g_handle, g_iface);
-        }
+        if (g_iface >= 0) libusb_release_interface(g_handle, g_iface);
         libusb_close(g_handle);
         g_handle = NULL;
     }
@@ -173,9 +156,6 @@ void usb_bridge_cleanup(void) {
     LOGI("cleanup: done");
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * FIX v34: Bulk read với OVERFLOW handling
- * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
     if (!g_handle || !g_ep_in) return -1;
 
@@ -186,7 +166,6 @@ int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
                                       &transferred, timeout);
         if (r == 0) {
             if (transferred > 0) return transferred;
-            /* transferred == 0, retry */
             usleep(1000);
             continue;
         }
@@ -199,19 +178,13 @@ int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
         }
 
         if (r == LIBUSB_ERROR_OVERFLOW) {
-            /* 
-             * FIX v34: OVERFLOW — buffer nhỏ hơn packet.
-             * Drain stale data và retry.
-             */
-            LOGW("bulk_read: OVERFLOW — draining stale data (%d/5)", attempt + 1);
+            LOGW("bulk_read: OVERFLOW — draining (%d/5)", attempt + 1);
             usb_bridge_flush_in(8, 200);
             usleep(100 * 1000);
             continue;
         }
 
-        if (r == LIBUSB_ERROR_TIMEOUT) {
-            return -1;  /* Timeout là normal */
-        }
+        if (r == LIBUSB_ERROR_TIMEOUT) return -1;
 
         LOGE("bulk_read: err=%d (%s) attempt=%d/5", r, libusb_error_name(r), attempt + 1);
         usleep(80 * 1000);
@@ -240,9 +213,6 @@ int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
     return -1;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Flush helpers
- * ════════════════════════════════════════════════════════════════════════ */
 void usb_bridge_flush_in(int max_packets, int timeout_ms) {
     if (!g_handle || !g_ep_in) return;
     uint8_t drain[4096];
@@ -255,8 +225,6 @@ void usb_bridge_flush_in(int max_packets, int timeout_ms) {
 }
 
 void usb_bridge_flush_out(int timeout_ms) {
-    if (!g_handle || !g_ep_out) return;
-    /* Không có cách dễ dàng để flush OUT endpoint */
     (void)timeout_ms;
 }
 
