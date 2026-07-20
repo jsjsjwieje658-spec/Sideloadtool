@@ -255,7 +255,7 @@ typedef struct {
  * (dùng cho log/error message nội bộ) và bỏ qua — kết nối TCP không
  * bao giờ được thiết lập dù version exchange có thành công.
  */
-#define V1_PROTO_TCP     6   /* MUX_PROTO_TCP = IPPROTO_TCP (KHÔNG PHẢI 1) */
+#define V1_PROTO_TCP     6   /* MUX_PROTO_TCP = IPPROTO_TCP = 6 */
 
 #define TH_FIN  0x01
 #define TH_SYN  0x02
@@ -1713,14 +1713,24 @@ static void *handle_client(void *arg) {
      */
     unregister_listener(client_fd);
 
-    // Gửi Detached event khi client đóng kết nối
+    /* FIX v32: Đóng fd TRƯỚC khi gửi Detached — client đã đóng nên
+     * gửi vào fd đã đóng là vô nghĩa và có thể gây SIGPIPE/EPIPE.
+     * Detached event nên được broadcast qua broadcast_attached() 
+     * mechanism cho các client ĐANG Listen, không gửi vào fd đã đóng. */
+    close(client_fd);
+
+    /* Broadcast Detached cho các client khác đang Listen */
     char *detached_event = make_detached_event();
     if (detached_event) {
-        send_plist(client_fd, 0, detached_event); // tag=0 cho events
+        pthread_mutex_lock(&g_listen_lock);
+        for (int i = 0; i < g_listen_count; i++) {
+            if (g_listen_fds[i] != client_fd) {
+                send_plist(g_listen_fds[i], 0, detached_event);
+            }
+        }
+        pthread_mutex_unlock(&g_listen_lock);
         free(detached_event);
     }
-
-    close(client_fd);
     LOGI("client fd=%d: đóng kết nối", client_fd);
     return NULL;
 }
