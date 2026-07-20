@@ -1,0 +1,40 @@
+From: SideloadTool Android Fix <fix@sideload.tool>
+Date: Sat, 19 Jul 2026 04:45:00 +0700
+Subject: [PATCH] libusbmuxd: fix connect_usbmuxd_socket() for Android Unix paths
+
+On Android, USBMUXD_SOCKET_ADDRESS is set to a Unix socket path like
+/data/user/0/.../usbmuxd.sock without the "UNIX:" prefix.
+
+The current code only handles:
+  1. "UNIX:/path/to/socket"  → socket_connect_unix(path)
+  2. "host:port"             → TCP socket_connect()
+
+But Android apps set the path directly without prefix, and the path
+contains no ':' so it falls through to the default /var/run/usbmuxd,
+which doesn't exist on Android → connection fails → IDEVICE_E_NO_DEVICE.
+
+Fix: Add a check for absolute Unix paths (starting with '/') when
+USBMUXD_SOCKET_ADDRESS is set but has no prefix and no ':'.
+
+--- a/src/libusbmuxd.c
++++ b/src/libusbmuxd.c
+@@ -164,6 +164,20 @@ static int connect_usbmuxd_socket()
+ 	int res = -1;
+ 	char *usbmuxd_socket_addr = getenv("USBMUXD_SOCKET_ADDRESS");
+ 	if (usbmuxd_socket_addr) {
++		/* FIX: Android non-root — Unix path without UNIX: prefix */
++		if (usbmuxd_socket_addr[0] == '/') {
++#if defined(_WIN32) || defined(__CYGWIN__)
++			/* not supported, ignore */
++#else
++			res = socket_connect_unix(usbmuxd_socket_addr);
++			if (res < 0) {
++				res = -errno;
++			}
++			return res;
++#endif
++		}
++		/* Existing UNIX: prefix handling */
+ 		if (strncmp(usbmuxd_socket_addr, "UNIX:", 5) == 0) {
+ #if defined(_WIN32) || defined(__CYGWIN__)
+ 			/* not supported, ignore */
