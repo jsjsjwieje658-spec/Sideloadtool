@@ -255,7 +255,7 @@ typedef struct {
  * (dùng cho log/error message nội bộ) và bỏ qua — kết nối TCP không
  * bao giờ được thiết lập dù version exchange có thành công.
  */
-#define V1_PROTO_TCP     6   /* MUX_PROTO_TCP = IPPROTO_TCP = 6 */
+#define V1_PROTO_TCP     6   /* MUX_PROTO_TCP = IPPROTO_TCP (KHÔNG PHẢI 1) */
 
 #define TH_FIN  0x01
 #define TH_SYN  0x02
@@ -1149,66 +1149,94 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     LOGI("do_usb_v1_connect: port=%d", port);
 
     /* Bước 0: Init TCP state */
-    /* Sport: dùng port ngẫu nhiên trong range 49152-65535 */
     srand((unsigned)time(NULL));
     st->sport      = (uint16_t)(49152 + (rand() % 16383));
     st->dport      = (uint16_t)port;
-    st->local_seq  = (uint32_t)(rand());  /* Initial sequence number */
+    st->local_seq  = (uint32_t)(rand());
     st->remote_seq = 0;
     pthread_mutex_init(&st->usb_tx_lock, NULL);
 
-    /*
-     * FIX Bug B: KHÔNG lặp lại version exchange ở đây nữa. iPhone v1 mux
-     * chỉ chấp nhận một version exchange per USB session; version exchange
-     * thật sự đã được thực hiện một lần trong nativeSetUsbFd() (ngay sau
-     * libusb init, trước usbmuxd_server_start()). Gọi lại usbmux_version_exchange()
-     * ở đây chỉ là safety check — idempotent nhờ g_version_done, sẽ no-op
-     * nếu đã làm rồi, và chỉ thực hiện thật nếu vì lý do nào đó chưa làm.
-     */
+    /* FIX v33: Đảm bảo version exchange OK */
     if (!usbmux_version_exchange()) {
-        LOGE("do_usb_v1_connect: version exchange thất bại — iPhone không hỗ trợ v1?");
+        LOGE("do_usb_v1_connect: ❌ version exchange thất bại");
         return false;
     }
+    LOGI("do_usb_v1_connect: ✅ version exchange OK");
+
+    /* FIX v33 (CRITICAL): Drain non-TCP packets trước SYN */
+    LOGI("do_usb_v1_connect: Drain non-TCP packets...");
+    int drained = 0;
+    for (int i = 0; i < 10; i++) {
+        v1_mux_hdr_t mhdr;
+        int n = usb_read_exact(&mhdr, sizeof(mhdr), 300);
+        if (n < (int)sizeof(mhdr)) break;
+
+        if (ntohl(mhdr.magic) != V1_MAGIC) {
+            LOGW("do_usb_v1_connect: drain bad magic, stop");
+            break;
+        }
+
+        uint32_t proto = ntohl(mhdr.protocol);
+        uint32_t body_len = ntohl(mhdr.length) - sizeof(mhdr);
+
+        if (proto == V1_PROTO_TCP) {
+            LOGW("do_usb_v1_connect: drain: unexpected TCP, skip");
+            if (body_len > 0 && body_len < 65536) {
+                uint8_t *db = malloc(body_len);
+                if (db) { usb_read_exact(db, body_len, 1000); free(db); }
+            }
+            drained++; continue;
+        }
+
+        if (body_len > 0 && body_len < 65536) {
+            uint8_t *db = malloc(body_len);
+            if (db) {
+                int r = usb_read_exact(db, body_len, 1000);
+                if (r > 0 && proto == V1_PROTO_CONTROL) {
+                    LOGI("do_usb_v1_connect: drain CONTROL type=%d", db[0]);
+                }
+                free(db);
+            }
+        }
+        drained++;
+    }
+    if (drained > 0) LOGI("do_usb_v1_connect: drained %d packets", drained);
 
     /* Bước 1: SYN */
     uint32_t isn = st->local_seq;
-    LOGI("do_usb_v1_connect: Đang gửi SYN đến iPhone port %d...", port);
+    LOGI("do_usb_v1_connect: Gửi SYN port=%d sport=%d...", port, st->sport);
     if (usb_send_tcp(st, TH_SYN, NULL, 0) < 0) {
-        LOGE("do_usb_v1_connect: ❌ gửi SYN thất bại");
+        LOGE("do_usb_v1_connect: ❌ SYN failed");
         return false;
     }
-    LOGI("do_usb_v1_connect: ✅ SYN đã gửi, chờ SYN+ACK...");
+    LOGI("do_usb_v1_connect: ✅ SYN sent seq=%u", isn);
 
-    /* FIX: Chờ lâu hơn nếu iPhone chưa unlock */
-    int synack_timeout = 15000; /* 15 giây cho user unlock/trust */
-
-    /* Bước 2: Nhận SYN+ACK từ iPhone */
+    /* Bước 2: Nhận SYN+ACK */
+    int synack_timeout = 20000;
     uint8_t flags = 0;
     uint8_t dummy[1];
     int n = usb_recv_tcp(st, dummy, sizeof(dummy), &flags, synack_timeout);
     if (n < 0) {
-        LOGE("do_usb_v1_connect: ❌ timeout chờ SYN+ACK (%dms) — iPhone có thể đang khoá hoặc chưa Trust", synack_timeout);
+        LOGE("do_usb_v1_connect: ❌ SYN+ACK timeout (%dms)", synack_timeout);
         return false;
     }
     if (!(flags & TH_SYN) || !(flags & TH_ACK)) {
         if (flags & TH_RST) {
-            LOGE("do_usb_v1_connect: ❌ iPhone gửi RST — port %d bị từ chối (chưa Trust hoặc iPhone khoá)", port);
+            LOGE("do_usb_v1_connect: ❌ RST received — port %d refused", port);
         } else {
-            LOGE("do_usb_v1_connect: ❌ nhận flags=0x%02x (không phải SYN+ACK)", flags);
+            LOGE("do_usb_v1_connect: ❌ flags=0x%02x (not SYN+ACK)", flags);
         }
         return false;
     }
-    LOGI("do_usb_v1_connect: ✅ Nhận SYN+ACK, gửi ACK...");
-    LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u", st->remote_seq);
+    LOGI("do_usb_v1_connect: ✅ SYN+ACK remote_seq=%u", st->remote_seq);
 
     /* Bước 3: ACK */
-    st->local_seq = isn + 1;   /* SYN tiêu thụ 1 sequence number */
+    st->local_seq = isn + 1;
     if (usb_send_tcp(st, TH_ACK, NULL, 0) < 0) {
-        LOGE("do_usb_v1_connect: gửi ACK thất bại");
+        LOGE("do_usb_v1_connect: ❌ ACK failed");
         return false;
     }
-    LOGI("do_usb_v1_connect: ✅ kết nối TCP port=%d OK (local_seq=%u remote_seq=%u)",
-         port, st->local_seq, st->remote_seq);
+    LOGI("do_usb_v1_connect: ✅ TCP port=%d OK", port);
     return true;
 }
 
@@ -1713,24 +1741,14 @@ static void *handle_client(void *arg) {
      */
     unregister_listener(client_fd);
 
-    /* FIX v32: Đóng fd TRƯỚC khi gửi Detached — client đã đóng nên
-     * gửi vào fd đã đóng là vô nghĩa và có thể gây SIGPIPE/EPIPE.
-     * Detached event nên được broadcast qua broadcast_attached() 
-     * mechanism cho các client ĐANG Listen, không gửi vào fd đã đóng. */
-    close(client_fd);
-
-    /* Broadcast Detached cho các client khác đang Listen */
+    // Gửi Detached event khi client đóng kết nối
     char *detached_event = make_detached_event();
     if (detached_event) {
-        pthread_mutex_lock(&g_listen_lock);
-        for (int i = 0; i < g_listen_count; i++) {
-            if (g_listen_fds[i] != client_fd) {
-                send_plist(g_listen_fds[i], 0, detached_event);
-            }
-        }
-        pthread_mutex_unlock(&g_listen_lock);
+        send_plist(client_fd, 0, detached_event); // tag=0 cho events
         free(detached_event);
     }
+
+    close(client_fd);
     LOGI("client fd=%d: đóng kết nối", client_fd);
     return NULL;
 }

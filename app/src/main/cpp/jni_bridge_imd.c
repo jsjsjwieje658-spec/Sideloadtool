@@ -435,17 +435,24 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
 
     /* ── FIX: Kiểm tra usb_bridge đã init chưa ── */
     if (!usb_bridge_ep_in() || !usb_bridge_ep_out()) {
-        emit_log("[imd] ❌ USB bridge chưa khởi tạo — gọi nativeSetUsbFd() trước");
+        emit_log("[imd] \u274c USB bridge chưa khởi tạo — gọi nativeSetUsbFd() trước");
         return JNI_FALSE;
     }
 
     /* ── FIX: Đảm bảo usbmuxd server đang chạy ── */
     const char *sock_path = usbmuxd_server_socket_path();
     if (!sock_path) {
-        emit_log("[imd] ❌ usbmuxd server chưa chạy — gọi nativeSetUsbFd() trước");
+        emit_log("[imd] \u274c usbmuxd server chưa chạy — gọi nativeSetUsbFd() trước");
         return JNI_FALSE;
     }
 
+    /*
+     * FIX: KHÔNG setenv USBMUXD_SOCKET_ADDRESS ở đây.
+     * usbmuxd_server_start() đã set đúng giá trị TCP 127.0.0.1:27015
+     * (hoặc Unix socket path nếu TCP thất bại). Việc setenv lại ở đây
+     * với sock_path (Unix path không có unix: prefix) sẽ overwrite giá
+     * trị đúng và khiến __wrap_usbmuxd_connect() không nhận diện được.
+     */
     {
         const char *env_sock = getenv("USBMUXD_SOCKET_ADDRESS");
         char buf[300];
@@ -453,7 +460,13 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         emit_log(buf);
     }
 
-    /* ── FIX RACE CONDITION: Chờ socket sẵn sàng ── */
+    /*
+     * ── FIX RACE CONDITION: Chờ socket sẵn sàng ──
+     *
+     * usbmuxd_server_start() tạo thread và return. Thread đó mới bind socket.
+     * Có thể có race nếu idevice_new_with_options() gọi trước khi bind xong.
+     * Thử kết nối thực tế vào socket để xác nhận ready.
+     */
     {
         char buf[128];
         int ready = 0;
@@ -478,16 +491,18 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
             }
         }
         if (!ready) {
-            emit_log("[imd] ❌ usbmuxd socket không accessible sau 3 giây");
+            emit_log("[imd] \u274c usbmuxd socket không accessible sau 3 giây");
             return JNI_FALSE;
         }
-        emit_log("[imd] usbmuxd socket ready ✅");
+        emit_log("[imd] usbmuxd socket ready \u2705");
     }
 
     emit_log("[imd] idevice_new_with_options(USBMUX)...");
 
     /*
      * Thử idevice_new_with_options() với retry nếu server mới start.
+     * Lỗi -3 (IDEVICE_E_NO_DEVICE) có thể xảy ra lần đầu nếu server
+     * chưa kịp process ListDevices request.
      */
     idevice_error_t err = IDEVICE_E_UNKNOWN_ERROR;
     for (int attempt = 0; attempt < 30; attempt++) {
@@ -501,180 +516,80 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
                      (int)err, attempt + 1);
             emit_log(msg);
         }
-        if (attempt < 29) usleep(500000);
+        if (attempt < 29) usleep(500000);  /* chờ 500ms */
     }
 
     if (err != IDEVICE_E_SUCCESS) {
         char msg[200];
         snprintf(msg, sizeof(msg),
-                 "[imd] ❌ idevice_new_with_options() err=%d "
+                 "[imd] \u274c idevice_new_with_options() err=%d "
                  "(màn hình iPhone đã mở khoá? cáp USB kết nối chắc chưa?)",
                  (int)err);
         emit_log(msg);
         return JNI_FALSE;
     }
 
-    emit_log("[imd] ✅ idevice OK");
+    emit_log("[imd] \u2705 idevice OK");
 
-    /* Lấy UDID và cập nhật server */
+    /* Lấy UDID và cập nhật server (KHÔNG restart) */
     char *udid = NULL;
     idevice_get_udid(g_device, &udid);
     if (udid) {
         strncpy(g_udid, udid, sizeof(g_udid) - 1);
         free(udid);
+        /* FIX: dùng update_udid thay vì restart (tránh race condition) */
         usbmuxd_server_update_udid(g_udid);
         android_fix_set_device(g_udid, 0x12a8);
+
+        /*
+         * FIX (báo cáo lỗi #7): usbmuxd_server_update_udid() giờ đã tự
+         * broadcast "Attached" (UDID mới) cho mọi client đang Listen bên
+         * trong nó, nhưng gọi tường minh usbmuxd_server_broadcast_attached()
+         * ở đây — ngay sau khi UDID thật được xác nhận qua
+         * idevice_get_udid() — như một safety-net rõ ràng ở tầng JNI, đảm
+         * bảo libusbmuxd (và bất kỳ client nào khác đang mở kết nối tới
+         * server nội bộ) luôn được thông báo lại ngay khi UDID thật sẵn
+         * sàng, thay vì phụ thuộc hoàn toàn vào side-effect bên trong
+         * update_udid().
+         */
         usbmuxd_server_broadcast_attached();
 
         char msg[128];
-        snprintf(msg, sizeof(msg), "[imd] ✅ iPhone UDID: %s", g_udid);
+        snprintf(msg, sizeof(msg), "[imd] \u2705 iPhone UDID: %s", g_udid);
         emit_log(msg);
     }
 
-    /* 
-     * ════════════════════════════════════════════════════════════════════════
-     * FIX v32 (CRITICAL — Root Cause của err=-8):
-     * 
-     * lockdownd_client_new_with_handshake() KHÔNG tự động pair. Nó chỉ:
-     *   1. Kết nối lockdownd (qua usbmuxd)
-     *   2. Kiểm tra pair record hiện có
-     *   3. Nếu không có / không hợp lệ → trả về LOCKDOWN_E_INVALID_HOST_ID (-8)
-     * 
-     * Flow đúng (theo libimobiledevice/src/lockdown.c):
-     *   A. Thử lockdownd_client_new_with_handshake() — nếu đã pair trước đó
-     *   B. Nếu INVALID_HOST_ID hoặc PASSWORD_PROTECTED:
-     *      B1. lockdownd_client_new() — kết nối KHÔNG TLS
-     *      B2. lockdownd_pair() — thực hiện pairing (hiện Trust popup)
-     *      B3. lockdownd_client_free() — đóng session không TLS
-     *      B4. lockdownd_client_new_with_handshake() — kết nối CÓ TLS
-     * 
-     * Lỗi cũ: Xóa pairing record rồi gọi handshake ngay → luôn err=-8
-     * ════════════════════════════════════════════════════════════════════════
-     */
+    /* Mở lockdownd session với TLS handshake */
     emit_log("[lockdown] Mở lockdownd session...");
-
+    /*
+     * FIX lockdownd err=-8: Xóa pairing record cũ (nếu có) để buộc
+     * iPhone hiển thị popup "Tin cậy" lại.
+     */
+    if (g_udid[0]) {
+        emit_log("[lockdown] Kiểm tra/xóa pairing record cũ...");
+        char pairing_path[512];
+        snprintf(pairing_path, sizeof(pairing_path), "%s/Lockdown/%s.plist", g_files_dir, g_udid);
+        if (remove(pairing_path) == 0) {
+            emit_log("[lockdown] Đã xóa pairing record cũ");
+        } else {
+            emit_log("[lockdown] Không có pairing record cũ");
+        }
+    }
     lockdownd_error_t ld_err = lockdownd_client_new_with_handshake(
             g_device, &g_lockdown, "sideloadtool");
-
-    if (ld_err == LOCKDOWN_E_SUCCESS) {
-        emit_log("[lockdown] ✅ lockdownd session OK (đã pair trước đó)");
-        return JNI_TRUE;
+    if (ld_err != LOCKDOWN_E_SUCCESS) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "[lockdown] \u274c lockdownd_client_new_with_handshake() err=%d",
+                 (int)ld_err);
+        emit_log(msg);
+        idevice_free(g_device);
+        g_device = NULL;
+        return JNI_FALSE;
     }
 
-    /* Chưa pair hoặc pair record không hợp lệ → cần pair mới */
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "[lockdown] lockdownd_client_new_with_handshake() err=%d — cần pair mới",
-             (int)ld_err);
-    emit_log(msg);
-
-    if (ld_err == LOCKDOWN_E_INVALID_HOST_ID || 
-        ld_err == LOCKDOWN_E_PASSWORD_PROTECTED ||
-        ld_err == LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING) {
-
-        emit_log("[lockdown] Bắt đầu pairing flow...");
-
-        /* B1: Kết nối KHÔNG TLS */
-        lockdownd_client_t tmp_client = NULL;
-        ld_err = lockdownd_client_new(g_device, &tmp_client, "sideloadtool");
-        if (ld_err != LOCKDOWN_E_SUCCESS) {
-            snprintf(msg, sizeof(msg),
-                     "[lockdown] ❌ lockdownd_client_new() err=%d", (int)ld_err);
-            emit_log(msg);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-        emit_log("[lockdown] ✅ lockdownd_client_new() OK (no-TLS)");
-
-        /* B2: Pair — hiện Trust popup trên iPhone */
-        int pair_attempts = 0;
-        while (pair_attempts < PAIR_RETRY_MAX) {
-            ld_err = lockdownd_pair(tmp_client, NULL);
-
-            if (ld_err == LOCKDOWN_E_SUCCESS) {
-                emit_log("[lockdown] ✅ Pair thành công!");
-                break;
-            }
-
-            if (ld_err == LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING) {
-                snprintf(msg, sizeof(msg),
-                         "[lockdown] ⏳ Chờ bấm 'Tin cậy' trên iPhone... (%d/%d)",
-                         pair_attempts + 1, PAIR_RETRY_MAX);
-                emit_log(msg);
-
-                /* Hiện notification Trust popup */
-                if (g_jvm) {
-                    JNIEnv *e = NULL; bool dt = false;
-                    if ((*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
-                        (*g_jvm)->AttachCurrentThread(g_jvm, &e, NULL); dt = true;
-                    }
-                    jclass cls = (*e)->FindClass(e,
-                        "com/superalpha/sideload/bridge/NativeBridge");
-                    if (cls) {
-                        jmethodID mid = (*e)->GetStaticMethodID(e, cls,
-                            "onTrustRequired", "()V");
-                        if (mid) (*e)->CallStaticVoidMethod(e, cls, mid);
-                        (*e)->DeleteLocalRef(e, cls);
-                    }
-                    if (dt) (*g_jvm)->DetachCurrentThread(g_jvm);
-                }
-
-                usleep(PAIR_RETRY_SLEEP_MS * 1000);
-                pair_attempts++;
-                continue;
-            }
-
-            if (ld_err == LOCKDOWN_E_PASSWORD_PROTECTED) {
-                emit_log("[lockdown] ❌ iPhone đang khoá — mở khoá trước");
-                lockdownd_client_free(tmp_client);
-                idevice_free(g_device); g_device = NULL;
-                return JNI_FALSE;
-            }
-
-            snprintf(msg, sizeof(msg),
-                     "[lockdown] ❌ lockdownd_pair() err=%d", (int)ld_err);
-            emit_log(msg);
-            lockdownd_client_free(tmp_client);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-
-        if (pair_attempts >= PAIR_RETRY_MAX) {
-            emit_log("[lockdown] ❌ Hết thờigian chờ Trust");
-            lockdownd_client_free(tmp_client);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-
-        /* B3: Đóng session không TLS */
-        lockdownd_client_free(tmp_client);
-        tmp_client = NULL;
-
-        /* B4: Kết nối CÓ TLS sau khi pair thành công */
-        emit_log("[lockdown] Mở lại lockdownd với TLS sau pair...");
-        ld_err = lockdownd_client_new_with_handshake(
-                g_device, &g_lockdown, "sideloadtool");
-
-        if (ld_err != LOCKDOWN_E_SUCCESS) {
-            snprintf(msg, sizeof(msg),
-                     "[lockdown] ❌ lockdownd_client_new_with_handshake() sau pair err=%d",
-                     (int)ld_err);
-            emit_log(msg);
-            idevice_free(g_device); g_device = NULL;
-            return JNI_FALSE;
-        }
-
-        emit_log("[lockdown] ✅ lockdownd session OK (sau pair mới)");
-        return JNI_TRUE;
-    }
-
-    /* Lỗi khác không phải INVALID_HOST_ID */
-    snprintf(msg, sizeof(msg),
-             "[lockdown] ❌ lockdownd_client_new_with_handshake() err=%d (không phải lỗi pair)",
-             (int)ld_err);
-    emit_log(msg);
-    idevice_free(g_device); g_device = NULL;
-    return JNI_FALSE;
+    emit_log("[lockdown] \u2705 lockdownd session OK");
+    return JNI_TRUE;
 }
 
 /* ── nativePair ──────────────────────────────────────────────────────────── */

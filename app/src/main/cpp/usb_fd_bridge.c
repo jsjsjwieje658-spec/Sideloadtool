@@ -184,30 +184,23 @@ static bool discover_apple_endpoints(void) {
                 }
                 libusb_set_auto_detach_kernel_driver(g_handle, 1);
 
-                /* 
-                 * FIX v32 (CRITICAL): Android UsbDeviceConnection đã claim interface
-                 * → libusb_claim_interface() sẽ trả BUSY. Không retry claim vì Android
-                 * đang giữ interface. Thay vào đó, dùng fd shared với Android.
-                 * 
-                 * termux-usbmuxd pattern: Không claim từ Android, để libusb claim.
-                 * Nhưng nếu đã claim (pattern hiện tại), vẫn hoạt động vì:
-                 *   - libusb_wrap_sys_device() share fd với Android
-                 *   - bulk transfers vẫn đi qua cùng fd
-                 *   - Chỉ cần clear_halt để reset endpoint state
-                 */
                 int r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
                 if (r == 0) {
-                    LOGI("discover: ✅ interface %d claimed (termux-api pattern — fd sạch)",
+                    LOGI("discover: ✅ interface %d claimed successfully (fd sạch — termux-api pattern)",
                          alt->bInterfaceNumber);
                 } else if (r == LIBUSB_ERROR_BUSY) {
-                    LOGI("discover: interface %d BUSY — Android đã claim, dùng shared fd (OK)",
-                         alt->bInterfaceNumber);
-                    /* Không retry claim — dùng fd shared */
+                    LOGI("discover: interface %d BUSY — retry after detach", alt->bInterfaceNumber);
+                    libusb_detach_kernel_driver(g_handle, alt->bInterfaceNumber);
+                    usleep(100000);
+                    r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
+                    if (r != 0) {
+                        LOGE("discover: claim retry failed: %d", r);
+                    }
                 } else if (r == LIBUSB_ERROR_NOT_SUPPORTED) {
                     LOGI("discover: interface %d NOT_SUPPORTED — tiếp tục (bình thường trên Android)",
                          alt->bInterfaceNumber);
                 } else {
-                    LOGW("discover: libusb_claim_interface(%d) err=%d (%s) — tiếp tục",
+                    LOGE("discover: libusb_claim_interface(%d) err=%d (%s) — tiếp tục",
                          alt->bInterfaceNumber, r, libusb_error_name(r));
                 }
                 g_ep_in     = ep_in;
