@@ -60,6 +60,13 @@ typedef struct {
     uint16_t rx_seq;
 } v1_mux_hdr_t;
 
+/* Version header used during the v1 version-exchange handshake */
+struct version_header {
+    uint32_t major;
+    uint32_t minor;
+    uint8_t  padding;
+};
+
 /* ════════════════════════════════════════════════════════════════════════
  * Packet reassembly buffer
  * ════════════════════════════════════════════════════════════════════════ */

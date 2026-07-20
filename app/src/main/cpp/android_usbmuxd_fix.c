@@ -33,9 +33,17 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <android/log.h>
 
 #include <usbmuxd.h>
 #include <plist/plist.h>
+
+/* ── Logging helper ── */
+void android_usbmuxd_fix_log(const char *msg)
+{
+    if (msg)
+        __android_log_print(ANDROID_LOG_INFO, "sideloadnative", "%s", msg);
+}
 
 /* ── Cache ── */
 static pthread_mutex_t g_fix_mutex = PTHREAD_MUTEX_INITIALIZER;

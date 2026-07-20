@@ -40,8 +40,8 @@ static pthread_mutex_t       g_write_lock = PTHREAD_MUTEX_INITIALIZER;
     android_usbmuxd_fix_log(_buf); \
 } while(0)
 
-int  usb_bridge_ep_in(void)  { return g_ep_in; }
-int  usb_bridge_ep_out(void) { return g_ep_out; }
+uint8_t usb_bridge_ep_in(void)  { return g_ep_in; }
+uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
 
 static int discover_apple_endpoints(void) {
     struct libusb_config_descriptor *cfg = NULL;
@@ -228,9 +228,12 @@ void usb_bridge_flush_out(int timeout_ms) {
     (void)timeout_ms;
 }
 
-void usb_bridge_clear_endpoints_halt(void) {
+bool usb_bridge_clear_endpoints_halt(void) {
     if (g_handle) {
-        if (g_ep_in)  libusb_clear_halt(g_handle, g_ep_in);
-        if (g_ep_out) libusb_clear_halt(g_handle, g_ep_out);
+        bool ok = true;
+        if (g_ep_in)  ok = (libusb_clear_halt(g_handle, g_ep_in)  == 0) && ok;
+        if (g_ep_out) ok = (libusb_clear_halt(g_handle, g_ep_out) == 0) && ok;
+        return ok;
     }
+    return false;
 }
