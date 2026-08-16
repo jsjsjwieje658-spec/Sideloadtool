@@ -81,6 +81,11 @@ setup_toolchain() {
     fi
     [[ -d "${TOOLCHAIN}" ]] || error "Không tìm thấy LLVM toolchain"
 
+    # OpenSSL's Android Configure detects modern NDKs through clang on PATH.
+    # NDK r25 no longer ships aarch64-linux-android-gcc wrappers.
+    export PATH="${TOOLCHAIN}/bin:${PATH}"
+    export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
+    export ANDROID_NDK="${ANDROID_NDK_HOME}"
     export CC="${TOOLCHAIN}/bin/${HOST_TRIPLE}-clang"
     export CXX="${TOOLCHAIN}/bin/${HOST_TRIPLE}-clang++"
     export AR="${TOOLCHAIN}/bin/llvm-ar"
@@ -170,6 +175,7 @@ build_openssl() {
     esac
 
     pushd "${src}" >/dev/null
+    CC="${CC}" CXX="${CXX}" AR="${AR}" RANLIB="${RANLIB}" \
     ./Configure \
         "${openssl_target}" \
         -D__ANDROID_API__=${ANDROID_API} \
@@ -178,8 +184,9 @@ build_openssl() {
         no-shared no-tests no-docs \
         -fPIC
 
-    # OpenSSL использует ANDROID_NDK_HOME для toolchain
-    ANDROID_NDK_HOME="${ANDROID_NDK_HOME}" make -j"${NCPU}" build_libs
+    # OpenSSL uses the NDK Clang toolchain exported above.
+    ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT}" ANDROID_NDK="${ANDROID_NDK}" \
+      PATH="${TOOLCHAIN}/bin:${PATH}" make -j"${NCPU}" build_libs
     make install_sw
     popd >/dev/null
 }
