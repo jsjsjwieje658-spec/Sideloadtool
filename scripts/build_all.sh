@@ -25,7 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NATIVE_DEPS_BASE="${NATIVE_DEPS_BASE:-${REPO_ROOT}/.native-deps}"
-BUILD_TMP="${TMPDIR:-/tmp}/sideload_native_build"
+BUILD_TMP_ROOT="${TMPDIR:-/tmp}/sideload_native_build"
 
 NDK_VERSION="${NDK_VERSION:-25.2.9519653}"
 # The app minSdk is 26; getifaddrs is exposed by Android from API 24.
@@ -76,6 +76,9 @@ setup_toolchain() {
     esac
 
     HOST_TRIPLE="${TRIPLE}${ANDROID_API}"
+    # Never share configured autotools/OpenSSL trees between ABIs.
+    BUILD_TMP="${BUILD_TMP_ROOT}/${abi}"
+    mkdir -p "${BUILD_TMP}"
     TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
     if [[ ! -d "${TOOLCHAIN}" ]]; then
         TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/darwin-x86_64"
@@ -337,7 +340,7 @@ main() {
     info "CPU:       ${NCPU}"
 
     check_ndk
-    mkdir -p "${BUILD_TMP}"
+    mkdir -p "${BUILD_TMP_ROOT}"
 
     # Build tất cả ABI
     for abi in "${TARGETS[@]}"; do
