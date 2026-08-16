@@ -258,7 +258,14 @@ class NativeBridge(private val context: Context) {
     }
 
     // ── Reset ──────────────────────────────────────────────────────────────────
-    fun reset() { try { nativeReset() } catch (_: Exception) {} }
+    /**
+     * Dọn cả native usbmuxd/libusb và Android UsbDeviceConnection.
+     * Phải gọi native trước để các tunnel không còn dùng fd mà Java sắp đóng.
+     */
+    fun reset() {
+        try { nativeReset() } catch (_: Exception) {}
+        UsbTransport.close()
+    }
 
     // ── listInstalledApps ──────────────────────────────────────────────────────
     suspend fun listInstalledApps(): List<String> = withContext(Dispatchers.IO) {

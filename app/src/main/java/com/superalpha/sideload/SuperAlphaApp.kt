@@ -14,6 +14,7 @@ import com.superalpha.sideload.bridge.AppConfig
 import com.superalpha.sideload.bridge.AppPaths
 import com.superalpha.sideload.bridge.DeviceNative
 import com.superalpha.sideload.bridge.NativeLog
+import com.superalpha.sideload.bridge.UsbReconnectManager
 import com.superalpha.sideload.bridge.UsbTransport
 
 /**
@@ -44,8 +45,12 @@ class SuperAlphaApp : Application() {
                 if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
                 val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                 if (device != null && device.vendorId != UsbTransport.VENDOR_ID_APPLE) return
+                /* Dọn native trước khi đóng Android fd; thứ tự này ngăn
+                 * libusb/usbmuxd tiếp tục đọc một descriptor đã mất. */
+                DeviceNative.reset()
                 UsbTransport.close()
-                NativeLog.emit("[usb] Thiết bị USB đã rút — bấm Kết nối để thử lại.")
+                UsbReconnectManager.notifyDisconnected()
+                NativeLog.emit("[usb] Thiết bị USB đã rút — đã dọn session, chờ reconnect.")
             }
         }
         val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)

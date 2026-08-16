@@ -6,6 +6,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlin.coroutines.resume
 
 /**
  * UsbReconnectManager — Tự động phát hiện và xử lý ngắt kết nối USB.
@@ -152,11 +153,32 @@ object UsbReconnectManager {
     }
 
     private suspend fun attemptReconnect(): Boolean {
+        val ctx = appContext ?: return false
         val b = bridge ?: return false
         return try {
-            b.tryReconnect()
+            /* Không được gọi nativeConnect() trên fd/session cũ. Sau detach,
+             * libusb và usbmuxd có thể còn tunnel dangling dù Java đã mất thiết bị. */
+            b.reset()
+            NativeLog.emit("[reconnect] Đã dọn session cũ, mở lại USB...")
+
+            val opened = suspendCancellableCoroutine<Boolean> { cont ->
+                UsbPermissionManager.requestAndOpen(
+                    context = ctx,
+                    fromAutoAttach = false
+                ) { ok, message, _ ->
+                    NativeLog.emit("[reconnect] $message")
+                    if (cont.isActive) cont.resume(ok)
+                }
+                cont.invokeOnCancellation {
+                    /* requestAndOpen() tự quản lý receiver; không gọi close ở
+                     * đây để tránh đóng nhầm một connection mới do callback tạo. */
+                }
+            }
+            if (!opened || !UsbTransport.isConnected()) return false
+            b.connect()
         } catch (e: Exception) {
             Log.w(TAG, "attemptReconnect exception: ${e.message}")
+            NativeLog.emit("[reconnect] ❌ ${e.message ?: "lỗi không xác định"}")
             false
         }
     }

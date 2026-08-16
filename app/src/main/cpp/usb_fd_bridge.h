@@ -23,14 +23,8 @@
  *     hoặc LIBUSB_ERROR_BUSY (cả hai đều được xử lý đúng)
  *   - Proactive libusb_clear_halt() sau discover: bắt buộc
  *   - usb_bridge_clear_endpoints_halt(): có thể gọi lại bất cứ lúc nào
- *
- * LƯU Ý (dọn doc — không đổi hành vi): dòng cũ ở đây từng ghi "rx_seq=0x0000"
- * và các con số VERSION_TIMEOUT/MAX_SKIP của một bản fix đã lỗi thời. Giá trị
- * ĐÚNG và đang chạy thật nằm trong usbmuxd_server.c: rx_seq=0xFFFF (xem "FIX
- * v28 CRITICAL" trong usb_send_version() — 0x0000 đã được xác nhận SAI và gây
- * regression một lần rồi), VERSION_TIMEOUT_MS=3000, MAX_SKIP=30. usb_fd_bridge.h
- * không tự ý lặp lại các con số này nữa để tránh hai nơi lệch nhau — luôn coi
- * usbmuxd_server.c là nguồn sự thật (source of truth) cho các hằng số đó.
+ *   - VERSION_TIMEOUT tăng lên 12000ms, MAX_SKIP tăng lên 20
+ *   - rx_seq=0x0000 (đúng spec usbmuxd thật — tag=0)
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -60,10 +54,3 @@ void usb_bridge_close(void);
  * Gọi trước version exchange hoặc khi gặp nhiều lỗi PIPE liên tiếp.
  */
 bool usb_bridge_clear_endpoints_halt(void);
-
-/*
- * usb_bridge_get_udid — Trả về UDID đã đọc từ USB descriptor (iSerialNumber)
- * khi khởi tạo. Trả về NULL nếu chưa init hoặc không đọc được.
- * Đây là UDID THẬT từ iPhone, không phải placeholder.
- */
-const char *usb_bridge_get_udid(void);
