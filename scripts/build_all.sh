@@ -37,7 +37,7 @@ read -r -a TARGETS <<< "${TARGET_ABIS:-arm64-v8a x86_64}"
 LIBUSB_VERSION="1.0.27"
 LIBPLIST_VERSION="2.6.0"
 LIBUSBMUXD_VERSION="2.0.2"
-LIBIMGLU_VERSION="1.4.0"   # libimobiledevice-glue
+LIBIMGLU_VERSION="1.3.2"   # libimobiledevice-glue upstream tag
 LIBIMD_VERSION="1.3.0"     # libimobiledevice
 OPENSSL_VERSION="3.2.1"
 
