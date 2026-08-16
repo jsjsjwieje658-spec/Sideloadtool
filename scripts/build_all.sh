@@ -280,7 +280,9 @@ build_libimobiledevice() {
     sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h common/utils.c
     # Patch: disable các binary tool (chỉ cần lib)
     # Keep common: libimobiledevice links its internal common utility library.
-    sed -i 's/^SUBDIRS = .*/SUBDIRS = common src/' Makefile.am 2>/dev/null || true
+    # Keep common and public headers: libimobiledevice links its internal
+    # common utility library and CMake consumes include/libimobiledevice.
+    sed -i 's/^SUBDIRS = .*/SUBDIRS = common src include/' Makefile.am 2>/dev/null || true
 
     ./autogen.sh --prefix="${prefix}" \
         --host="${TRIPLE}" \
