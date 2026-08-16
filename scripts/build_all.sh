@@ -28,7 +28,8 @@ NATIVE_DEPS_BASE="${NATIVE_DEPS_BASE:-${REPO_ROOT}/.native-deps}"
 BUILD_TMP="${TMPDIR:-/tmp}/sideload_native_build"
 
 NDK_VERSION="${NDK_VERSION:-25.2.9519653}"
-ANDROID_API="${ANDROID_API:-21}"
+# The app minSdk is 26; getifaddrs is exposed by Android from API 24.
+ANDROID_API="${ANDROID_API:-26}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${HOME}/Android/Sdk/ndk/${NDK_VERSION}}"
 
 read -r -a TARGETS <<< "${TARGET_ABIS:-arm64-v8a x86_64}"
@@ -96,7 +97,7 @@ setup_toolchain() {
 
     SYSROOT="${TOOLCHAIN}/sysroot"
     export CFLAGS="${ARCH_FLAGS} -O2 -fPIC -ffunction-sections -fdata-sections"
-    export CFLAGS="${CFLAGS} --sysroot=${SYSROOT} -DANDROID -D__ANDROID_API__=${ANDROID_API}"
+    export CFLAGS="${CFLAGS} --sysroot=${SYSROOT} -DANDROID"
     export LDFLAGS="-Wl,--gc-sections --sysroot=${SYSROOT}"
 
     PREFIX="${NATIVE_DEPS_BASE}/${abi}"
