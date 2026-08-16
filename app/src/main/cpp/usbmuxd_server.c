@@ -34,10 +34,9 @@
  *        dùng chung giữa mọi cuộc gọi/thread. Fix: local + max_retries
  *        giảm 50 → 12.
  *
- * Bug B (Critical, confuse iPhone): version exchange bị lặp lại mỗi lần
- *        TCP "Connect". Fix: tách thành usbmux_version_exchange(), gọi
- *        đúng 1 lần trong nativeSetUsbFd() trước usbmuxd_server_start();
- *        idempotent qua g_version_done.
+ * Bug B (Critical, confuse iPhone): version exchange bị đặt sai thời điểm
+ *        tại lúc nhận fd. Fix: trì hoãn đến Connect đầu tiên tới service
+ *        lockdown; gọi đúng một lần/session qua g_version_done.
  *
  * Bug C (High, block claim — xem usb_fd_bridge.c): bỏ
  *        libusb_detach_kernel_driver() (không tồn tại trên Android).
@@ -99,13 +98,7 @@ typedef struct {
 } umux_hdr_t;
 
 /* ── iPhone USB mux protocol — big-endian ────────────────────────────── */
-/* The initial version request/response uses the legacy 8-byte header. */
-typedef struct {
-    uint32_t protocol;
-    uint32_t length;
-} mux_version_hdr_t;
-
-/* After negotiation, mux v2 uses the full 16-byte header. */
+/* Mux v2 uses the full 16-byte header for version, setup and TCP frames. */
 typedef struct {
     uint32_t protocol;
     uint32_t length;
@@ -469,19 +462,22 @@ static int usb_read_at_least(void *buf, int len, int timeout_ms) {
 
 /* ── Gửi version request theo usbmuxd upstream ─────────────────────────── */
 static int usb_send_version(void) {
-    uint8_t pkt[sizeof(mux_version_hdr_t) + sizeof(mux_version_body_t)];
+    uint8_t pkt[sizeof(v2_mux_hdr_t) + sizeof(mux_version_body_t)];
     memset(pkt, 0, sizeof(pkt));
 
-    mux_version_hdr_t *hdr = (mux_version_hdr_t *)pkt;
+    v2_mux_hdr_t *hdr = (v2_mux_hdr_t *)pkt;
     hdr->protocol = htonl(MUX_PROTO_VERSION);
     hdr->length = htonl(sizeof(pkt));
+    hdr->magic = htonl(V2_MAGIC);
+    hdr->tx_seq = htons(0);
+    hdr->rx_seq = htons(0xFFFF);
 
     mux_version_body_t *body = (mux_version_body_t *)(pkt + sizeof(*hdr));
     body->major = htonl(2);
     body->minor = htonl(0);
     body->padding = 0;
 
-    LOGI("usb_send_version: gửi mux version 2.0, length=%zu", sizeof(pkt));
+    LOGI("usb_send_version: gửi mux v2 header 16-byte + version 2.0, length=%zu", sizeof(pkt));
     return usb_write(pkt, (int)sizeof(pkt)) > 0 ? 0 : -1;
 }
 
@@ -496,15 +492,17 @@ static int usb_drain_bytes(uint32_t len, int timeout_ms) {
     return 0;
 }
 
-/* The initial response uses the legacy 8-byte header.  Once major 2 is
- * accepted, send the SETUP frame required by upstream usbmuxd. */
+/* Version exchange của mux v2 dùng mux header đầy đủ 16 byte.
+ * usbmuxd upstream gửi/nhận: [protocol,length,magic,tx_seq,rx_seq]
+ * + version body 12 byte. Header 8 byte chỉ hợp lệ cho mux v1; dùng nó
+ * với iPhone hiện đại làm thiết bị im lặng và không bao giờ tới lockdown. */
 static int usb_recv_version(void) {
     const int VERSION_TIMEOUT_MS = 3000;
     const int MAX_TIMEOUT_TRIES = 10;
     const int MAX_SKIP = 12;
 
     for (int skip = 0, timeout_tries = 0; skip < MAX_SKIP; ) {
-        mux_version_hdr_t hdr;
+        v2_mux_hdr_t hdr;
         int n = usb_read_exact(&hdr, sizeof(hdr), VERSION_TIMEOUT_MS);
         if (n <= 0) {
             if (++timeout_tries >= MAX_TIMEOUT_TRIES) {
@@ -519,6 +517,11 @@ static int usb_recv_version(void) {
 
         uint32_t protocol = ntohl(hdr.protocol);
         uint32_t packet_len = ntohl(hdr.length);
+        uint32_t magic = ntohl(hdr.magic);
+        if (magic != V2_MAGIC) {
+            LOGE("usb_recv_version: magic không hợp lệ=0x%08x", magic);
+            return -1;
+        }
         if (packet_len < sizeof(hdr) || packet_len > 65536) {
             LOGE("usb_recv_version: packet length không hợp lệ=%u", packet_len);
             return -1;
@@ -544,7 +547,8 @@ static int usb_recv_version(void) {
 
         uint32_t major = ntohl(body.major);
         uint32_t minor = ntohl(body.minor);
-        LOGI("usb_recv_version: iPhone mux version %u.%u", major, minor);
+        LOGI("usb_recv_version: iPhone mux version %u.%u tx=%u rx=%u", major, minor,
+             ntohs(hdr.tx_seq), ntohs(hdr.rx_seq));
         if (major != 2) {
             LOGE("usb_recv_version: iPhone trả version %u, cần mux v2", major);
             return -1;
@@ -742,14 +746,8 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     st->remote_seq = 0;
     pthread_mutex_init(&st->usb_tx_lock, NULL);
 
-    /*
-     * FIX Bug B: KHÔNG lặp lại version exchange ở đây nữa. iPhone v1 mux
-     * chỉ chấp nhận một version exchange per USB session; version exchange
-     * thật sự đã được thực hiện một lần trong nativeSetUsbFd() (ngay sau
-     * libusb init, trước usbmuxd_server_start()). Gọi lại usbmux_version_exchange()
-     * ở đây chỉ là safety check — idempotent nhờ g_version_done, sẽ no-op
-     * nếu đã làm rồi, và chỉ thực hiện thật nếu vì lý do nào đó chưa làm.
-     */
+    /* Version exchange được thực hiện một lần ngay trước SYN, sau khi
+     * client đã gửi Connect tới port lockdown. */
     if (!usbmux_version_exchange()) {
         LOGE("do_usb_v1_connect: version exchange thất bại — iPhone không hỗ trợ v1?");
         return false;

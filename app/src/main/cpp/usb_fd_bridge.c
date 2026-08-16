@@ -219,27 +219,14 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
     }
 
     /*
-     * FIX v27 (Critical): Proactive libusb_clear_halt() ngay sau discover.
-     *
-     * Dù fd có sạch (chưa claim từ Android) hay không, endpoint vẫn có thể
-     * ở trạng thái STALL sau khi iPhone vừa kết nối USB. Bước này bắt buộc.
-     *
-     * Nếu fd sạch (termux-api pattern): clear_halt thường trả SUCCESS → OK
-     * Nếu fd đã claim (Android pattern): clear_halt có thể trả error → non-fatal
+     * Giữ nguyên endpoint sau khi wrap fd, giống termux-usbmuxd.
+     * Không gửi CLEAR_FEATURE/clear_halt chủ động trước phiên mux đầu tiên:
+     * Android UsbDeviceConnection đã cấp một fd mới, còn usbmuxd upstream sẽ
+     * tự xử lý stall khi bulk transfer thực tế báo PIPE. Việc phát sinh thêm
+     * control transfer trước khi mở lockdown có thể làm iPhone bỏ qua phiên
+     * mux đầu tiên trên một số bản iOS.
      */
-    LOGI("usb_bridge_init: clear endpoint halts...");
-    {
-        int re = libusb_clear_halt(g_handle, g_ep_out);
-        LOGI("clear_halt ep_out=0x%02x → %d (%s)", g_ep_out, re,
-             re == 0 ? "OK" : libusb_error_name(re));
-        usleep(100 * 1000);
-    }
-    {
-        int re = libusb_clear_halt(g_handle, g_ep_in);
-        LOGI("clear_halt ep_in=0x%02x → %d (%s)", g_ep_in, re,
-             re == 0 ? "OK" : libusb_error_name(re));
-        usleep(100 * 1000);
-    }
+    LOGI("usb_bridge_init: giữ endpoint nguyên trạng; clear_halt chỉ khi transfer PIPE");
 
     g_initialized = 1;
     LOGI("usb_bridge_init: ✅ sẵn sàng — ep_in=0x%02x ep_out=0x%02x",
