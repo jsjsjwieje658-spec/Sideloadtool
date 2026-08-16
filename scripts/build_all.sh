@@ -271,6 +271,10 @@ build_libimobiledevice() {
     # Android exposes pthread_once from libc; there is no standalone
     # libpthread to probe/link. Skip libimobiledevice's Unix-only check.
     sed -i '/AC_CHECK_LIB(pthread, \[pthread_once\]/d' configure.ac
+    # libplist >= 2.6 already owns plist_format_t and PLIST_FORMAT_*.
+    # libimobiledevice 1.3.0 still redeclares the old enum in common/utils.h.
+    sed -i '/^enum plist_format_t {/,/^};$/d' common/utils.h
+    sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h
     # Patch: disable các binary tool (chỉ cần lib)
     sed -i 's/^SUBDIRS = .*/SUBDIRS = src/' Makefile.am 2>/dev/null || true
 
