@@ -274,7 +274,7 @@ build_libimobiledevice() {
     # libplist >= 2.6 already owns plist_format_t and PLIST_FORMAT_*.
     # libimobiledevice 1.3.0 still redeclares the old enum in common/utils.h.
     sed -i '/^enum plist_format_t {/,/^};$/d' common/utils.h
-    sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h
+    sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h common/utils.c
     # Patch: disable các binary tool (chỉ cần lib)
     # Keep common: libimobiledevice links its internal common utility library.
     sed -i 's/^SUBDIRS = .*/SUBDIRS = common src/' Makefile.am 2>/dev/null || true
