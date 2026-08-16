@@ -50,7 +50,7 @@ foreach(HEADER_DIR IN ITEMS
   "${NATIVE_INC_DIR}"
   "${NATIVE_INC_DIR}/libimobiledevice"
   "${NATIVE_INC_DIR}/libimobiledevice-glue"
-  "${NATIVE_INC_DIR}/libplist"
+  "${NATIVE_INC_DIR}/plist"
   "${NATIVE_INC_DIR}/libusb-1.0"
 )
   if(NOT EXISTS "${HEADER_DIR}")
@@ -78,7 +78,7 @@ target_include_directories(sideloadnative PRIVATE
   "${NATIVE_INC_DIR}"
   "${NATIVE_INC_DIR}/libimobiledevice"
   "${NATIVE_INC_DIR}/libimobiledevice-glue"
-  "${NATIVE_INC_DIR}/libplist"
+  "${NATIVE_INC_DIR}/plist"
   "${NATIVE_INC_DIR}/libusb-1.0"
 )
 
