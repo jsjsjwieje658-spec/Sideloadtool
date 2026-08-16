@@ -191,7 +191,11 @@ int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
     plist_t req = plist_new_dict();
     plist_dict_set_item(req, "MessageType", plist_new_string("Connect"));
     plist_dict_set_item(req, "DeviceID", plist_new_uint(1));
-    plist_dict_set_item(req, "PortNumber", plist_new_uint(port));
+    /* libusbmuxd v1 encodes PortNumber as network-order uint16 in the plist.
+     * The in-process server decodes it with ntohs(), matching upstream
+     * send_connect_packet(). Sending host-order here turns lockdown 62078
+     * into 32498 on little-endian Android and causes LOCKDOWN_E_MUX_ERROR. */
+    plist_dict_set_item(req, "PortNumber", plist_new_uint(htons(port)));
 
     char *xml = NULL;
     uint32_t xml_len = 0;
