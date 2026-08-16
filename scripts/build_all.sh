@@ -268,6 +268,9 @@ build_libimobiledevice() {
         "${LIBIMD_VERSION}"
 
     pushd "${src}" >/dev/null
+    # Android exposes pthread_once from libc; there is no standalone
+    # libpthread to probe/link. Skip libimobiledevice's Unix-only check.
+    sed -i '/AC_CHECK_LIB(pthread, \[pthread_once\]/d' configure.ac
     # Patch: disable các binary tool (chỉ cần lib)
     sed -i 's/^SUBDIRS = .*/SUBDIRS = src/' Makefile.am 2>/dev/null || true
 
