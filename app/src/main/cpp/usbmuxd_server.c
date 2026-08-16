@@ -227,7 +227,17 @@ static char *recv_plist(int fd, umux_hdr_t *hdr_out) {
     umux_hdr_t hdr;
     if (sock_read_all(fd, &hdr, sizeof(hdr)) < 0) return NULL;
     if (hdr_out) *hdr_out = hdr;
-    uint32_t body_len = hdr.length - sizeof(hdr);
+    if (hdr.length < sizeof(hdr)) {
+        LOGE("recv_plist: header length=%u nhỏ hơn header=%zu",
+             hdr.length, sizeof(hdr));
+        return NULL;
+    }
+    if (hdr.version != USBMUX_PROTO_PLIST || hdr.type != USBMUX_TYPE_PLIST) {
+        LOGE("recv_plist: header không hợp lệ version=%u type=%u",
+             hdr.version, hdr.type);
+        return NULL;
+    }
+    uint32_t body_len = hdr.length - (uint32_t)sizeof(hdr);
     if (body_len > 2*1024*1024) { LOGE("recv_plist: body_len=%u quá lớn", body_len); return NULL; }
     char *xml = malloc(body_len + 1);
     if (!xml) return NULL;

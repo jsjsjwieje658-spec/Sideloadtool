@@ -41,6 +41,22 @@
 
 #include "android_usbmuxd_fix.h"
 
+/* libusbmuxd plist socket framing is a packed 16-byte little-endian header.
+ * The in-process server uses the same layout; do not send a standalone
+ * 4-byte length followed by XML because the server will then consume the
+ * first 12 XML bytes as version/type/tag and compute a bogus body length. */
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t length;
+    uint32_t version;
+    uint32_t type;
+    uint32_t tag;
+} android_usbmux_plist_hdr_t;
+#pragma pack(pop)
+
+#define ANDROID_USBMUX_PROTO_PLIST 1u
+#define ANDROID_USBMUX_TYPE_PLIST  8u
+
 /* ── Logging helper ── */
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static android_usbmuxd_log_callback_t g_log_callback = NULL;
@@ -72,6 +88,39 @@ void android_usbmuxd_fix_logf(const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     android_usbmuxd_fix_log(msg);
+}
+
+/* Socket reads/writes may be partial even for a local stream socket. */
+static int send_all(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL);
+        if (n > 0) {
+            done += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buf, size_t len)
+{
+    char *p = (char *)buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = recv(fd, p + done, len - done, 0);
+        if (n > 0) {
+            done += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Cache ── */
@@ -236,38 +285,38 @@ int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
         return -1;
     }
 
-    uint32_t len_be = __builtin_bswap32(xml_len);
+    android_usbmux_plist_hdr_t req_hdr;
+    memset(&req_hdr, 0, sizeof(req_hdr));
+    req_hdr.length  = (uint32_t)(sizeof(req_hdr) + xml_len);
+    req_hdr.version = ANDROID_USBMUX_PROTO_PLIST;
+    req_hdr.type    = ANDROID_USBMUX_TYPE_PLIST;
+    req_hdr.tag     = 1;
     int ok = 0;
 
-    if (send(sfd, &len_be, 4, MSG_NOSIGNAL) == 4 &&
-        send(sfd, xml, xml_len, MSG_NOSIGNAL) == (ssize_t)xml_len) {
-        uint32_t resp_len_be = 0;
-        if (recv(sfd, &resp_len_be, 4, 0) == 4) {
-            uint32_t resp_len = __builtin_bswap32(resp_len_be);
-            if (resp_len > 0 && resp_len < 65536) {
-                char *resp_xml = (char *)malloc(resp_len + 1);
-                if (resp_xml) {
-                    int total = 0;
-                    while (total < (int)resp_len) {
-                        int n = recv(sfd, resp_xml + total, resp_len - total, 0);
-                        if (n <= 0) break;
-                        total += n;
-                    }
-                    if (total == (int)resp_len) {
-                        resp_xml[resp_len] = '\0';
-                        plist_t resp = NULL;
-                        plist_from_xml(resp_xml, resp_len, &resp);
-                        if (resp) {
-                            plist_t num = plist_dict_get_item(resp, "Number");
-                            uint64_t result = 0;
-                            if (num) plist_get_uint_val(num, &result);
-                            plist_free(resp);
-                            if (result == 0) ok = 1;
-                        }
-                    }
-                    free(resp_xml);
+    if (send_all(sfd, &req_hdr, sizeof(req_hdr)) == 0 &&
+        send_all(sfd, xml, xml_len) == 0) {
+        android_usbmux_plist_hdr_t resp_hdr;
+        memset(&resp_hdr, 0, sizeof(resp_hdr));
+        if (recv_all(sfd, &resp_hdr, sizeof(resp_hdr)) == 0 &&
+            resp_hdr.length >= sizeof(resp_hdr) &&
+            resp_hdr.length <= 65536 &&
+            resp_hdr.version == ANDROID_USBMUX_PROTO_PLIST &&
+            resp_hdr.type == ANDROID_USBMUX_TYPE_PLIST) {
+            uint32_t resp_len = resp_hdr.length - (uint32_t)sizeof(resp_hdr);
+            char *resp_xml = (char *)malloc(resp_len + 1);
+            if (resp_xml && recv_all(sfd, resp_xml, resp_len) == 0) {
+                resp_xml[resp_len] = '\0';
+                plist_t resp = NULL;
+                plist_from_xml(resp_xml, resp_len, &resp);
+                if (resp) {
+                    plist_t num = plist_dict_get_item(resp, "Number");
+                    uint64_t result = 0;
+                    if (num) plist_get_uint_val(num, &result);
+                    plist_free(resp);
+                    if (result == 0) ok = 1;
                 }
             }
+            free(resp_xml);
         }
     }
 
