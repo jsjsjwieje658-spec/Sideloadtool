@@ -98,15 +98,21 @@ typedef struct {
     uint32_t tag;
 } umux_hdr_t;
 
-/* ── iPhone USB v1 protocol — big-endian ──────────────────────────────── */
-/* Mux header (16 bytes) */
+/* ── iPhone USB mux protocol — big-endian ────────────────────────────── */
+/* The initial version request/response uses the legacy 8-byte header. */
 typedef struct {
-    uint32_t protocol;   /* BE: 0=version, 1=TCP */
-    uint32_t length;     /* BE: total length including all headers */
-    uint32_t magic;      /* BE: 0xfeedface */
-    uint16_t tx_seq;     /* BE: device frame sequence (we use 0) */
-    uint16_t rx_seq;     /* BE: last received frame (we use 0xffff) */
-} v1_mux_hdr_t;
+    uint32_t protocol;
+    uint32_t length;
+} mux_version_hdr_t;
+
+/* After negotiation, mux v2 uses the full 16-byte header. */
+typedef struct {
+    uint32_t protocol;
+    uint32_t length;
+    uint32_t magic;
+    uint16_t tx_seq;
+    uint16_t rx_seq;
+} v2_mux_hdr_t;
 
 /* TCP header (20 bytes) */
 typedef struct {
@@ -121,19 +127,20 @@ typedef struct {
     uint16_t urgp;       /* urgent pointer (0) */
 } v1_tcp_hdr_t;
 
-/* Version packet body (16 bytes) */
+/* Version body used by usbmuxd upstream (12 bytes). */
 typedef struct {
-    uint32_t major;      /* BE */
-    uint32_t minor;      /* BE */
+    uint32_t major;
+    uint32_t minor;
     uint32_t padding;
-    uint32_t padding2;
-} v1_version_body_t;
+} mux_version_body_t;
 
 #pragma pack(pop)
 
-#define V1_MAGIC     0xfeedface
-#define V1_PROTO_VER 0
-#define V1_PROTO_TCP 1
+#define V2_MAGIC         0xfeedface
+#define MUX_PROTO_VERSION 0
+#define MUX_PROTO_CONTROL 1
+#define MUX_PROTO_SETUP   2
+#define MUX_PROTO_TCP     6
 
 #define TH_FIN  0x01
 #define TH_SYN  0x02
@@ -170,6 +177,9 @@ static pthread_mutex_t g_udid_mutex = PTHREAD_MUTEX_INITIALIZER;
  * usbmux_version_exchange() là idempotent.
  */
 static volatile int    g_version_done = 0;
+static uint16_t         g_mux_tx_seq = 0;
+static uint16_t         g_mux_rx_seq = 0xFFFF;
+static pthread_mutex_t  g_mux_seq_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ════════════════════════════════════════════════════════════════════════
  * Socket I/O helpers
@@ -457,318 +467,178 @@ static int usb_read_at_least(void *buf, int len, int timeout_ms) {
     return usb_bridge_bulk_read(buf, len, timeout_ms);
 }
 
-/* ── Gửi v1 version packet ─────────────────────────────────────────────── */
+/* ── Gửi version request theo usbmuxd upstream ─────────────────────────── */
 static int usb_send_version(void) {
-    uint8_t pkt[sizeof(v1_mux_hdr_t) + sizeof(v1_version_body_t)];
+    uint8_t pkt[sizeof(mux_version_hdr_t) + sizeof(mux_version_body_t)];
     memset(pkt, 0, sizeof(pkt));
 
-    v1_mux_hdr_t *hdr = (v1_mux_hdr_t *)pkt;
-    hdr->protocol = htonl(V1_PROTO_VER);
-    hdr->length   = htonl(sizeof(pkt));
-    hdr->magic    = htonl(V1_MAGIC);
-    hdr->tx_seq   = htons(0);
-    /*
-     * FIX v28 (CRITICAL): rx_seq phải là 0xFFFF, không phải 0x0000.
-     *
-     * 0xFFFF = "chưa nhận frame nào" — đây là giá trị khởi tạo đúng theo
-     * spec usbmuxd thật (xem libimobiledevice/tools/iproxy.c và
-     * usbmuxd/src/usb.c: hdr.rx_seq = 0xffff trong version request).
-     *
-     * Với 0x0000, iPhone (iOS 7+) đọc "rx_seq=0" nghĩa là "đã nhận frame 0"
-     * → trạng thái protocol không nhất quán → iPhone bỏ qua hoặc từ chối
-     * version packet → version exchange thất bại từ lần đầu.
-     *
-     * FIX v26 (đã sai): "0x0000 đúng với spec" — KHÔNG ĐÚNG.
-     * Spec thật: https://github.com/libimobiledevice/usbmuxd/blob/master/src/usb.c
-     * version_request.header.rx_seq = htons(0xffff);
-     */
-    hdr->rx_seq   = htons(0xFFFF);
+    mux_version_hdr_t *hdr = (mux_version_hdr_t *)pkt;
+    hdr->protocol = htonl(MUX_PROTO_VERSION);
+    hdr->length = htonl(sizeof(pkt));
 
-    v1_version_body_t *body = (v1_version_body_t *)(pkt + sizeof(v1_mux_hdr_t));
-    /*
-     * FIX v28 (CRITICAL): major phải là 1, không phải 2.
-     *
-     * iPhone iOS 7+ chỉ hỗ trợ v1 protocol (major=1, minor=0).
-     * Gửi major=2 khiến iPhone không nhận ra version packet và không
-     * phản hồi → version exchange thất bại → Trust popup không xuất hiện.
-     *
-     * Tham khảo real usbmuxd source (usb.c):
-     *   version_request.body.major = htonl(1);
-     *   version_request.body.minor = htonl(0);
-     */
-    body->major   = htonl(1);   /* FIX: v1 protocol — iPhone iOS 7+ chỉ accept major=1 */
-    body->minor   = htonl(0);
+    mux_version_body_t *body = (mux_version_body_t *)(pkt + sizeof(*hdr));
+    body->major = htonl(2);
+    body->minor = htonl(0);
     body->padding = 0;
-    body->padding2= 0;
 
-    return usb_write(pkt, sizeof(pkt)) > 0 ? 0 : -1;
+    LOGI("usb_send_version: gửi mux version 2.0, length=%zu", sizeof(pkt));
+    return usb_write(pkt, (int)sizeof(pkt)) > 0 ? 0 : -1;
 }
 
-/* ── Nhận và kiểm tra version response từ iPhone ───────────────────────── */
-/*
- * FIX Bug D (Medium): đọc header (16 bytes) TRƯỚC, validate magic +
- * protocol ngay, rồi mới đọc/drain phần body (version_body) riêng.
- *
- * Trước đây đọc gộp header+body trong một lần usb_read_exact(sizeof(pkt)),
- * chờ đủ toàn bộ 32 bytes mới validate — nếu iPhone đã đẩy version packet
- * (hoặc byte đầu của gói kế tiếp) vào buffer USB trước khi ta kịp đọc,
- * việc đọc gộp dễ lẫn dữ liệu và validate trễ. Đọc header trước cho phép
- * fail-fast ngay khi magic sai, và timeout mỗi lần đọc giảm 3000ms → 1500ms
- * để không giữ pipe quá lâu khi iPhone không phản hồi.
- */
-static int usb_recv_version(void) {
-    /*
-     * FIX v25 (Critical — version exchange thất bại):
-     *
-     * Ba vấn đề được sửa trong lần này:
-     *
-     * 1. BAD MAGIC → return -1 ngay (WRONG): iPhone đôi khi gửi dữ liệu
-     *    USB cũ (từ lần kết nối trước, buffered trong kernel) có magic khác.
-     *    Fix: khi magic sai nhưng length có vẻ hợp lệ (8-65535), drain body
-     *    và TIẾP TỤC vòng lặp thay vì return -1. Tăng số lần skip từ 5 → 12.
-     *
-     * 2. SHORT HEADER READ → return -1 ngay (WRONG): khi usb_read_exact()
-     *    trả về 0 (timeout) hoặc số byte nhỏ, không nên bỏ ngay mà phải
-     *    retry lại toàn bộ header read.
-     *
-     * 3. TIMEOUT quá ngắn: tăng từ 5000ms → 8000ms để phù hợp với iOS 17+
-     *    trên các máy Android có USB controller chậm (MediaTek).
-     */
-    /*
-     * FIX v28: Tách riêng timeout retries khỏi bad-packet skip budget.
-     *
-     * VẤN ĐỀ CŨ (v27): Timeout và bad packet đều dùng chung biến `skip`
-     * (MAX_SKIP=20). Nếu iPhone không phản hồi ngay (phổ biến với USB
-     * controller chậm), 20 lần timeout cạn kiệt toàn bộ skip budget mà
-     * chưa nhận được một packet rác nào → hàm trả -1 quá sớm.
-     *
-     * FIX: Hai counter riêng biệt:
-     *   - timeout_tries: đếm số lần đọc trả về ≤0 (timeout/error)
-     *   - skip: chỉ tăng khi nhận được packet thực sự nhưng sai (bad magic/protocol)
-     *
-     * Timeout tối đa: MAX_TIMEOUT_TRIES × VERSION_TIMEOUT_MS = 10 × 3000ms = 30 giây
-     * Bad packet skip: MAX_SKIP = 30 (tăng từ 20 để xử lý thiết bị ồn ào hơn)
-     */
-    const int VERSION_TIMEOUT_MS      = 3000;  /* ms mỗi lần đọc — ngắn hơn để retry nhanh hơn */
-    const int MAX_TIMEOUT_TRIES       = 10;    /* tối đa 10 lần timeout (30 giây tổng) */
-    const int MAX_SKIP                = 30;    /* tối đa 30 bad packet bị skip */
-    v1_mux_hdr_t hdr;
+static int usb_drain_bytes(uint32_t len, int timeout_ms) {
+    uint8_t buf[256];
+    while (len > 0) {
+        int take = (int)(len < sizeof(buf) ? len : sizeof(buf));
+        int n = usb_read_exact(buf, take, timeout_ms);
+        if (n != take) return -1;
+        len -= (uint32_t)n;
+    }
+    return 0;
+}
 
-    int timeout_tries = 0;
-    for (int skip = 0; skip < MAX_SKIP; ) {
-        /* ── Đọc 16-byte header ── */
+/* The initial response uses the legacy 8-byte header.  Once major 2 is
+ * accepted, send the SETUP frame required by upstream usbmuxd. */
+static int usb_recv_version(void) {
+    const int VERSION_TIMEOUT_MS = 3000;
+    const int MAX_TIMEOUT_TRIES = 10;
+    const int MAX_SKIP = 12;
+
+    for (int skip = 0, timeout_tries = 0; skip < MAX_SKIP; ) {
+        mux_version_hdr_t hdr;
         int n = usb_read_exact(&hdr, sizeof(hdr), VERSION_TIMEOUT_MS);
         if (n <= 0) {
-            /*
-             * FIX v28: Timeout KHÔNG tăng skip — dùng counter riêng.
-             * Giúp hàm tiếp tục chờ ngay cả khi iPhone khởi tạo endpoint chậm.
-             */
-            timeout_tries++;
-            if (timeout_tries >= MAX_TIMEOUT_TRIES) {
-                LOGI("usb_recv_version: %d timeout liên tiếp — dừng tìm version packet",
-                     MAX_TIMEOUT_TRIES);
-                break;
+            if (++timeout_tries >= MAX_TIMEOUT_TRIES) {
+                LOGE("usb_recv_version: timeout chờ version (%d lần)", timeout_tries);
+                return -1;
             }
-            LOGI("usb_recv_version: header timeout n=%d (timeout %d/%d), tiếp tục chờ...",
-                 n, timeout_tries, MAX_TIMEOUT_TRIES);
-            usleep(200 * 1000); /* 200ms */
-            continue;  /* KHÔNG tăng skip */
+            usleep(200 * 1000);
+            continue;
         }
-        /* Nhận được dữ liệu — reset timeout counter */
+        if (n != (int)sizeof(hdr)) return -1;
         timeout_tries = 0;
 
-        if (n < (int)sizeof(hdr)) {
-            LOGI("usb_recv_version: short header n=%d (skip=%d/%d), retry",
-                 n, skip+1, MAX_SKIP);
+        uint32_t protocol = ntohl(hdr.protocol);
+        uint32_t packet_len = ntohl(hdr.length);
+        if (packet_len < sizeof(hdr) || packet_len > 65536) {
+            LOGE("usb_recv_version: packet length không hợp lệ=%u", packet_len);
+            return -1;
+        }
+        uint32_t body_len = packet_len - (uint32_t)sizeof(hdr);
+        if (protocol != MUX_PROTO_VERSION) {
+            LOGI("usb_recv_version: packet protocol=%u trước version, drain=%u", protocol, body_len);
+            if (usb_drain_bytes(body_len, 2000) < 0) return -1;
+            skip++;
+            continue;
+        }
+        if (body_len < sizeof(mux_version_body_t)) {
+            if (usb_drain_bytes(body_len, 2000) < 0) return -1;
             skip++;
             continue;
         }
 
-        uint32_t magic    = ntohl(hdr.magic);
-        uint32_t protocol = ntohl(hdr.protocol);
-        uint32_t pkt_len  = ntohl(hdr.length);
+        mux_version_body_t body;
+        if (usb_read_exact(&body, sizeof(body), VERSION_TIMEOUT_MS) != (int)sizeof(body))
+            return -1;
+        if (body_len > sizeof(body) && usb_drain_bytes(body_len - sizeof(body), 2000) < 0)
+            return -1;
 
-        /* ── Kiểm tra magic ── */
-        if (magic != V1_MAGIC) {
-            LOGI("usb_recv_version: bad magic=0x%08x (skip=%d/%d) — drain & retry",
-                 magic, skip+1, MAX_SKIP);
-            if (pkt_len > sizeof(hdr) && pkt_len < 65536) {
-                uint32_t body_len = pkt_len - sizeof(hdr);
-                uint8_t *drain = malloc(body_len);
-                if (drain) {
-                    usb_read_exact(drain, (int)body_len, 2000);
-                    free(drain);
-                } else {
-                    uint8_t tmp[256];
-                    uint32_t remaining = body_len;
-                    while (remaining > 0) {
-                        int take = (int)(remaining < sizeof(tmp) ? remaining : sizeof(tmp));
-                        int r = usb_read_exact(tmp, take, 1000);
-                        if (r <= 0) break;
-                        remaining -= (uint32_t)r;
-                    }
-                }
-            }
-            skip++;  /* FIX v28: tăng skip chỉ khi có packet rác thật sự */
-            continue;
+        uint32_t major = ntohl(body.major);
+        uint32_t minor = ntohl(body.minor);
+        LOGI("usb_recv_version: iPhone mux version %u.%u", major, minor);
+        if (major != 2) {
+            LOGE("usb_recv_version: iPhone trả version %u, cần mux v2", major);
+            return -1;
         }
-
-        /* ── Magic hợp lệ — kiểm tra protocol ── */
-        if (protocol != V1_PROTO_VER) {
-            uint32_t body_len = pkt_len > sizeof(hdr) ? pkt_len - sizeof(hdr) : 0;
-            if (body_len > 0 && body_len < 65536) {
-                uint8_t *drain = malloc(body_len);
-                if (drain) {
-                    usb_read_exact(drain, (int)body_len, 2000);
-                    free(drain);
-                }
-            }
-            LOGI("usb_recv_version: protocol=%u (not version), drain & retry (skip=%d/%d)",
-                 protocol, skip+1, MAX_SKIP);
-            skip++;  /* FIX v28: tăng skip chỉ khi có packet rác thật sự */
-            continue;
-        }
-
-        /* ── Version packet hợp lệ — đọc/drain body ── */
-        uint32_t body_len = pkt_len > sizeof(hdr) ? pkt_len - sizeof(hdr) : 0;
-        if (body_len > sizeof(v1_version_body_t)) body_len = sizeof(v1_version_body_t);
-        if (body_len > 0) {
-            uint8_t body[sizeof(v1_version_body_t)];
-            int r = usb_read_exact(body, (int)body_len, VERSION_TIMEOUT_MS);
-            if (r < (int)body_len) {
-                LOGI("usb_recv_version: short body read r=%d/%u, retry", r, body_len);
-                continue; /* retry — có thể đọc được ở lần sau */
-            }
-            v1_version_body_t *vb = (v1_version_body_t *)body;
-            LOGI("usb_recv_version: iPhone version major=%u minor=%u",
-                 ntohl(vb->major), ntohl(vb->minor));
-        }
-
-        LOGI("usb_recv_version: ✅ iPhone v1 protocol confirmed (skip=%d)", skip);
         return 0;
-    } /* end for(skip) */
-
-    LOGE("usb_recv_version: ❌ thất bại — skip=%d/%d timeout=%d/%d",
-         MAX_SKIP, MAX_SKIP, timeout_tries, MAX_TIMEOUT_TRIES);
+    }
     return -1;
 }
 
-/*
- * usbmux_version_exchange (public, khai báo trong usbmuxd_server.h)
- *
- * FIX Bug B (Critical — confuse iPhone): iPhone v1 mux protocol chỉ chấp
- * nhận MỘT version exchange per USB session. Code cũ gọi
- * usb_send_version()+usb_recv_version() bên trong do_usb_v1_connect(), tức
- * là mỗi lần libusbmuxd gửi "Connect" (lockdownd, AFC, instproxy, ...) đều
- * lặp lại version exchange. Từ lần kết nối thứ 2 trở đi, iPhone nhận được
- * một packet version không mong đợi trong lúc nó đang chờ SYN → reject
- * connection.
- *
- * Fix: tách thành hàm public này, gọi đúng MỘT LẦN — từ nativeSetUsbFd()
- * ngay sau khi libusb init xong và TRƯỚC KHI usbmuxd_server_start(). Flag
- * g_version_done đảm bảo idempotent nếu hàm bị gọi lại (an toàn khi
- * do_usb_v1_connect() cũng gọi lại như một safety check).
- */
-bool usbmux_version_exchange(void) {
-    if (g_version_done) {
-        LOGI("usbmux_version_exchange: đã thực hiện trước đó cho session này — bỏ qua (idempotent)");
-        return true;
-    }
-    LOGI("usbmux_version_exchange: bắt đầu version exchange (đúng 1 lần/session)");
+static int usb_send_setup(void) {
+    uint8_t pkt[sizeof(v2_mux_hdr_t) + 1];
+    memset(pkt, 0, sizeof(pkt));
 
-    /*
-     * FIX v24 Bug H: Thêm retry (3 lần, khoảng cách 1 giây).
-     * Trước đây một lần gửi+nhận thất bại là hết — không có cơ hội phục hồi.
-     * Sau khi libusb wrap fd, endpoint có thể bị stall trong 1-2 giây đầu
-     * (đặc biệt trên iOS 16+ và một số dòng Android). Retry cho phép
-     * version exchange thành công ở lần thứ 2 hoặc 3.
-     */
-    /*
-     * FIX v27 (học từ usbmuxd_proxy.c của termux-usbmuxd):
-     *
-     * Tăng từ 3 → 5 lần retry. Giữa mỗi lần retry:
-     *   1. usb_bridge_clear_endpoints_halt() — xóa STALL trên cả ep_out và ep_in
-     *   2. usb_bridge_flush_in() — drain tất cả stale packet còn trong buffer
-     *   3. Delay 1.5 giây — cho iPhone đủ thời gian reset MUX endpoint
-     *
-     * Lý do 5 lần (thay vì 3): Trên một số dòng iPhone (iOS 16+) và một số
-     * Android OEM (MediaTek SoC), endpoint STALL kéo dài đến 3-4 giây sau
-     * khi libusb wrap fd. 5 retry × 1.5s = 7.5s tổng thời gian chờ.
-     *
-     * termux-usbmuxd giải quyết vấn đề này bằng cách dùng fd SẠCH (không
-     * claim interface từ Android). Với fix v27 (UsbTransport.open() không
-     * claim interface nữa), số lần retry thực tế cần ít hơn, nhưng giữ 5
-     * để đảm bảo backward compat với các thiết bị khó chịu.
-     */
+    v2_mux_hdr_t *hdr = (v2_mux_hdr_t *)pkt;
+    hdr->protocol = htonl(MUX_PROTO_SETUP);
+    hdr->length = htonl(sizeof(pkt));
+    hdr->magic = htonl(V2_MAGIC);
+    hdr->tx_seq = htons(0);
+    hdr->rx_seq = htons(0xFFFF);
+    pkt[sizeof(v2_mux_hdr_t)] = 0x07;
+
+    int n = usb_write(pkt, (int)sizeof(pkt));
+    if (n <= 0) return -1;
+
+    pthread_mutex_lock(&g_mux_seq_mutex);
+    g_mux_tx_seq = 1;
+    g_mux_rx_seq = 0xFFFF;
+    pthread_mutex_unlock(&g_mux_seq_mutex);
+    LOGI("usb_send_setup: SETUP v2 đã gửi");
+    return 0;
+}
+
+bool usbmux_version_exchange(void) {
+    if (g_version_done) return true;
+
     for (int attempt = 0; attempt < 5; attempt++) {
         if (attempt > 0) {
-            LOGI("usbmux_version_exchange: retry lần %d/5 — clear_halt + flush + 1.5s...", attempt + 1);
+            LOGI("usbmux_version_exchange: retry %d/5", attempt + 1);
             usb_bridge_clear_endpoints_halt();
             usb_bridge_flush_in(8, 200);
-            usleep(1500 * 1000); /* 1.5 giây giữa các lần retry */
+            usleep(1000 * 1000);
         }
+        if (usb_send_version() < 0) continue;
+        if (usb_recv_version() < 0) continue;
+        if (usb_send_setup() < 0) continue;
 
-        if (usb_send_version() < 0) {
-            LOGE("usbmux_version_exchange attempt %d: gửi VERSION thất bại", attempt + 1);
-            continue; /* thử lại */
-        }
-
-        if (usb_recv_version() == 0) {
-            g_version_done = 1;
-            LOGI("usbmux_version_exchange: ✅ version exchange OK (attempt %d)", attempt + 1);
-            return true;
-        }
-
-        LOGE("usbmux_version_exchange attempt %d: nhận VERSION thất bại", attempt + 1);
+        g_version_done = 1;
+        LOGI("usbmux_version_exchange: mux v2 + SETUP OK (attempt %d)", attempt + 1);
+        return true;
     }
-
-    LOGE("usbmux_version_exchange: ❌ thất bại sau 5 lần thử — iPhone không phản hồi v1 protocol");
+    LOGE("usbmux_version_exchange: thất bại sau 5 lần thử");
     return false;
 }
 
-/*
- * usbmuxd_server_reset_version_state — xem giải thích trong .h.
- * Gọi khi có USB fd/session mới, TRƯỚC usbmux_version_exchange(), để
- * flag idempotent không "ăn" mất version exchange thật sự cần thiết
- * cho session mới (VD: rút/cắm lại cáp mà không restart app process).
- */
 void usbmuxd_server_reset_version_state(void) {
     g_version_done = 0;
-    LOGI("usbmuxd_server_reset_version_state: reset — session mới sẽ version exchange lại");
+    pthread_mutex_lock(&g_mux_seq_mutex);
+    g_mux_tx_seq = 0;
+    g_mux_rx_seq = 0xFFFF;
+    pthread_mutex_unlock(&g_mux_seq_mutex);
+    LOGI("usbmuxd_server_reset_version_state: reset USB mux v2 session");
 }
 
 /* ── Gửi TCP packet lên iPhone (qua USB) ────────────────────────────────── */
 static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
                          const void *data, uint32_t data_len) {
-    uint32_t total = sizeof(v1_mux_hdr_t) + sizeof(v1_tcp_hdr_t) + data_len;
+    uint32_t total = sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t) + data_len;
     uint8_t *pkt = malloc(total);
     if (!pkt) return -1;
     memset(pkt, 0, total);
 
-    v1_mux_hdr_t *mhdr = (v1_mux_hdr_t *)pkt;
-    mhdr->protocol = htonl(V1_PROTO_TCP);
-    mhdr->length   = htonl(total);
-    mhdr->magic    = htonl(V1_MAGIC);
-    mhdr->tx_seq   = htons(0);
-    mhdr->rx_seq   = htons(0);
+    v2_mux_hdr_t *mhdr = (v2_mux_hdr_t *)pkt;
+    mhdr->protocol = htonl(MUX_PROTO_TCP);
+    mhdr->length = htonl(total);
+    mhdr->magic = htonl(V2_MAGIC);
 
-    v1_tcp_hdr_t *thdr = (v1_tcp_hdr_t *)(pkt + sizeof(v1_mux_hdr_t));
-    thdr->sport  = htons(st->sport);
-    thdr->dport  = htons(st->dport);
-    thdr->seq    = htonl(st->local_seq);
-    thdr->ack    = htonl(st->remote_seq);
-    thdr->off    = 0x50;  /* 20 bytes / 4 = 5 → 0x50 */
-    thdr->flags  = flags;
-    thdr->window = htons(0x0200);  /* 512 — conservative */
-    thdr->cksum  = 0;
-    thdr->urgp   = 0;
+    v1_tcp_hdr_t *thdr = (v1_tcp_hdr_t *)(pkt + sizeof(v2_mux_hdr_t));
+    thdr->sport = htons(st->sport);
+    thdr->dport = htons(st->dport);
+    thdr->seq = htonl(st->local_seq);
+    thdr->ack = htonl(st->remote_seq);
+    thdr->off = 0x50;
+    thdr->flags = flags;
+    thdr->window = htons(0x0200);
 
     if (data && data_len > 0)
-        memcpy(pkt + sizeof(v1_mux_hdr_t) + sizeof(v1_tcp_hdr_t), data, data_len);
+        memcpy(pkt + sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t), data, data_len);
 
-    int r;
     pthread_mutex_lock(&st->usb_tx_lock);
-    r = usb_write(pkt, (int)total);
+    pthread_mutex_lock(&g_mux_seq_mutex);
+    mhdr->tx_seq = htons(g_mux_tx_seq++);
+    mhdr->rx_seq = htons(g_mux_rx_seq);
+    int r = usb_write(pkt, (int)total);
+    pthread_mutex_unlock(&g_mux_seq_mutex);
     pthread_mutex_unlock(&st->usb_tx_lock);
     free(pkt);
     return r > 0 ? 0 : -1;
@@ -778,21 +648,23 @@ static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
 /* Trả: data_len nếu có data, 0 nếu chỉ là ACK/SYN-ACK/FIN, -1 nếu lỗi */
 static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
                          uint8_t *flags_out, int timeout_ms) {
-    v1_mux_hdr_t mhdr;
+    v2_mux_hdr_t mhdr;
     int n = usb_read_exact(&mhdr, sizeof(mhdr), timeout_ms);
     if (n < (int)sizeof(mhdr)) return -1;
 
-    if (ntohl(mhdr.magic) != V1_MAGIC) {
+    if (ntohl(mhdr.magic) != V2_MAGIC) {
         LOGE("usb_recv_tcp: bad magic=0x%08x", ntohl(mhdr.magic));
         return -1;
     }
-    if (ntohl(mhdr.protocol) != V1_PROTO_TCP) {
-        /* Bỏ qua version packets từ iPhone */
-        uint32_t body_len = ntohl(mhdr.length) - sizeof(mhdr);
-        if (body_len > 0 && body_len < 4096) {
-            uint8_t *drain = malloc(body_len);
-            if (drain) { usb_read_exact(drain, body_len, 2000); free(drain); }
-        }
+    uint32_t packet_len = ntohl(mhdr.length);
+    if (packet_len < sizeof(mhdr) || packet_len > 1024 * 1024) {
+        LOGE("usb_recv_tcp: packet length không hợp lệ=%u", packet_len);
+        return -1;
+    }
+    if (ntohl(mhdr.protocol) != MUX_PROTO_TCP) {
+        /* Drain control/setup payloads so the next TCP frame stays aligned. */
+        uint32_t body_len = packet_len - (uint32_t)sizeof(mhdr);
+        if (body_len > 0 && usb_drain_bytes(body_len, 2000) < 0) return -1;
         return 0;
     }
 
@@ -801,7 +673,14 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
 
     uint32_t total_len = ntohl(mhdr.length);
     uint32_t tcp_hdr_len = (thdr.off >> 4) * 4;
-    uint32_t data_len_raw = total_len - sizeof(v1_mux_hdr_t) - tcp_hdr_len;
+    if (total_len < sizeof(v2_mux_hdr_t) + tcp_hdr_len || tcp_hdr_len < sizeof(thdr)) {
+        LOGE("usb_recv_tcp: packet length/header không hợp lệ total=%u tcp=%u", total_len, tcp_hdr_len);
+        return -1;
+    }
+    pthread_mutex_lock(&g_mux_seq_mutex);
+    g_mux_rx_seq = ntohs(mhdr.rx_seq);
+    pthread_mutex_unlock(&g_mux_seq_mutex);
+    uint32_t data_len_raw = total_len - sizeof(v2_mux_hdr_t) - tcp_hdr_len;
 
     /* Đọc TCP options nếu có (tcp_hdr_len > 20) */
     if (tcp_hdr_len > sizeof(thdr)) {
