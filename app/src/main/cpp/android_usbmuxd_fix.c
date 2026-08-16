@@ -101,10 +101,9 @@ void android_usbmuxd_fix_set_device(const char *udid, int product_id)
 /* ═══════════════════════════════════════════════════════════════════════
  * OVERRIDE (via -Wl,--wrap=usbmuxd_get_device): __wrap_usbmuxd_get_device()
  *
- * CRITICAL FIX: Return a placeholder device with handle=1 even when
- * UDID is not yet known. This allows idevice_new_with_options() to
- * succeed and create a device handle, which then can be used to
- * query the real UDID from the iPhone via lockdown service.
+ * CRITICAL FIX: Return a transport-only device with handle=1 even when
+ * the real UDID is not yet known. The mux handle can open lockdown first;
+ * the actual UniqueDeviceID is queried from lockdown after that connection.
  *
  * Without this fix, idevice_new_with_options() fails with
  * IDEVICE_E_NO_DEVICE (err=-3) forever because usbmuxd_get_device()
@@ -124,10 +123,10 @@ int __wrap_usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
     int pid = g_fix_product_id;
     pthread_mutex_unlock(&g_fix_mutex);
 
-    /* If a specific UDID was requested and we have a different one cached,
-       return not found. But if we have no real UDID yet, still return
-       placeholder so idevice_new_with_options() can proceed. */
-    if (udid && udid[0] && has && strcmp(udid, cached) != 0) {
+    /* A lookup for a specific UDID cannot be satisfied before lockdown has
+       revealed the real identity. The NULL lookup used by nativeConnect()
+       is intentionally allowed to proceed with the transport label below. */
+    if (udid && udid[0] && (!has || strcmp(udid, cached) != 0)) {
         return -ENOENT;
     }
 
@@ -139,9 +138,9 @@ int __wrap_usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
         strncpy(device->udid, cached, sizeof(device->udid) - 1);
         device->udid[sizeof(device->udid) - 1] = '\0';
     } else {
-        /* Placeholder UDID — will be replaced by real one after
-           idevice_get_udid() succeeds via lockdown connection */
-        strcpy(device->udid, "00000000-0000000000000000");
+        /* This is deliberately not formatted as an UDID. It is only a
+         * transport label and is never exposed as the phone's identity. */
+        strcpy(device->udid, "pending-device");
     }
 
     device->conn_type = CONNECTION_TYPE_USB;

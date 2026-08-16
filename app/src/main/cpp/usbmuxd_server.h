@@ -54,8 +54,8 @@ void usbmuxd_server_reset_version_state(void);
  *   - Ignore SIGPIPE, SIGHUP trong các server threads (như usbmuxd_proxy.c).
  *
  * @param files_dir  thư mục app (Unix socket: files_dir/usbmuxd.sock)
- * @param udid       UDID của iPhone (ListDevices response)
- *                   Nếu chưa biết, truyền "00000000-0000-0000-0000-000000000000"
+ * @param udid       UDID của iPhone (ListDevices response), hoặc
+ *                   "pending-device" trước khi lockdown trả UniqueDeviceID
  * @param product_id USB product ID của iPhone
  * @return true nếu Unix socket đã listen, false nếu thất bại
  *         (TCP listener start failure là non-fatal — fallback Unix socket)
@@ -63,8 +63,8 @@ void usbmuxd_server_reset_version_state(void);
 bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_id);
 
 /*
- * usbmuxd_server_update_udid — cập nhật UDID sau khi đã biết (gọi sau
- * idevice_get_udid()). Server cần UDID thật để ListDevices trả về đúng.
+ * usbmuxd_server_update_udid — cập nhật UDID sau khi lockdown trả về
+ * UniqueDeviceID. Server cần UDID thật để ListDevices trả về đúng.
  */
 void usbmuxd_server_update_udid(const char *udid);
 

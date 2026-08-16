@@ -1232,7 +1232,7 @@ bool usbmuxd_server_start(const char *files_dir, const char *udid, int product_i
     }
 
     pthread_mutex_lock(&g_udid_mutex);
-    strncpy(g_udid, udid ? udid : "00000000-0000-0000-0000-000000000000",
+    strncpy(g_udid, udid ? udid : "pending-device",
             sizeof(g_udid) - 1);
     g_udid[63] = '\0';
     pthread_mutex_unlock(&g_udid_mutex);
@@ -1331,7 +1331,7 @@ void usbmuxd_server_update_udid(const char *udid) {
     strncpy(g_udid, udid, sizeof(g_udid) - 1);
     g_udid[63] = '\0';
     pthread_mutex_unlock(&g_udid_mutex);
-    LOGI("usbmuxd_server_update_udid: %s", g_udid);
+    LOGI("usbmuxd_server_update_udid: real identity=%s", g_udid);
 }
 
 const char *usbmuxd_server_socket_path(void) {

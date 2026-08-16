@@ -80,7 +80,22 @@ static char               g_files_dir[512] = {0};
 static bool               g_paired   = false;
 static int                g_product_id = 0;
 
-/* ── JNI helpers ─────────────────────────────────────────────────────────── */
+/* A USB mux handle can be used before lockdown reveals the real UDID, but
+ * neither the all-zero UUID nor a synthetic label is a device UDID. */
+static bool is_real_udid(const char *value) {
+    if (!value || !value[0]) return false;
+    size_t n = strlen(value);
+    if (n < 16 || n >= sizeof(g_udid)) return false;
+    bool has_nonzero = false;
+    for (size_t i = 0; i < n; i++) {
+        char c = value[i];
+        if (c != '0' && c != '-') has_nonzero = true;
+    }
+    return has_nonzero && strcmp(value, "pending-device") != 0;
+}
+
+/* ── JNI helpers ──
+───────────────────────────────────────────────────────── */
 static JavaVM *g_jvm = NULL;
 static jobject g_bridge_obj = NULL;
 
@@ -166,7 +181,10 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
 
     if (udidHint) {
         const char *hint = (*env)->GetStringUTFChars(env, udidHint, NULL);
-        if (hint && hint[0]) strncpy(g_udid, hint, sizeof(g_udid) - 1);
+        if (hint && is_real_udid(hint)) {
+            strncpy(g_udid, hint, sizeof(g_udid) - 1);
+            g_udid[sizeof(g_udid) - 1] = '\0';
+        }
         if (hint) (*env)->ReleaseStringUTFChars(env, udidHint, hint);
     }
     g_product_id = (int)productId;
@@ -208,20 +226,21 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
     /*
      * Bước 2: Khởi động usbmuxd server nội bộ.
      *
-     * FIX: Dùng UDID placeholder khi chưa biết UDID thật.
-     * Sau khi idevice_get_udid() trả về, gọi usbmuxd_server_update_udid()
-     * KHÔNG restart server (tránh race condition).
+     * Khi chưa mở lockdown, chỉ dùng nhãn transport `pending-device`;
+     * UDID thật sẽ được đọc từ khóa UniqueDeviceID sau khi lockdown mở.
+     * Khi có UDID thật, cập nhật server mà không restart để tránh race.
      */
+    const char *server_identity = g_udid[0] ? g_udid : "pending-device";
     bool srv = usbmuxd_server_start(
         g_files_dir,
-        g_udid[0] ? g_udid : "00000000-0000-0000-0000-000000000000",
+        server_identity,
         (int)productId
     );
 
     if (srv) {
         snprintf(buf, sizeof(buf),
-                 "[usbmuxd_srv] \u2705 Server listening: %s (UDID: %s)",
-                 usbmuxd_server_socket_path(), g_udid[0] ? g_udid : "(chưa có)");
+                 "[usbmuxd_srv] \u2705 Server listening: %s (identity: %s)",
+                 usbmuxd_server_socket_path(), g_udid[0] ? g_udid : "pending; chưa lấy từ lockdown");
         emit_log(buf);
         /* Set env var ngay lập tức */
         setenv("USBMUXD_SOCKET_ADDRESS", usbmuxd_server_socket_path(), 1);
@@ -341,18 +360,11 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
 
     emit_log("[imd] \u2705 idevice OK");
 
-    /* Lấy UDID và cập nhật server (KHÔNG restart) */
-    char *udid = NULL;
-    idevice_get_udid(g_device, &udid);
-    if (udid) {
-        strncpy(g_udid, udid, sizeof(g_udid) - 1);
-        free(udid);
-        /* FIX: dùng update_udid thay vì restart (tránh race condition) */
-        usbmuxd_server_update_udid(g_udid);
-
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[imd] \u2705 iPhone UDID: %s", g_udid);
-        emit_log(msg);
+    /* Không gọi idevice_get_udid() ở đây: upstream chỉ trả lại chuỗi đã
+     * copy từ usbmuxd_get_device(), trước đó chỉ là identity pending. UDID
+     * thật chỉ được đọc từ lockdown sau khi transport mở thành công. */
+    if (!g_udid[0]) {
+        emit_log("[imd] UDID đang pending; chưa coi identity tạm là UDID thật");
     }
 
     /* Chỉ mở lockdownd client thuần, chưa handshake/TLS.
@@ -375,6 +387,29 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
         g_device = NULL;
         return JNI_FALSE;
     }
+
+    /* Lấy UniqueDeviceID thật từ lockdown, không lấy từ placeholder trong
+     * usbmuxd_device_info_t. Nếu iPhone chưa cho đọc, vẫn giữ session để
+     * nativePair() có thể yêu cầu Trust. */
+    plist_t unique_value = NULL;
+    lockdownd_error_t value_err = lockdownd_get_value(
+            g_lockdown, NULL, "UniqueDeviceID", &unique_value);
+    char *real_udid = NULL;
+    if (value_err == LOCKDOWN_E_SUCCESS && unique_value) {
+        plist_get_string_val(unique_value, &real_udid);
+    }
+    if (real_udid && is_real_udid(real_udid)) {
+        strncpy(g_udid, real_udid, sizeof(g_udid) - 1);
+        g_udid[sizeof(g_udid) - 1] = '\0';
+        usbmuxd_server_update_udid(g_udid);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[imd] ✅ iPhone UDID thật: %s", g_udid);
+        emit_log(msg);
+    } else {
+        emit_log("[imd] UDID thật chưa đọc được từ lockdown; không dùng UDID giả");
+    }
+    if (real_udid) free(real_udid);
+    if (unique_value) plist_free(unique_value);
 
     emit_log("[lockdown] ✅ lockdownd client OK (no-TLS; sẵn sàng Pair/Trust)");
     return JNI_TRUE;
