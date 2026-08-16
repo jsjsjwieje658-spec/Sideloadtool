@@ -2,195 +2,90 @@ cmake_minimum_required(VERSION 3.22)
 project(sideloadnative C)
 
 # =============================================================================
-#  Ba chế độ hoạt động (tự động phát hiện theo prebuilt/)
+# Native stack built from upstream source by scripts/build_all.sh.
 #
-#  Mode 1 — libimobiledevice thật  (sau khi scripts/build_all.sh chạy xong)
-#    Sources: jni_bridge_imd.c  usb_fd_bridge.c  usbmuxd_server.c
-#    Static links: libimobiledevice-1.0.a  libusbmuxd-2.0.a  libplist-2.0.a
-#                  libimobiledevice-glue-1.0.a  libusb-1.0.a  libssl.a  libcrypto.a
+# The build output is deliberately kept outside app/src/main/cpp so the
+# repository never carries opaque prebuilt archives. Gradle passes
+# -DNATIVE_DEPS_ROOT=<repo>/.native-deps and this file selects the current ABI.
+# The resulting static libraries are linked into libsideloadnative.so.
 #
-#    Luồng Mode 1:
-#      Java: UsbTransport.open() → claimInterface() → getFileDescriptor()
-#      JNI:  nativeSetUsbFd(fd) → libusb_wrap_sys_device() + discover_endpoints()
-#                               → usbmuxd_server_start() → server thread listen
-#      JNI:  nativeConnect() → idevice_new_with_options()
-#                             → libusbmuxd → USBMUXD_SOCKET_ADDRESS
-#                             → server: ListDevices + Connect(62078)
-#                             → mux_do_setup() + mux_connect() qua libusb
-#                             → tunnel (socket ↔ USB)
-#
-#  Mode 2 — Custom protocol layer  (chỉ có libplist, hoặc không có gì)
-#    Sources: jni_bridge.c  usbmux.c  lockdown.c  pairing.c  afc.c  install_proxy.c
-#    Links:   libplist-2.0.a (nếu có)
-#
-#  Mode 3 — Fully bundled fallback (không cần build gì)
-#    Sources: giống Mode 2 nhưng không link libplist, dùng plist_util.c
+# Runtime path (Android non-root):
+#   UsbDeviceConnection fd -> libusb_wrap_sys_device()
+#   -> in-process usbmuxd transport -> libusbmuxd/libimobiledevice
 # =============================================================================
 
-set(PREBUILT_DIR "${CMAKE_SOURCE_DIR}/prebuilt/${ANDROID_ABI}")
-set(PREBUILT_LIB "${PREBUILT_DIR}/lib")
-set(PREBUILT_INC "${PREBUILT_DIR}/include")
-
-# Override bằng -DPREBUILT_ROOT nếu được truyền từ build.gradle.kts
-if(DEFINED PREBUILT_ROOT)
-  set(PREBUILT_DIR "${PREBUILT_ROOT}/${ANDROID_ABI}")
-  set(PREBUILT_LIB "${PREBUILT_DIR}/lib")
-  set(PREBUILT_INC "${PREBUILT_DIR}/include")
+if(NOT DEFINED NATIVE_DEPS_ROOT OR NATIVE_DEPS_ROOT STREQUAL "")
+  message(FATAL_ERROR
+    "NATIVE_DEPS_ROOT is required. Run scripts/build_all.sh before Gradle."
+  )
 endif()
 
-# ── Phát hiện mode ────────────────────────────────────────────────────────────
-if(EXISTS "${PREBUILT_LIB}/libimobiledevice-1.0.a")
-  set(BUILD_MODE 1)
-  message(STATUS "🟢 Mode 1: libimobiledevice thật + usbmuxd server nội bộ")
-elseif(EXISTS "${PREBUILT_LIB}/libplist-2.0.a")
-  set(BUILD_MODE 2)
-  message(STATUS "🟡 Mode 2: Custom protocol + libplist parser")
-else()
-  set(BUILD_MODE 3)
-  message(STATUS "🔴 Mode 3: Fully bundled fallback — chạy scripts/build_all.sh để dùng Mode 1")
-endif()
+set(NATIVE_DEPS_DIR "${NATIVE_DEPS_ROOT}/${ANDROID_ABI}")
+set(NATIVE_LIB_DIR "${NATIVE_DEPS_DIR}/lib")
+set(NATIVE_INC_DIR "${NATIVE_DEPS_DIR}/include")
 
-# =============================================================================
-#  Mode 1 — libimobiledevice thật + usbmuxd server
-# =============================================================================
-if(BUILD_MODE EQUAL 1)
+set(NATIVE_LIBRARIES
+  imobiledevice-1.0
+  usbmuxd-2.0
+  imobiledevice-glue-1.0
+  plist-2.0
+  usb-1.0
+  ssl
+  crypto
+)
 
-  # LƯU Ý (dọn dẹp — không đổi hành vi runtime): usbmux.c đã bị GỠ khỏi danh
-  # sách này. Đó là implementation TCP-over-USB của Mode 2/3 (mux_conn_init,
-  # mux_connect, ...) — không có hàm nào trong usbmux.c được gọi bởi ba file
-  # dưới đây (đã kiểm chứng bằng grep, không có tham chiếu "mux_conn_" hay
-  # #include "usbmux.h"). Mode 1 tự cài đặt lại v1 protocol của riêng nó ngay
-  # trong usbmuxd_server.c (usb_send_version/usb_recv_version/do_usb_v1_connect).
-  # Trước đây usbmux.c vẫn được build vào .so Mode 1 dù không dùng — không gây
-  # lỗi (không trùng tên symbol) nhưng làm phình file .so và dễ khiến người
-  # đọc sau này tưởng nhầm đây là code đang chạy thật.
-  add_library(sideloadnative SHARED
-    jni_bridge_imd.c    # JNI API: nativeInit/Connect/Pair/Sideload (libimobiledevice)
-    usb_fd_bridge.c     # Android USB fd → libusb handle + endpoint discovery
-    android_usbmuxd_fix.c  # Android non-root: override usbmuxd_get_device/connect
-    usbmuxd_server.c    # Mini usbmuxd Unix socket server + v1 USB protocol (cho libusbmuxd kết nối)
-  )
-
-  # android_usbmuxd_fix.c cung cấp bản thay thế (Android, non-root) cho
-  # usbmuxd_get_device()/usbmuxd_connect() — 2 hàm client API vốn được
-  # định nghĩa sẵn trong libusbmuxd-2.0.a (static archive) và được
-  # libimobiledevice-1.0.a gọi nội bộ.
-  #
-  # KHÔNG dùng "-Wl,--allow-multiple-definition" (cách cũ): NDK r25 CMake
-  # toolchain luôn thêm sẵn "-Wl,--fatal-warnings" vào linker flags mặc
-  # định, nên cảnh báo "duplicate symbol" mà --allow-multiple-definition
-  # sinh ra vẫn bị nâng thành lỗi fatal → build luôn FAILED bất kể có cờ
-  # này hay không. Ngoài ra set(CMAKE_SHARED_LINKER_FLAGS ...) đặt TRƯỚC
-  # project() cũng bị NDK toolchain ghi đè mất, không bao giờ tới được
-  # lệnh link thật sự (đã kiểm chứng qua log build lỗi).
-  #
-  # Dùng "--wrap" của linker thay thế: mọi tham chiếu tới ký hiệu
-  # usbmuxd_get_device / usbmuxd_connect ở BẤT KỲ đâu trong quá trình
-  # link (kể cả từ bên trong libimobiledevice-1.0.a) sẽ được linker tự
-  # động chuyển hướng sang __wrap_usbmuxd_get_device /
-  # __wrap_usbmuxd_connect (định nghĩa trong android_usbmuxd_fix.c).
-  # Bản gốc trong libusbmuxd-2.0.a vẫn được giữ nguyên tên (không đổi),
-  # chỉ đơn giản là không còn ai gọi tới nó nữa — vì vậy KHÔNG hề có
-  # xung đột tên ký hiệu (=> không cảnh báo, không lỗi, không phụ thuộc
-  # thứ tự cờ linker).
-  target_link_options(sideloadnative PRIVATE
-    "-Wl,--wrap=usbmuxd_get_device"
-    "-Wl,--wrap=usbmuxd_connect"
-  )
-
-  # Import static libraries (thứ tự: cao → thấp level)
-  foreach(LIB IN ITEMS
-    imobiledevice-1.0
-    usbmuxd-2.0
-    imobiledevice-glue-1.0
-    plist-2.0
-    usb-1.0
-    ssl
-    crypto
-  )
-    add_library(lib${LIB} STATIC IMPORTED)
-    set_target_properties(lib${LIB} PROPERTIES
-      IMPORTED_LOCATION "${PREBUILT_LIB}/lib${LIB}.a"
+foreach(LIB IN LISTS NATIVE_LIBRARIES)
+  if(NOT EXISTS "${NATIVE_LIB_DIR}/lib${LIB}.a")
+    message(FATAL_ERROR
+      "Missing source-built library: ${NATIVE_LIB_DIR}/lib${LIB}.a"
     )
-  endforeach()
-
-  # NOTE: libusb cài header vào include/libusb-1.0/libusb.h
-  # Thiếu "${PREBUILT_INC}/libusb-1.0" → "fatal error: 'libusb.h' file not found"
-  target_include_directories(sideloadnative PRIVATE
-    "${PREBUILT_INC}"
-    "${PREBUILT_INC}/libimobiledevice"
-    "${PREBUILT_INC}/libimobiledevice-glue"
-    "${PREBUILT_INC}/libplist"
-    "${PREBUILT_INC}/libusb-1.0"
+  endif()
+  add_library("native_${LIB}" STATIC IMPORTED GLOBAL)
+  set_target_properties("native_${LIB}" PROPERTIES
+    IMPORTED_LOCATION "${NATIVE_LIB_DIR}/lib${LIB}.a"
   )
+endforeach()
 
-  target_compile_definitions(sideloadnative PRIVATE
-    HAVE_LIBIMOBILEDEVICE=1
-  )
+foreach(HEADER_DIR IN ITEMS
+  "${NATIVE_INC_DIR}"
+  "${NATIVE_INC_DIR}/libimobiledevice"
+  "${NATIVE_INC_DIR}/libimobiledevice-glue"
+  "${NATIVE_INC_DIR}/libplist"
+  "${NATIVE_INC_DIR}/libusb-1.0"
+)
+  if(NOT EXISTS "${HEADER_DIR}")
+    message(FATAL_ERROR "Missing source-built headers: ${HEADER_DIR}")
+  endif()
+endforeach()
 
-  target_link_libraries(sideloadnative
-    # libimobiledevice stack (thứ tự quan trọng: high-level → low-level)
-    libimobiledevice-1.0
-    libusbmuxd-2.0
-    libimobiledevice-glue-1.0
-    libplist-2.0
-    libusb-1.0
-    libssl
-    libcrypto
-    # Android system libs
-    log
-    android
-    z
-  )
+add_library(sideloadnative SHARED
+  jni_bridge_imd.c
+  usb_fd_bridge.c
+  android_usbmuxd_fix.c
+  usbmuxd_server.c
+)
 
-# =============================================================================
-#  Mode 2 — Custom protocol + libplist
-# =============================================================================
-elseif(BUILD_MODE EQUAL 2)
+# libimobiledevice calls the normal libusbmuxd client API. On Android the
+# app's in-process non-root transport must service those calls using the USB
+# fd supplied by UsbDeviceConnection, so redirect the two entry points without
+# introducing duplicate symbols into the static archives.
+target_link_options(sideloadnative PRIVATE
+  "-Wl,--wrap=usbmuxd_get_device"
+  "-Wl,--wrap=usbmuxd_connect"
+)
 
-  add_library(sideloadnative SHARED
-    jni_bridge.c
-    usbmux.c
-    lockdown.c
-    pairing.c
-    afc.c
-    install_proxy.c
-    plist_util.c
-  )
+target_include_directories(sideloadnative PRIVATE
+  "${NATIVE_INC_DIR}"
+  "${NATIVE_INC_DIR}/libimobiledevice"
+  "${NATIVE_INC_DIR}/libimobiledevice-glue"
+  "${NATIVE_INC_DIR}/libplist"
+  "${NATIVE_INC_DIR}/libusb-1.0"
+)
 
-  add_library(libplist-2.0 STATIC IMPORTED)
-  set_target_properties(libplist-2.0 PROPERTIES
-    IMPORTED_LOCATION "${PREBUILT_LIB}/libplist-2.0.a"
-  )
+target_compile_definitions(sideloadnative PRIVATE
+  HAVE_LIBIMOBILEDEVICE=1
+)
 
-  target_include_directories(sideloadnative PRIVATE
-    "${PREBUILT_INC}"
-    "${PREBUILT_INC}/libplist"
-  )
-
-  target_compile_definitions(sideloadnative PRIVATE HAVE_LIBPLIST=1)
-  target_link_libraries(sideloadnative libplist-2.0 log android z)
-
-# =============================================================================
-#  Mode 3 — Fully bundled fallback
-# =============================================================================
-else()
-
-  add_library(sideloadnative SHARED
-    jni_bridge.c
-    usbmux.c
-    lockdown.c
-    pairing.c
-    afc.c
-    install_proxy.c
-    plist_util.c
-  )
-
-  target_link_libraries(sideloadnative log android z)
-
-endif()
-
-# ── Cờ compiler chung ─────────────────────────────────────────────────────────
 target_compile_options(sideloadnative PRIVATE
   -Wall -Wextra -Wno-unused-parameter
   -ffunction-sections -fdata-sections
@@ -198,7 +93,23 @@ target_compile_options(sideloadnative PRIVATE
   -fPIC
 )
 
+target_link_libraries(sideloadnative
+  # High-level to low-level order is required for static archives.
+  native_imobiledevice-1.0
+  native_usbmuxd-2.0
+  native_imobiledevice-glue-1.0
+  native_plist-2.0
+  native_usb-1.0
+  native_ssl
+  native_crypto
+  log
+  android
+  z
+)
+
 set_target_properties(sideloadnative PROPERTIES
   C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
   LINK_FLAGS "-Wl,--gc-sections -Wl,--strip-all"
 )

@@ -2,14 +2,14 @@
 # ============================================================================
 #  build_all.sh — Cross-compile libimobiledevice stack cho Android ARM64/x86_64
 #
-#  FIX v20: Script này bị THIẾU trong source gốc → CI buildapk.yml không
-#  thể compile prebuilt libs → Mode 1 không hoạt động.
+#  CI builds the upstream sources for each ABI into a disposable, gitignored
+#  directory. The resulting static archives and headers are consumed by
+#  CMake and linked into libsideloadnative.so; no opaque native archive is
+#  committed to the application source tree.
 #
-#  Kết quả: .a static libs đặt vào:
-#    app/src/main/cpp/prebuilt/arm64-v8a/lib/
-#    app/src/main/cpp/prebuilt/x86_64/lib/
-#    app/src/main/cpp/prebuilt/arm64-v8a/include/  (shared)
-#    app/src/main/cpp/prebuilt/x86_64/include/     (shared)
+#  Kết quả: source-built output đặt vào:
+#    .native-deps/arm64-v8a/lib/ và .native-deps/arm64-v8a/include/
+#    .native-deps/x86_64/lib/   và .native-deps/x86_64/include/
 #
 #  Thứ tự build: libusb → libplist → libusbmuxd → libimobiledevice-glue
 #                → openssl → libimobiledevice
@@ -24,14 +24,14 @@ set -euo pipefail
 # ── Cấu hình ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PREBUILT_BASE="${REPO_ROOT}/app/src/main/cpp/prebuilt"
+NATIVE_DEPS_BASE="${NATIVE_DEPS_BASE:-${REPO_ROOT}/.native-deps}"
 BUILD_TMP="${TMPDIR:-/tmp}/sideload_native_build"
 
 NDK_VERSION="${NDK_VERSION:-25.2.9519653}"
 ANDROID_API="${ANDROID_API:-21}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${HOME}/Android/Sdk/ndk/${NDK_VERSION}}"
 
-TARGETS=("arm64-v8a" "x86_64")
+read -r -a TARGETS <<< "${TARGET_ABIS:-arm64-v8a x86_64}"
 
 # Phiên bản thư viện
 LIBUSB_VERSION="1.0.27"
@@ -94,7 +94,7 @@ setup_toolchain() {
     export CFLAGS="${CFLAGS} --sysroot=${SYSROOT} -DANDROID -D__ANDROID_API__=${ANDROID_API}"
     export LDFLAGS="-Wl,--gc-sections --sysroot=${SYSROOT}"
 
-    PREFIX="${PREBUILT_BASE}/${abi}"
+    PREFIX="${NATIVE_DEPS_BASE}/${abi}"
     export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
     export PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig"
 
@@ -284,7 +284,7 @@ build_abi() {
     info "════════════════════════════════════"
 
     setup_toolchain "${abi}"
-    local prefix="${PREBUILT_BASE}/${abi}"
+    local prefix="${NATIVE_DEPS_BASE}/${abi}"
 
     # Kiểm tra đã build chưa
     if [[ -f "${prefix}/lib/libimobiledevice-1.0.a" ]]; then
@@ -315,7 +315,7 @@ build_abi() {
 main() {
     info "SideloadTool — build_all.sh bắt đầu"
     info "Repo root: ${REPO_ROOT}"
-    info "Prebuilt:  ${PREBUILT_BASE}"
+    info "Native deps: ${NATIVE_DEPS_BASE}"
     info "NDK:       ${ANDROID_NDK_HOME}"
     info "API:       ${ANDROID_API}"
     info "CPU:       ${NCPU}"
@@ -330,10 +330,10 @@ main() {
 
     info ""
     info "════════════════════════════════════"
-    info " Build hoàn tất! Kiểm tra Mode 1 trong Gradle."
+    info " Build source stack hoàn tất; CMake sẽ link các archive vào APK."
     info " Chạy: ./gradlew assembleDebug"
     info "════════════════════════════════════"
-    ls -lh "${PREBUILT_BASE}/arm64-v8a/lib/"*.a 2>/dev/null || true
+    ls -lh "${NATIVE_DEPS_BASE}/arm64-v8a/lib/"*.a 2>/dev/null || true
 }
 
 main "$@"

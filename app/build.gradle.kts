@@ -36,8 +36,8 @@ android {
                 cppFlags("")
                 arguments(
                     "-DANDROID_STL=c++_shared",
-                    // Truyền thư mục prebuilt vào CMake để tự detect mode
-                    "-DPREBUILT_ROOT=${projectDir}/src/main/cpp/prebuilt"
+                    // Các thư viện upstream được build từ source trước Gradle.
+                    "-DNATIVE_DEPS_ROOT=${rootProject.projectDir.resolve(".native-deps").absolutePath}"
                 )
             }
         }

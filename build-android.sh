@@ -100,10 +100,10 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. Strip and copy to Sideloadtool
+# 4. Strip source-built libraries (Gradle/CMake consumes .native-deps directly)
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "[4/4] Stripping and copying libraries..."
+echo "[4/4] Stripping source-built libraries..."
 
 for lib in libplist-2.0 libusbmuxd-2.0 libimobiledevice-1.0; do
     if [ -f "$PREFIX/lib/${lib}.so" ]; then
@@ -117,7 +117,7 @@ echo "========================================"
 echo "Build complete!"
 echo "Libraries in: $PREFIX/lib/"
 echo ""
-echo "Copy to Sideloadtool:"
-echo "  cp $PREFIX/lib/*.so \"
-echo "     /path/to/Sideloadtool/app/src/main/cpp/prebuilt/$ARCH/lib/"
+echo "CMake input directory: $PREFIX/lib/"
+echo "No copy into app/src/main/cpp is required; use .native-deps/ as NATIVE_DEPS_ROOT."
+
 echo "========================================"

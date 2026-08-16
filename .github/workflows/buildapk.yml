@@ -4,13 +4,13 @@ name: Build APK
 #  CI pipeline — Simplified integrated workflow
 #
 #  Phase 1: Setup (Java 17 + Android SDK + NDK + Python + Gradle)
-#  Phase 2: Cross-compile libmobiledevice stack (NDK 25)
-#  Phase 3: Build Gradle APK (prebuilt linked automatically via CMakeLists.txt)
+#  Phase 2: Cross-compile upstream libmobiledevice stack (NDK 25)
+#  Phase 3: Build Gradle APK from source-built native dependencies
 #  Phase 4: Verify APK integrity
-#  Phase 5: Upload ONLY final APK (prebuilt is embedded inside)
+#  Phase 5: Upload ONLY final APK
 #
-#  💡 Key: Prebuilt libraries are linked into APK at build time.
-#          No need to distribute prebuilt separately.
+#  💡 Key: upstream sources are built in CI and linked into the APK.
+#          No opaque native archive is kept in the repository.
 # =============================================================================
 
 on:
@@ -88,11 +88,11 @@ jobs:
           KEY="imd-ndk25.2-$(sha256sum scripts/build_all.sh | cut -d' ' -f1)"
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
-      - name: "⚡ Restore prebuilt cache"
+      - name: "⚡ Restore source-build cache"
         id: cache-restore
         uses: actions/cache@v4
         with:
-          path: app/src/main/cpp/prebuilt
+          path: .native-deps
           key: ${{ steps.cache-key.outputs.key }}
           restore-keys: imd-ndk25.2-
 
@@ -100,24 +100,31 @@ jobs:
         if: steps.cache-restore.outputs.cache-hit != 'true' || github.event.inputs.rebuild_native == 'true'
         run: |
           chmod +x scripts/build_all.sh
-          TARGET_ABIS="arm64-v8a x86_64" bash scripts/build_all.sh
+          TARGET_ABIS="arm64-v8a x86_64" \
+            NATIVE_DEPS_BASE="$GITHUB_WORKSPACE/.native-deps" \
+            bash scripts/build_all.sh
 
-      - name: "✅ Verify prebuilt libraries"
+      - name: "✅ Verify source-built libraries"
         run: |
-          echo "=== Verifying prebuilt libraries ==="
+          echo "=== Verifying source-built libraries ==="
           for abi in arm64-v8a x86_64; do
-            if [ -d "app/src/main/cpp/prebuilt/$abi/lib" ]; then
-              echo "✅ $abi: $(ls app/src/main/cpp/prebuilt/$abi/lib/*.a 2>/dev/null | wc -l) libraries"
+            if [ ! -d ".native-deps/$abi/lib" ]; then
+              echo "❌ Missing .native-deps/$abi/lib"
+              exit 1
             fi
+            count=$(find ".native-deps/$abi/lib" -maxdepth 1 -name '*.a' | wc -l)
+            echo "✅ $abi: $count static libraries"
+            test "$count" -ge 7
           done
+          test ! -d app/src/main/cpp/prebuilt
 
       # ══════════════════════════════════════════════════════════════════════
-      # Phase 3: Build Gradle APK (CMakeLists.txt links prebuilt automatically)
+      # Phase 3: Build Gradle APK (CMake links source-built dependencies)
       # ══════════════════════════════════════════════════════════════════════
 
       - name: "🏗️  Build Debug APK"
         run: |
-          echo "🚀 Building APK (prebuilt will be linked automatically)..."
+          echo "🚀 Building APK from upstream source-built libraries..."
           gradle :app:assembleDebug --stacktrace
 
       # ══════════════════════════════════════════════════════════════════════
