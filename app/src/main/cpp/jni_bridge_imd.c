@@ -48,6 +48,7 @@
 
 #include "usb_fd_bridge.h"
 #include "usbmuxd_server.h"
+#include "android_usbmuxd_fix.h"
 
 #define LOG_TAG "jni_imd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -98,8 +99,9 @@ static void emit_log(const char *msg) {
         (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
         detach = true;
     }
-    jclass cls = (*env)->FindClass(env,
-        "com/superalpha/sideload/bridge/NativeBridge");
+    /* Worker threads cannot reliably use FindClass with the app class
+     * loader. Resolve the class from the global bridge object instead. */
+    jclass cls = g_bridge_obj ? (*env)->GetObjectClass(env, g_bridge_obj) : NULL;
     if (cls) {
         jmethodID mid = (*env)->GetStaticMethodID(env, cls, "onNativeLog",
                                                    "(Ljava/lang/String;)V");
@@ -115,6 +117,11 @@ static void emit_log(const char *msg) {
     if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
+/* Forward logs emitted by usbmuxd_server worker threads to the same UI sink. */
+static void server_log_callback(const char *msg) {
+    emit_log(msg);
+}
+
 /* ── nativeInit ─────────────────────────────────────────────────────────── */
 JNIEXPORT void JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
@@ -126,6 +133,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
     const char *dir = (*env)->GetStringUTFChars(env, filesDir, NULL);
     strncpy(g_files_dir, dir, sizeof(g_files_dir) - 1);
     (*env)->ReleaseStringUTFChars(env, filesDir, dir);
+    android_usbmuxd_fix_set_log_callback(server_log_callback);
     emit_log("[jni] Mode 1: libimobiledevice thật + usbmuxd server nội bộ");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }

@@ -11,6 +11,12 @@ void android_fix_set_device(const char *udid, int product_id);
 /* Android log helper used by LOGI/LOGE/LOGW macros in usb_fd_bridge.c
  * and usbmuxd_server.c. Forwards to __android_log_print. */
 void android_usbmuxd_fix_log(const char *msg);
+void android_usbmuxd_fix_logf(const char *fmt, ...);
+
+/* Register an optional UI log sink. The callback may be invoked from native
+ * worker threads and must be safe for JNI attachment by its owner. */
+typedef void (*android_usbmuxd_log_callback_t)(const char *msg);
+void android_usbmuxd_fix_set_log_callback(android_usbmuxd_log_callback_t callback);
 
 /* Alias with namespaced name — called from jni_bridge_imd.c */
 void android_usbmuxd_fix_set_device(const char *udid, int product_id);

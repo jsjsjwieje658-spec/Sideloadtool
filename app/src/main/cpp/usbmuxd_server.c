@@ -47,6 +47,7 @@
  */
 #include "usbmuxd_server.h"
 #include "usb_fd_bridge.h"
+#include "android_usbmuxd_fix.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,8 +81,14 @@
 #include <time.h>
 
 #define TAG "usbmuxd_srv"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) do { \
+    __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); \
+    android_usbmuxd_fix_logf(__VA_ARGS__); \
+} while (0)
+#define LOGE(...) do { \
+    __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__); \
+    android_usbmuxd_fix_logf(__VA_ARGS__); \
+} while (0)
 
 /* ── Unix socket protocol constants ────────────────────────────────────── */
 #define USBMUX_PROTO_PLIST  1
@@ -638,11 +645,19 @@ static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
         memcpy(pkt + sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t), data, data_len);
 
     pthread_mutex_lock(&st->usb_tx_lock);
+    uint16_t mux_tx;
+    uint16_t mux_rx;
     pthread_mutex_lock(&g_mux_seq_mutex);
-    mhdr->tx_seq = htons(g_mux_tx_seq++);
-    mhdr->rx_seq = htons(g_mux_rx_seq);
-    int r = usb_write(pkt, (int)total);
+    mux_tx = g_mux_tx_seq++;
+    mux_rx = g_mux_rx_seq;
+    mhdr->tx_seq = htons(mux_tx);
+    mhdr->rx_seq = htons(mux_rx);
     pthread_mutex_unlock(&g_mux_seq_mutex);
+
+    LOGI("usb_send_tcp: sport=%u dport=%u flags=0x%02x seq=%u ack=%u len=%u mux_tx=%u mux_rx=%u",
+         st->sport, st->dport, flags, st->local_seq, st->remote_seq,
+         data_len, mux_tx, mux_rx);
+    int r = usb_write(pkt, (int)total);
     pthread_mutex_unlock(&st->usb_tx_lock);
     free(pkt);
     return r > 0 ? 0 : -1;
@@ -681,8 +696,10 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
         LOGE("usb_recv_tcp: packet length/header không hợp lệ total=%u tcp=%u", total_len, tcp_hdr_len);
         return -1;
     }
+    uint16_t mux_tx = ntohs(mhdr.tx_seq);
+    uint16_t mux_rx = ntohs(mhdr.rx_seq);
     pthread_mutex_lock(&g_mux_seq_mutex);
-    g_mux_rx_seq = ntohs(mhdr.rx_seq);
+    g_mux_rx_seq = mux_rx;
     pthread_mutex_unlock(&g_mux_seq_mutex);
     uint32_t data_len_raw = total_len - sizeof(v2_mux_hdr_t) - tcp_hdr_len;
 
@@ -696,8 +713,13 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
 
     if (flags_out) *flags_out = thdr.flags;
 
-    /* Cập nhật remote_seq từ ack + seq fields */
     uint32_t iphone_seq = ntohl(thdr.seq);
+    uint32_t iphone_ack = ntohl(thdr.ack);
+    LOGI("usb_recv_tcp: sport=%u dport=%u flags=0x%02x seq=%u ack=%u win=%u len=%u mux_tx=%u mux_rx=%u",
+         ntohs(thdr.dport), ntohs(thdr.sport), thdr.flags, iphone_seq, iphone_ack,
+         ntohs(thdr.window), data_len_raw, mux_tx, mux_rx);
+
+    /* Cập nhật remote_seq từ ack + seq fields */
 
     /* Đọc data nếu có */
     int data_read = 0;
@@ -738,11 +760,11 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
     LOGI("do_usb_v1_connect: port=%d", port);
 
     /* Bước 0: Init TCP state */
-    /* Sport: dùng port ngẫu nhiên trong range 49152-65535 */
-    srand((unsigned)time(NULL));
-    st->sport      = (uint16_t)(49152 + (rand() % 16383));
+    /* Giống upstream usbmuxd: mỗi device bắt đầu source port ở 1 và
+     * TCP sequence đầu tiên là 0. iPhone dùng đúng state này trong mux v1. */
+    st->sport      = 1;
     st->dport      = (uint16_t)port;
-    st->local_seq  = (uint32_t)(rand());  /* Initial sequence number */
+    st->local_seq  = 0;
     st->remote_seq = 0;
     pthread_mutex_init(&st->usb_tx_lock, NULL);
 
@@ -774,7 +796,8 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
         LOGE("do_usb_v1_connect: nhận flags=0x%02x (không phải SYN+ACK)", flags);
         return false;
     }
-    LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u", st->remote_seq);
+    LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u (expected ack=%u)",
+         st->remote_seq, isn + 1);
 
     /* Bước 3: ACK */
     st->local_seq = isn + 1;   /* SYN tiêu thụ 1 sequence number */

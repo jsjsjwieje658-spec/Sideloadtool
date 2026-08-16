@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -38,11 +39,39 @@
 #include <usbmuxd.h>
 #include <plist/plist.h>
 
+#include "android_usbmuxd_fix.h"
+
 /* ── Logging helper ── */
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static android_usbmuxd_log_callback_t g_log_callback = NULL;
+
+void android_usbmuxd_fix_set_log_callback(android_usbmuxd_log_callback_t callback)
+{
+    pthread_mutex_lock(&g_log_mutex);
+    g_log_callback = callback;
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
 void android_usbmuxd_fix_log(const char *msg)
 {
-    if (msg)
-        __android_log_print(ANDROID_LOG_INFO, "sideloadnative", "%s", msg);
+    if (!msg) return;
+    __android_log_print(ANDROID_LOG_INFO, "sideloadnative", "%s", msg);
+
+    pthread_mutex_lock(&g_log_mutex);
+    android_usbmuxd_log_callback_t callback = g_log_callback;
+    pthread_mutex_unlock(&g_log_mutex);
+    if (callback) callback(msg);
+}
+
+void android_usbmuxd_fix_logf(const char *fmt, ...)
+{
+    if (!fmt) return;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    android_usbmuxd_fix_log(msg);
 }
 
 /* ── Cache ── */
@@ -134,9 +163,10 @@ int __wrap_usbmuxd_get_device(const char *udid, usbmuxd_device_info_t *device,
 __attribute__((visibility("default")))
 int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
 {
-    (void)handle;
-
     const char *addr_env = getenv("USBMUXD_SOCKET_ADDRESS");
+    android_usbmuxd_fix_logf("[usbmux] connect handle=%u port=%u wire_port=%u addr=%s",
+                             handle, (unsigned)port, (unsigned)htons(port),
+                             addr_env ? addr_env : "(default)");
     int sfd = -1;
 
     if (addr_env && (strncmp(addr_env, "unix:", 5) == 0 || addr_env[0] == '/')) {
@@ -244,6 +274,7 @@ int __wrap_usbmuxd_connect(const uint32_t handle, const unsigned short port)
 
     free(xml);
 
+    android_usbmuxd_fix_logf("[usbmux] Connect Result=%d socket_fd=%d", ok ? 0 : -1, sfd);
     if (!ok) {
         close(sfd);
         return -1;
