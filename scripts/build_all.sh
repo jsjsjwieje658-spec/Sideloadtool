@@ -276,7 +276,8 @@ build_libimobiledevice() {
     sed -i '/^enum plist_format_t {/,/^};$/d' common/utils.h
     sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h
     # Patch: disable các binary tool (chỉ cần lib)
-    sed -i 's/^SUBDIRS = .*/SUBDIRS = src/' Makefile.am 2>/dev/null || true
+    # Keep common: libimobiledevice links its internal common utility library.
+    sed -i 's/^SUBDIRS = .*/SUBDIRS = common src/' Makefile.am 2>/dev/null || true
 
     ./autogen.sh --prefix="${prefix}" \
         --host="${TRIPLE}" \
