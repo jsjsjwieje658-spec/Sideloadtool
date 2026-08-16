@@ -204,7 +204,24 @@ fun PairingScreen(viewModel: HomeViewModel) {
         }
 
         Spacer(Modifier.height(24.dp))
-        Text("Nhật ký:", style = MaterialTheme.typography.labelLarge)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Nhật ký:", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = {
+                val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                val text = logLines.joinToString("\n")
+                clipboard.setPrimaryClip(
+                    android.content.ClipData.newPlainText("Sideloadtool log", text)
+                )
+                NativeLog.log("Đã sao chép ${logLines.size} dòng nhật ký")
+            }) {
+                Text("Sao chép log")
+            }
+        }
         Spacer(Modifier.height(4.dp))
         LogConsole(lines = logLines, modifier = Modifier.weight(1f))
     }

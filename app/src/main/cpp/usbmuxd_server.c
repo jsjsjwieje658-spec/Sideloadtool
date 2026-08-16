@@ -114,6 +114,14 @@ typedef struct {
     uint16_t rx_seq;
 } v2_mux_hdr_t;
 
+/* Upstream usbmuxd starts version negotiation with the legacy 8-byte mux header.
+ * The device switches to the 16-byte v2 header only after replying with version
+ * 2 and receiving SETUP. */
+typedef struct {
+    uint32_t protocol;
+    uint32_t length;
+} v1_mux_hdr_t;
+
 /* TCP header (20 bytes) */
 typedef struct {
     uint16_t sport;      /* BE: source port (our ephemeral port) */
@@ -477,24 +485,23 @@ static int usb_read_at_least(void *buf, int len, int timeout_ms) {
     return usb_bridge_bulk_read(buf, len, timeout_ms);
 }
 
-/* ── Gửi version request theo usbmuxd upstream ─────────────────────────── */
+/* ── Gửi VERSION request theo usbmuxd upstream ─────────────────────────── */
 static int usb_send_version(void) {
-    uint8_t pkt[sizeof(v2_mux_hdr_t) + sizeof(mux_version_body_t)];
+    /* Upstream device.c sends VERSION while dev->version == 0, therefore
+     * send_packet() uses only protocol+length (8 bytes). */
+    uint8_t pkt[sizeof(v1_mux_hdr_t) + sizeof(mux_version_body_t)];
     memset(pkt, 0, sizeof(pkt));
 
-    v2_mux_hdr_t *hdr = (v2_mux_hdr_t *)pkt;
+    v1_mux_hdr_t *hdr = (v1_mux_hdr_t *)pkt;
     hdr->protocol = htonl(MUX_PROTO_VERSION);
     hdr->length = htonl(sizeof(pkt));
-    hdr->magic = htonl(V2_MAGIC);
-    hdr->tx_seq = htons(0);
-    hdr->rx_seq = htons(0xFFFF);
 
     mux_version_body_t *body = (mux_version_body_t *)(pkt + sizeof(*hdr));
     body->major = htonl(2);
     body->minor = htonl(0);
     body->padding = 0;
 
-    LOGI("usb_send_version: gửi mux v2 header 16-byte + version 2.0, length=%zu", sizeof(pkt));
+    LOGI("usb_send_version: VERSION upstream header 8-byte + version 2.0, length=%zu", sizeof(pkt));
     return usb_write(pkt, (int)sizeof(pkt)) > 0 ? 0 : -1;
 }
 
@@ -509,50 +516,35 @@ static int usb_drain_bytes(uint32_t len, int timeout_ms) {
     return 0;
 }
 
-/* Version exchange của mux v2 dùng mux header đầy đủ 16 byte.
- * usbmuxd upstream gửi/nhận: [protocol,length,magic,tx_seq,rx_seq]
- * + version body 12 byte. Header 8 byte chỉ hợp lệ cho mux v1; dùng nó
- * với iPhone hiện đại làm thiết bị im lặng và không bao giờ tới lockdown. */
+/* VERSION response is also framed with the legacy 8-byte header because
+ * device.version is still 0 until the response body is parsed. This mirrors
+ * usbmuxd/src/device.c exactly; v2 magic/sequence fields start with SETUP. */
 static int usb_recv_version(void) {
     const int VERSION_TIMEOUT_MS = 3000;
-    const int MAX_TIMEOUT_TRIES = 10;
-    const int MAX_SKIP = 12;
 
-    for (int skip = 0, timeout_tries = 0; skip < MAX_SKIP; ) {
-        v2_mux_hdr_t hdr;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        v1_mux_hdr_t hdr;
         int n = usb_read_exact(&hdr, sizeof(hdr), VERSION_TIMEOUT_MS);
         if (n <= 0) {
-            if (++timeout_tries >= MAX_TIMEOUT_TRIES) {
-                LOGE("usb_recv_version: timeout chờ version (%d lần)", timeout_tries);
+            if (attempt == 9) {
+                LOGE("usb_recv_version: timeout chờ version (%d lần)", attempt + 1);
                 return -1;
             }
             usleep(200 * 1000);
             continue;
         }
         if (n != (int)sizeof(hdr)) return -1;
-        timeout_tries = 0;
 
         uint32_t protocol = ntohl(hdr.protocol);
         uint32_t packet_len = ntohl(hdr.length);
-        uint32_t magic = ntohl(hdr.magic);
-        if (magic != V2_MAGIC) {
-            LOGE("usb_recv_version: magic không hợp lệ=0x%08x", magic);
-            return -1;
-        }
-        if (packet_len < sizeof(hdr) || packet_len > 65536) {
+        if (packet_len < sizeof(hdr) + sizeof(mux_version_body_t) || packet_len > 65536) {
             LOGE("usb_recv_version: packet length không hợp lệ=%u", packet_len);
             return -1;
         }
         uint32_t body_len = packet_len - (uint32_t)sizeof(hdr);
         if (protocol != MUX_PROTO_VERSION) {
-            LOGI("usb_recv_version: packet protocol=%u trước version, drain=%u", protocol, body_len);
+            LOGE("usb_recv_version: protocol trước version không hợp lệ=%u", protocol);
             if (usb_drain_bytes(body_len, 2000) < 0) return -1;
-            skip++;
-            continue;
-        }
-        if (body_len < sizeof(mux_version_body_t)) {
-            if (usb_drain_bytes(body_len, 2000) < 0) return -1;
-            skip++;
             continue;
         }
 
@@ -564,10 +556,9 @@ static int usb_recv_version(void) {
 
         uint32_t major = ntohl(body.major);
         uint32_t minor = ntohl(body.minor);
-        LOGI("usb_recv_version: iPhone mux version %u.%u tx=%u rx=%u", major, minor,
-             ntohs(hdr.tx_seq), ntohs(hdr.rx_seq));
-        if (major != 2) {
-            LOGE("usb_recv_version: iPhone trả version %u, cần mux v2", major);
+        LOGI("usb_recv_version: iPhone mux version %u.%u (legacy header 8-byte)", major, minor);
+        if (major < 2) {
+            LOGE("usb_recv_version: iPhone trả version %u, không hỗ trợ mux v2", major);
             return -1;
         }
         return 0;
