@@ -276,13 +276,20 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
      */
     int version_exchange_attempts = 0;
     bool version_exchange_ok = false;
-    const int MAX_OUTER_RETRY = 5;
+    const int MAX_OUTER_RETRY = 3;
 
+    /*
+     * Giữ nguyên libusb handle và Android fd trong toàn bộ session.
+     * termux-usbmuxd chạy proxy/daemon lâu sống trên cùng descriptor; việc
+     * close rồi libusb_wrap_sys_device() lại cùng một fd có thể làm mất
+     * ownership/interface state của UsbDeviceConnection và làm iPhone phải
+     * re-enumerate. Chỉ retry I/O/state của mux trên handle hiện tại.
+     */
     while (version_exchange_attempts < MAX_OUTER_RETRY) {
         version_exchange_attempts++;
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf),
-                 "[usbmux] Thử version exchange lần %d/%d...",
+                 "[usbmux] Thử version exchange lần %d/%d (giữ nguyên USB fd)...",
                  version_exchange_attempts, MAX_OUTER_RETRY);
         emit_log(log_buf);
 
@@ -294,43 +301,19 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         if (version_exchange_attempts >= MAX_OUTER_RETRY) break;
 
         snprintf(log_buf, sizeof(log_buf),
-                 "[usbmux] ⚠️ version exchange (%d retry) thất bại - thử lại jni-level sau 3s...",
+                 "[usbmux] ⚠️ version exchange lần %d thất bại - retry trên cùng session sau 1s...",
                  version_exchange_attempts);
         emit_log(log_buf);
         emit_log("[usbmux] ⚠️ iPhone đã unlock chưa? Bấm 'Trust' nếu có popup trên iPhone");
         emit_log("[usbmux] ⚠️ Kiểm tra: Cáp USB có hỗ trợ data không? (không phải cáp sạc)");
 
-        /*
-         * FIX v28: Full USB re-init — khác với v27 chỉ clear_halt + flush.
-         *
-         * usb_bridge_close() giải phóng toàn bộ libusb state (context, handle).
-         * usb_bridge_init_from_fd() khởi tạo lại từ đầu với cùng fd — bao gồm
-         * libusb_reset_device() để xóa stale state (FIX v28 trong usb_fd_bridge.c).
-         * Đây là cách tiếp cận của termux-usbmuxd: kill + restart usbmuxd process.
-         */
-        usb_bridge_close();
-        snprintf(log_buf, sizeof(log_buf),
-                 "[bridge] ⚠️ nativeSetUsbfd lần %d thất bại - thử lại sau 3s...",
-                 version_exchange_attempts);
-        emit_log(log_buf);
-        emit_log("[bridge] 💡 Giữ cáp USB, không rút ra. iPhone đã unlock + bấm Trust chưa?");
-        usleep(3000 * 1000); /* 3 giây cho iPhone reset MUX endpoint */
-
-        /* Re-init libusb từ cùng fd (fd vẫn valid do Kotlin giữ UsbDeviceConnection) */
-        bool reinit_ok = usb_bridge_init_from_fd((int)fd, (int)vendorId, (int)productId);
-        if (!reinit_ok) {
-            emit_log("[bridge] ❌ Không thể reinit libusb — fd có thể không còn valid");
-            emit_log("[bridge] 💡 Thử: Rút cáp USB 5s rồi cắm lại và nhấn 'Kết nối'");
-            return JNI_FALSE;
-        }
-        snprintf(log_buf, sizeof(log_buf),
-                 "[usb] ✅ libusb ready: ep_in=0x%02x ep_out=0x%02x",
-                 usb_bridge_ep_in(), usb_bridge_ep_out());
-        emit_log(log_buf);
-
-        usleep(500 * 1000); /* 500ms ổn định sau reinit */
-        usb_bridge_flush_in(15, 100); /* drain stale data */
-        usbmuxd_server_reset_version_state(); /* cho phép exchange chạy lại */
+        /* Không reset USB bus và không wrap lại cùng fd. Chỉ dọn packet
+         * còn tồn, clear halt best-effort rồi reset state mux trước lần thử
+         * tiếp theo; Android UsbDeviceConnection vẫn là owner của fd. */
+        usb_bridge_clear_endpoints_halt();
+        usb_bridge_flush_in(8, 200);
+        usleep(1000 * 1000);
+        usbmuxd_server_reset_version_state();
     }
 
     if (!version_exchange_ok) {

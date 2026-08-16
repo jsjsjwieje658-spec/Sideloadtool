@@ -102,12 +102,11 @@ class NativeBridge(private val context: Context) {
      *   1. UsbTransport.open() đã KHÔNG claim interface (fd sạch cho libusb)
      *   2. nativeSetUsbFd() với fd sạch → libusb claim interface tự do
      *      → Endpoint sạch → version exchange thành công
-     *   3. Nếu Mode 1 thất bại hoàn toàn (5 lần retry với mỗi lần 5 internal retry):
-     *      → prepareForBulkTransfers() → claim interface cho Mode 2/3
-     *      → nativeConnect() sẽ dùng Mode 2/3 fallback
+     *   3. Nếu Mode 1 thất bại, đóng session hiện tại; requestAndOpen()
+     *      sẽ mở UsbDeviceConnection/fd mới thay vì re-wrap cùng fd.
      *
-     * Số lần retry Kotlin-level giảm xuống (5 lần, delay ngắn hơn vì
-     * mỗi lần nativeSetUsbFd() đã có 5 internal retry × 12s = ~60s).
+     * Retry ở mức mux/native chỉ giữ nguyên handle và fd của session; không
+     * reset USB bus, không đóng/re-wrap descriptor giữa các lần thử.
      */
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
@@ -131,49 +130,21 @@ class NativeBridge(private val context: Context) {
                          * Cả hai trường hợp đều tốt hơn trường hợp cũ (Android pre-claim
                          * gây STALL trên endpoints).
                          *
-                         * Số lần retry: 5 lần Kotlin-level với delay 3s/5s/5s/8s/10s.
-                         * Mỗi lần gọi nativeSetUsbFd() đã có 5 internal retry trong C.
-                         * Tổng: 5 × 5 = 25 lần thử với đủ clear_halt + flush + delay.
+                         * Mỗi Android fd chỉ được wrap một lần trong một USB session;
+                         * retry attach sẽ tạo session/fd mới thay vì close/re-wrap cùng fd.
                          */
-                        val retryDelays = longArrayOf(3_000L, 5_000L, 5_000L, 8_000L, 10_000L)
                         val udid = UsbTransport.getSerialNumber()
-                        var fdOk = nativeSetUsbFd(fd, vid, pid, udid)
-                        if (fdOk) {
-                            NativeLog.emit("[bridge] ✅ libusb bridge ready — fd sạch (termux-api pattern)")
-                        } else {
-                            var attempt = 1
-                            for (delay in retryDelays) {
-                                NativeLog.emit("[bridge] ⚠️ nativeSetUsbFd lần $attempt thất bại — thử lại sau ${delay/1000}s...")
-                                NativeLog.emit("[bridge] 💡 Giữ cáp USB, không rút ra. iPhone đã unlock + bấm Trust chưa?")
-                                Thread.sleep(delay)
-                                fdOk = nativeSetUsbFd(fd, vid, pid, udid)
-                                if (fdOk) {
-                                    NativeLog.emit("[bridge] ✅ libusb bridge ready (lần thử ${attempt+1})")
-                                    break
-                                }
-                                attempt++
-                            }
-                            if (!fdOk) {
-                                NativeLog.emit("[bridge] ⚠️ Mode 1 (libimobiledevice) thất bại sau ${retryDelays.size+1} lần")
-                                NativeLog.emit("[bridge] 🔄 Chuẩn bị Mode 2/3 (custom protocol fallback)...")
-                                /*
-                                 * FIX v27: Fallback sang Mode 2/3.
-                                 *
-                                 * Khi Mode 1 thất bại hoàn toàn, claim interface để
-                                 * Mode 2/3 có thể dùng UsbDeviceConnection.bulkTransfer().
-                                 * prepareForBulkTransfers() claim interface + clear endpoint halt.
-                                 */
-                                val bulkReady = UsbTransport.prepareForBulkTransfers()
-                                if (bulkReady) {
-                                    NativeLog.emit("[bridge] ✅ Mode 2/3 ready (interface claimed)")
-                                } else {
-                                    NativeLog.emit("[bridge] ❌ Không thể claim interface cho Mode 2/3")
-                                    NativeLog.emit("[bridge] 💡 Thử: Rút cáp USB 5s rồi cắm lại và nhấn 'Kết nối'")
-                                }
-                                // Tiếp tục gọi nativeConnect() bất kể — để libimobiledevice
-                                // thử tất cả các mode có sẵn và báo lỗi rõ ràng hơn
-                            }
+                        /* Một Android fd chỉ được wrap một lần trong một USB session.
+                         * termux-usbmuxd giữ nguyên descriptor và daemon; không retry
+                         * bằng cách close/re-wrap cùng fd. */
+                        val fdOk = nativeSetUsbFd(fd, vid, pid, udid)
+                        if (!fdOk) {
+                            NativeLog.emit("[bridge] ❌ libusb/usbmux attach thất bại trên USB fd hiện tại")
+                            NativeLog.emit("[bridge] 💡 Không claim interface fallback; mở lại USB session rồi thử lại")
+                            UsbTransport.close()
+                            return@withContext false
                         }
+                        NativeLog.emit("[bridge] ✅ libusb bridge ready — fd sạch (termux-api pattern)")
                     } catch (_: UnsatisfiedLinkError) {
                         // Mode 2/3 — nativeSetUsbFd không tồn tại (symbol không được link)
                         // Cần claim interface cho bulk transfers

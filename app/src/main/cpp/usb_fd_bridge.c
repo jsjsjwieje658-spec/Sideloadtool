@@ -65,6 +65,11 @@ static libusb_device_handle *g_handle     = NULL;
 static uint8_t               g_ep_in      = 0;
 static uint8_t               g_ep_out     = 0;
 static int                   g_iface_num  = -1;
+/* Chỉ true khi chính libusb claim thành công interface. Với fd từ
+ * UsbDeviceConnection/termux-usb, Android có thể giữ ownership hoặc libusb
+ * có thể trả NOT_SUPPORTED; trong cả hai trường hợp không được release
+ * interface khi đóng handle. */
+static int                   g_iface_claimed = 0;
 static int                   g_initialized = 0;
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -125,6 +130,7 @@ static bool discover_apple_endpoints(void) {
                  */
                 int r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
                 if (r == 0) {
+                    g_iface_claimed = 1;
                     LOGI("discover: ✅ interface %d claimed successfully (fd sạch — termux-api pattern)",
                          alt->bInterfaceNumber);
                 } else if (r == LIBUSB_ERROR_BUSY) {
@@ -357,10 +363,11 @@ void usb_bridge_flush_in(int max_packets, int timeout_ms) {
  * ════════════════════════════════════════════════════════════════════════ */
 void usb_bridge_close(void) {
     if (g_handle) {
-        if (g_iface_num >= 0) {
+        if (g_iface_claimed && g_iface_num >= 0) {
             libusb_release_interface(g_handle, g_iface_num);
-            g_iface_num = -1;
         }
+        g_iface_num = -1;
+        g_iface_claimed = 0;
         libusb_close(g_handle);
         g_handle = NULL;
     }
