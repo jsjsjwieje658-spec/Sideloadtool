@@ -494,11 +494,31 @@ static int usb_read_at_least(void *buf, int len, int timeout_ms) {
  */
 static void log_hex(const char *prefix, const void *buf, int len) {
     const uint8_t *p = (const uint8_t *)buf;
-    char hex[16 * 3 + 1];
+    /*
+     * FIX v34 (Critical): Buffer overflow crash!
+     *
+     * Code cũ: char hex[16 * 3 + 1] = 49 bytes.
+     *   Nhưng show có thể lên đến 32 byte (32 × 3 = 96 chars + null = 97).
+     *   → Ghi 96 chars vào buffer 49 bytes → STACK BUFFER OVERFLOW →
+     *   app crash ngay khi gọi log_hex() từ usb_send_version().
+     *
+     * Log ở screenshot:
+     *   "[usbmux] Eager version exchange (best-effort, non-blocking)..."
+     *   → crash ngay sau đó, không in thêm log nào. Đó là vì log_hex()
+     *     trong usb_send_version() tràn buffer và SIGSEGV.
+     *
+     * Fix: Đảm bảo buffer đủ lớn cho 32 byte hex dump.
+     *   32 byte × 3 chars/byte + 1 null + 4 chars dư an toàn = 101 bytes.
+     */
+    char hex[32 * 3 + 8];
     int off = 0;
     int show = len < 32 ? len : 32;  /* dump max 32 bytes */
     for (int i = 0; i < show; i++) {
-        off += snprintf(hex + off, sizeof(hex) - off, "%02x ", p[i]);
+        /* snprintf luôn trả về số chars cần thiết (không kể null).
+         * Dùng sizeof(hex) - off làm size limit để tránh tràn. */
+        int n = snprintf(hex + off, sizeof(hex) - off, "%02x ", p[i]);
+        if (n < 0 || (size_t)n >= sizeof(hex) - off) break;  /* buffer đầy */
+        off += n;
     }
     LOGI("%s (len=%d): %s%s", prefix, len, hex, len > 32 ? "..." : "");
 }
