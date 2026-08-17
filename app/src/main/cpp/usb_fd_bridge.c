@@ -261,51 +261,149 @@ uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
 
 /* ════════════════════════════════════════════════════════════════════════
  * usb_bridge_bulk_write — 5 retry, 80ms delay
+ *
+ * FIX v35: Log error code CỤ THỂ cho mọi path lỗi (không chỉ PIPE).
+ * Trước đây chỉ log "PIPE ep=..." và return -1 cho các error khác mà
+ * không nói rõ là NOT_FOUND/NO_DEVICE/ACCESS/etc → khó debug.
+ *
+ * Các lỗi phổ biến trên Android:
+ *   LIBUSB_ERROR_NOT_FOUND (-5): handle đã bị close do UsbDeviceConnection
+ *     bị Android reclaim. Cần re-open.
+ *   LIBUSB_ERROR_NO_DEVICE (-4): device đã detach.
+ *   LIBUSB_ERROR_ACCESS (-3): thiếu quyền USB.
+ *   LIBUSB_ERROR_BUSY (-6): interface bị process khác hold.
+ *   LIBUSB_ERROR_OVERFLOW (-8): packet lớn hơn endpoint max packet size.
+ *   LIBUSB_ERROR_PIPE (-9): endpoint STALL — clear_halt và retry.
+ *   LIBUSB_ERROR_TIMEOUT (-7): timeout.
  * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
-    if (!g_handle || !g_ep_out) return -1;
+    if (!g_handle || !g_ep_out) {
+        LOGE("bulk_write: bad state — handle=%p ep_out=0x%02x", (void*)g_handle, g_ep_out);
+        return -1;
+    }
+    int last_err = 0;
     for (int attempt = 0; attempt < 5; attempt++) {
         int transferred = 0;
         int r = libusb_bulk_transfer(g_handle, g_ep_out,
                                       (unsigned char *)buf, len,
                                       &transferred, timeout ? timeout : 5000);
         if (r == 0) return transferred;
-        if (r == LIBUSB_ERROR_TIMEOUT) return transferred;
+        if (r == LIBUSB_ERROR_TIMEOUT) {
+            LOGI("bulk_write: TIMEOUT ep=0x%02x attempt %d/5 — transferred=%d/%d",
+                 g_ep_out, attempt+1, transferred, len);
+            /* TIMEOUT không retry ngay — tăng timeout cho lần sau */
+            continue;
+        }
         if (r == LIBUSB_ERROR_PIPE) {
-            LOGI("bulk_write: PIPE ep=0x%02x — clear_halt retry %d/5", g_ep_out, attempt+1);
+            LOGI("bulk_write: PIPE ep=0x%02x attempt %d/5 — clear_halt retry",
+                 g_ep_out, attempt+1);
             libusb_clear_halt(g_handle, g_ep_out);
             usleep(80 * 1000);
             continue;
         }
-        LOGE("bulk_write ep=0x%02x err=%d (%s)", g_ep_out, r, libusb_error_name(r));
-        return -1;
+        if (r == LIBUSB_ERROR_OVERFLOW) {
+            /*
+             * FIX v35 (Critical): OVERFLOW thường xảy ra khi Android UsbDeviceConnection
+             * đã claim interface và libusb chia sẻ fd. Khi đó libusb không gửi được
+             * packet đúng kích thước. Clear_halt không giúp — cần raw USB reset
+             * qua control transfer CLEAR_FEATURE(ENDPOINT_HALT) để reset endpoint
+             * toggle state. Thử clear_halt + delay dài hơn.
+             */
+            LOGI("bulk_write: OVERFLOW ep=0x%02x attempt %d/5 — try clear_halt + long delay",
+                 g_ep_out, attempt+1);
+            libusb_clear_halt(g_handle, g_ep_out);
+            usleep(200 * 1000);  /* delay dài hơn cho OVERFLOW */
+            continue;
+        }
+        if (r == LIBUSB_ERROR_NOT_FOUND || r == LIBUSB_ERROR_NO_DEVICE) {
+            /*
+             * FIX v35: Handle bị mất — không retry được, return ngay.
+             * Caller sẽ thấy error này và trigger USB re-open.
+             */
+            LOGE("bulk_write: %s ep=0x%02x err=%d — handle mất, không retry",
+                 libusb_error_name(r), g_ep_out, r);
+            return -1;
+        }
+        if (r == LIBUSB_ERROR_BUSY) {
+            LOGI("bulk_write: BUSY ep=0x%02x attempt %d/5 — chờ 100ms và retry",
+                 g_ep_out, attempt+1);
+            usleep(100 * 1000);
+            continue;
+        }
+        if (r == LIBUSB_ERROR_ACCESS) {
+            LOGE("bulk_write: ACCESS DENIED ep=0x%02x err=%d — thiếu quyền USB Host",
+                 g_ep_out, r);
+            return -1;
+        }
+        /* Lỗi khác — log + retry */
+        LOGE("bulk_write: ep=0x%02x err=%d (%s) attempt %d/5 — retry",
+             g_ep_out, r, libusb_error_name(r), attempt+1);
+        last_err = r;
+        usleep(80 * 1000);
     }
-    LOGE("bulk_write: 5 lần PIPE, ep=0x%02x", g_ep_out);
+    LOGE("bulk_write: thất bại sau 5 lần thử, ep=0x%02x, last_err=%d (%s)",
+         g_ep_out, last_err, libusb_error_name(last_err));
     return -1;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
  * usb_bridge_bulk_read — 5 retry, 80ms delay
+ *
+ * FIX v35: Log error code CỤ THỂ cho mọi path lỗi (không chỉ PIPE).
  * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
-    if (!g_handle || !g_ep_in) return -1;
+    if (!g_handle || !g_ep_in) {
+        LOGE("bulk_read: bad state — handle=%p ep_in=0x%02x", (void*)g_handle, g_ep_in);
+        return -1;
+    }
+    int last_err = 0;
     for (int attempt = 0; attempt < 5; attempt++) {
         int transferred = 0;
         int r = libusb_bulk_transfer(g_handle, g_ep_in,
                                       (unsigned char *)buf, len,
                                       &transferred, timeout ? timeout : 10000);
         if (r == 0) return transferred;
-        if (r == LIBUSB_ERROR_TIMEOUT) return 0;
+        if (r == LIBUSB_ERROR_TIMEOUT) {
+            /* TIMEOUT = không có data — return 0 (caller sẽ xử lý) */
+            return 0;
+        }
         if (r == LIBUSB_ERROR_PIPE) {
-            LOGI("bulk_read: PIPE ep=0x%02x — clear_halt retry %d/5", g_ep_in, attempt+1);
+            LOGI("bulk_read: PIPE ep=0x%02x attempt %d/5 — clear_halt retry",
+                 g_ep_in, attempt+1);
             libusb_clear_halt(g_handle, g_ep_in);
             usleep(80 * 1000);
             continue;
         }
-        LOGE("bulk_read ep=0x%02x err=%d (%s)", g_ep_in, r, libusb_error_name(r));
-        return -1;
+        if (r == LIBUSB_ERROR_OVERFLOW) {
+            LOGI("bulk_read: OVERFLOW ep=0x%02x attempt %d/5 — buffer quá nhỏ? clear_halt và retry",
+                 g_ep_in, attempt+1);
+            libusb_clear_halt(g_handle, g_ep_in);
+            usleep(200 * 1000);
+            continue;
+        }
+        if (r == LIBUSB_ERROR_NOT_FOUND || r == LIBUSB_ERROR_NO_DEVICE) {
+            LOGE("bulk_read: %s ep=0x%02x err=%d — handle mất, không retry",
+                 libusb_error_name(r), g_ep_in, r);
+            return -1;
+        }
+        if (r == LIBUSB_ERROR_BUSY) {
+            LOGI("bulk_read: BUSY ep=0x%02x attempt %d/5 — chờ 100ms và retry",
+                 g_ep_in, attempt+1);
+            usleep(100 * 1000);
+            continue;
+        }
+        if (r == LIBUSB_ERROR_ACCESS) {
+            LOGE("bulk_read: ACCESS DENIED ep=0x%02x err=%d — thiếu quyền USB Host",
+                 g_ep_in, r);
+            return -1;
+        }
+        LOGE("bulk_read: ep=0x%02x err=%d (%s) attempt %d/5 — retry",
+             g_ep_in, r, libusb_error_name(r), attempt+1);
+        last_err = r;
+        usleep(80 * 1000);
     }
-    LOGE("bulk_read: 5 lần PIPE, ep=0x%02x", g_ep_in);
+    LOGE("bulk_read: thất bại sau 5 lần thử, ep=0x%02x, last_err=%d (%s)",
+         g_ep_in, last_err, libusb_error_name(last_err));
     return -1;
 }
 
