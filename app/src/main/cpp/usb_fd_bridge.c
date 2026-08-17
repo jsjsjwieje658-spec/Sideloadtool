@@ -44,15 +44,41 @@
  *  5. bulk_write/bulk_read: retry từ 3 → 5 lần, delay từ 50ms → 80ms
  */
 #include "usb_fd_bridge.h"
+#include "android_usbmuxd_fix.h"
 #include <libusb.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <android/log.h>
 
+/*
+ * FIX v36 (Critical): Forward LOGI/LOGE to UI log viewer.
+ *
+ * Trước đây, usb_fd_bridge.c chỉ gọi __android_log_print() → log chỉ xuất
+ * hiện trong logcat của Android, KHÔNG hiển thị trong UI log viewer của app.
+ *
+ * Hậu quả: khi bulk_write() return -1, log trong UI chỉ thấy
+ *   "usb_send_version: usb_write() returned -1"
+ * mà KHÔNG thấy log chi tiết từ usb_bridge_bulk_write() như:
+ *   "bulk_write: PIPE ep=0x04 attempt 1/5 — clear_halt retry"
+ *   "bulk_write: OVERFLOW ep=0x04 attempt 1/5 — try clear_halt + long delay"
+ *   "bulk_write: ACCESS DENIED ep=0x04 err=-3 — thiếu quyền USB Host"
+ *
+ * → Người dùng/không debug được error code thực sự của libusb.
+ *
+ * Fix: thêm android_usbmuxd_fix_logf() vào macro LOGI/LOGE để forward
+ * log vào UI log viewer qua callback đã được set trong nativeInit().
+ * (Giống cách usbmuxd_server.c đã làm.)
+ */
 #define TAG "usb_fd_bridge"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) do { \
+    __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__); \
+    android_usbmuxd_fix_logf(__VA_ARGS__); \
+} while (0)
+#define LOGE(...) do { \
+    __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__); \
+    android_usbmuxd_fix_logf(__VA_ARGS__); \
+} while (0)
 
 /* Apple AMDI interface */
 #define APPLE_IF_CLASS     0xFF

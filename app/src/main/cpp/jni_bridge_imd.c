@@ -150,6 +150,15 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
     (*env)->ReleaseStringUTFChars(env, filesDir, dir);
     android_usbmuxd_fix_set_log_callback(server_log_callback);
     emit_log("[jni] Mode 1: libimobiledevice thật + usbmuxd server nội bộ");
+    /*
+     * FIX v36: Banner phiên bản để user xác nhận đang chạy APK mới nhất.
+     * Khi gặp lỗi, user nhìn lên đầu log sẽ biết ngay phiên bản nào đang chạy.
+     */
+    emit_log("[jni] ═══════════════════════════════════════════════════════");
+    emit_log("[jni]   SideloadTool native v36 (2026-08-17)");
+    emit_log("[jni]   Fixes: v33 eager+clear, v34 log_hex overflow,");
+    emit_log("[jni]          v35 libusb error codes, v36 UI log forwarding");
+    emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
 
