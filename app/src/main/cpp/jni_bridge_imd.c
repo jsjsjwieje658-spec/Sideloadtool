@@ -102,6 +102,12 @@ static jobject g_bridge_obj = NULL;
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     g_jvm = vm;
+    /*
+     * FIX v38: Truyền JavaVM pointer xuống usb_fd_bridge.c để nó có thể
+     * AttachCurrentThread và gọi NativeBridge.onNativeBulkWrite/Read
+     * từ worker threads (khi Android JNI transport mode được enable).
+     */
+    usb_bridge_set_jvm((void *)vm);
     return JNI_VERSION_1_6;
 }
 
@@ -151,15 +157,17 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
     android_usbmuxd_fix_set_log_callback(server_log_callback);
     emit_log("[jni] Mode 1: libimobiledevice thật + usbmuxd server nội bộ");
     /*
-     * FIX v36: Banner phiên bản để user xác nhận đang chạy APK mới nhất.
-     * Khi gặp lỗi, user nhìn lên đầu log sẽ biết ngay phiên bản nào đang chạy.
+     * FIX v38: Truyền NativeBridge instance xuống usb_fd_bridge.c để nó
+     * có thể gọi onNativeBulkWrite/Read qua JNI khi Android transport mode.
      */
+    usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v37 (2026-08-17)");
+    emit_log("[jni]   SideloadTool native v38 (2026-08-17)");
     emit_log("[jni]   Fixes:");
     emit_log("[jni]     v33 eager+clear, v34 log_hex overflow,");
     emit_log("[jni]     v35 libusb error codes, v36 UI log forwarding,");
-    emit_log("[jni]     v37 endpoints from Kotlin (bypass discover_apple_endpoints)");
+    emit_log("[jni]     v37 endpoints from Kotlin (bypass discover),");
+    emit_log("[jni]     v38 Android JNI bulk transport fallback");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -223,6 +231,31 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
              "[usb] \u2705 libusb ready: ep_in=0x%02x ep_out=0x%02x",
              usb_bridge_ep_in(), usb_bridge_ep_out());
     emit_log(buf);
+
+    /*
+     * FIX v38: Auto-switch sang Android JNI transport mode.
+     *
+     * Lý do: libusb_claim_interface() với Android wrapped fd gần như luôn
+     * trả NOT_FOUND (descriptor access không đáng tin). Khi claim fail,
+     * libusb_bulk_transfer() cũng fail với LIBUSB_ERROR_IO → không có lý do
+     * thử libusb path.
+     *
+     * Android JNI transport mode route bulk_write/read qua:
+     *   NativeBridge.onNativeBulkWrite/Read → UsbTransport.nativeBulkWrite/Read
+     *   → UsbDeviceConnection.bulkTransfer()
+     *
+     * Yêu cầu: Kotlin ĐÃ phải gọi UsbTransport.prepareForBulkTransfers() TRƯỚC
+     * khi gọi nativeSetUsbFd() — NativeBridge.setUsbFd() và connect() đảm bảo
+     * việc này. Nếu chưa prepareForBulkTransfers, bulk_transfer sẽ fail với -1.
+     *
+     * Caller đảm bảo: NativeBridge.connect() gọi UsbTransport.prepareForBulkTransfers()
+     * trước khi gọi nativeSetUsbFd() lần đầu (khi g_iface_claimed sẽ là 0).
+     */
+    if (usb_bridge_set_android_mode()) {
+        emit_log("[usbmux] ✅ Đã switch sang Android JNI bulk transport mode");
+    } else {
+        emit_log("[usbmux] ⚠️ Không switch được Android mode — JNI callbacks chưa sẵn sàng");
+    }
 
     /*
      * Không thực hiện version exchange tại thời điểm nhận fd.

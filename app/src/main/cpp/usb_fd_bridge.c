@@ -50,6 +50,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <jni.h>
+#include <pthread.h>
 
 /*
  * FIX v36 (Critical): Forward LOGI/LOGE to UI log viewer.
@@ -97,6 +99,167 @@ static int                   g_iface_num  = -1;
  * interface khi đóng handle. */
 static int                   g_iface_claimed = 0;
 static int                   g_initialized = 0;
+
+/*
+ * FIX v38: Android JNI transport mode — fallback khi libusb_claim_interface()
+ * trả NOT_FOUND. Khi g_use_android = 1, usb_bridge_bulk_write/read sẽ gọi
+ * NativeBridge.onNativeBulkWrite/Read qua JNI thay vì libusb_bulk_transfer.
+ */
+static int                   g_use_android = 0;
+static JavaVM               *g_jvm         = NULL;
+static jobject               g_bridge_ref  = NULL;
+static jmethodID             g_mid_bulk_write = NULL;
+static jmethodID             g_mid_bulk_read  = NULL;
+static jclass                g_nb_class    = NULL;
+static pthread_mutex_t       g_jni_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * usb_bridge_set_jvm — được gọi từ JNI_OnLoad để cache JavaVM pointer.
+ * Tham số void* để tránh require jni.h trong header; cast sang JavaVM* ở đây.
+ */
+void usb_bridge_set_jvm(void *vm) {
+    g_jvm = (JavaVM *)vm;
+}
+
+/*
+ * usb_bridge_set_bridge_ref — cache global ref to NativeBridge instance
+ * và pre-resolve method IDs để tránh FindClass mỗi lần.
+ * Tham số void* để tránh require jni.h trong header; cast sang jobject ở đây.
+ */
+void usb_bridge_set_bridge_ref(void *bridge_obj) {
+    pthread_mutex_lock(&g_jni_mutex);
+    JNIEnv *env = NULL;
+    bool detach = false;
+    if (!g_jvm) {
+        pthread_mutex_unlock(&g_jni_mutex);
+        return;
+    }
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
+        detach = true;
+    }
+
+    if (g_bridge_ref) {
+        (*env)->DeleteGlobalRef(env, g_bridge_ref);
+        g_bridge_ref = NULL;
+    }
+    if (g_nb_class) {
+        (*env)->DeleteGlobalRef(env, g_nb_class);
+        g_nb_class = NULL;
+    }
+    g_mid_bulk_write = NULL;
+    g_mid_bulk_read  = NULL;
+
+    jobject bridge = (jobject)bridge_obj;
+    if (bridge) {
+        g_bridge_ref = (*env)->NewGlobalRef(env, bridge);
+        jclass local_cls = (*env)->GetObjectClass(env, bridge);
+        if (local_cls) {
+            g_nb_class = (jclass)(*env)->NewGlobalRef(env, local_cls);
+            (*env)->DeleteLocalRef(env, local_cls);
+
+            g_mid_bulk_write = (*env)->GetStaticMethodID(env, g_nb_class,
+                "onNativeBulkWrite", "([BI)I");
+            g_mid_bulk_read = (*env)->GetStaticMethodID(env, g_nb_class,
+                "onNativeBulkRead", "([BI)I");
+
+            LOGI("usb_bridge_set_bridge_ref: NativeBridge ref cached. "
+                 "bulk_write=%p bulk_read=%p",
+                 (void*)g_mid_bulk_write, (void*)g_mid_bulk_read);
+        }
+    }
+
+    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    pthread_mutex_unlock(&g_jni_mutex);
+}
+
+bool usb_bridge_set_android_mode(void) {
+    if (!g_jvm) {
+        LOGE("usb_bridge_set_android_mode: g_jvm NULL — chưa gọi usb_bridge_set_jvm()");
+        return false;
+    }
+    if (!g_mid_bulk_write || !g_mid_bulk_read) {
+        LOGE("usb_bridge_set_android_mode: method IDs NULL — chưa gọi usb_bridge_set_bridge_ref()");
+        return false;
+    }
+    g_use_android = 1;
+    LOGI("usb_bridge_set_android_mode: ✅ Android JNI transport mode ENABLED");
+    LOGI("usb_bridge_set_android_mode: bulk_write/read sẽ route qua NativeBridge.onNativeBulkWrite/Read");
+    return true;
+}
+
+bool usb_bridge_using_android_mode(void) {
+    return g_use_android != 0;
+}
+
+/*
+ * call_android_bulk_write — gọi NativeBridge.onNativeBulkWrite(buf, timeout)
+ */
+static int call_android_bulk_write(const void *buf, int len, unsigned int timeout_ms) {
+    if (!g_jvm || !g_mid_bulk_write) return -1;
+
+    JNIEnv *env = NULL;
+    bool detach = false;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
+        detach = true;
+    }
+
+    jbyteArray jarr = (*env)->NewByteArray(env, len);
+    if (!jarr) {
+        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+        return -1;
+    }
+    (*env)->SetByteArrayRegion(env, jarr, 0, len, (const jbyte *)buf);
+
+    jint result = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_write,
+                                              jarr, (jint)timeout_ms);
+    jthrowable exc = (*env)->ExceptionOccurred(env);
+    if (exc) {
+        (*env)->ExceptionClear(env);
+        LOGE("call_android_bulk_write: Java exception");
+        result = -1;
+    }
+
+    (*env)->DeleteLocalRef(env, jarr);
+    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    return (int)result;
+}
+
+/*
+ * call_android_bulk_read — gọi NativeBridge.onNativeBulkRead(buf, timeout)
+ */
+static int call_android_bulk_read(void *buf, int len, unsigned int timeout_ms) {
+    if (!g_jvm || !g_mid_bulk_read) return -1;
+
+    JNIEnv *env = NULL;
+    bool detach = false;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
+        detach = true;
+    }
+
+    jbyteArray jarr = (*env)->NewByteArray(env, len);
+    if (!jarr) {
+        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+        return -1;
+    }
+
+    jint result = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_read,
+                                              jarr, (jint)timeout_ms);
+    jthrowable exc = (*env)->ExceptionOccurred(env);
+    if (exc) {
+        (*env)->ExceptionClear(env);
+        LOGE("call_android_bulk_read: Java exception");
+        result = -1;
+    } else if (result > 0) {
+        (*env)->GetByteArrayRegion(env, jarr, 0, result, (jbyte *)buf);
+    }
+
+    (*env)->DeleteLocalRef(env, jarr);
+    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    return (int)result;
+}
 
 /* ════════════════════════════════════════════════════════════════════════
  * discover_apple_endpoints
@@ -390,6 +553,16 @@ bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id,
  * usb_bridge_clear_endpoints_halt (public)
  * ════════════════════════════════════════════════════════════════════════ */
 bool usb_bridge_clear_endpoints_halt(void) {
+    /*
+     * FIX v38: Trong Android JNI transport mode, Android UsbDeviceConnection
+     * quản lý endpoint state. Hàm này không cần làm gì — return true để caller
+     * không bị block.
+     */
+    if (g_use_android) {
+        LOGI("clear_halt: skip (Android mode — UsbDeviceConnection quản lý endpoints)");
+        return true;
+    }
+
     if (!g_handle) return false;
     bool any_ok = false;
 
@@ -429,6 +602,15 @@ uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
  *   LIBUSB_ERROR_TIMEOUT (-7): timeout.
  * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
+    /*
+     * FIX v38: Nếu đang ở Android JNI transport mode, route qua JNI callbacks
+     * thay vì libusb_bulk_transfer. Điều này xảy ra khi libusb_claim_interface()
+     * đã fail với NOT_FOUND — libusb_bulk_transfer cũng sẽ fail với IO.
+     */
+    if (g_use_android) {
+        return call_android_bulk_write(buf, len, timeout ? timeout : 5000);
+    }
+
     if (!g_handle || !g_ep_out) {
         LOGE("bulk_write: bad state — handle=%p ep_out=0x%02x", (void*)g_handle, g_ep_out);
         return -1;
@@ -504,6 +686,13 @@ int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
  * FIX v35: Log error code CỤ THỂ cho mọi path lỗi (không chỉ PIPE).
  * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
+    /*
+     * FIX v38: Route qua Android JNI transport nếu đã enable.
+     */
+    if (g_use_android) {
+        return call_android_bulk_read(buf, len, timeout ? timeout : 10000);
+    }
+
     if (!g_handle || !g_ep_in) {
         LOGE("bulk_read: bad state — handle=%p ep_in=0x%02x", (void*)g_handle, g_ep_in);
         return -1;

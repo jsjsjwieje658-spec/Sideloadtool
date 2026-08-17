@@ -65,6 +65,43 @@ class NativeBridge(private val context: Context) {
         fun onNativeLog(line: String) {
             NativeLog.emit(line)
         }
+
+        /*
+         * FIX v38: Android bulk transfer callbacks — được gọi TỪ native layer
+         * qua JNI khi libusb_claim_interface() thất bại (NOT_FOUND).
+         *
+         * Đi qua UsbTransport.nativeBulkWrite/Read → UsbDeviceConnection.bulkTransfer()
+         * của Android — path ổn định nhất trên Android vì Android USB service quản lý
+         * configuration và interface claim một cách chính xác.
+         *
+         * Flow khi libusb_claim_interface fail:
+         *   1. native usb_bridge_init_from_fd2() detect claim NOT_FOUND
+         *   2. native gọi usb_bridge_set_android_mode()
+         *   3. usb_bridge_bulk_write() gọi onNativeBulkWrite(byte[], timeoutMs) qua JNI
+         *   4. NativeBridge.onNativeBulkWrite() gọi UsbTransport.nativeBulkWrite()
+         *   5. UsbDeviceConnection.bulkTransfer(epOut, ...) → kernel USB
+         *
+         * Trả về: số byte transfer nếu thành công, -1 nếu lỗi, 0 nếu timeout.
+         */
+        @JvmStatic
+        fun onNativeBulkWrite(data: ByteArray, timeoutMs: Int): Int {
+            return try {
+                UsbTransport.nativeBulkWrite(data, timeoutMs)
+            } catch (e: Exception) {
+                Log.e(TAG, "onNativeBulkWrite exception: ${e.message}")
+                -1
+            }
+        }
+
+        @JvmStatic
+        fun onNativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
+            return try {
+                UsbTransport.nativeBulkRead(buf, timeoutMs)
+            } catch (e: Exception) {
+                Log.e(TAG, "onNativeBulkRead exception: ${e.message}")
+                -1
+            }
+        }
     }
 
     fun init() {
@@ -75,9 +112,9 @@ class NativeBridge(private val context: Context) {
     /*
      * FIX v37: Truyền epIn/epOut/ifaceNum từ Kotlin xuống native.
      *
-     * Kotlin đã có sẵn thông tin này từ UsbTransport.findUsbmuxIface().
-     * Native layer không cần discover lại (thường fail khi dùng
-     * libusb_wrap_sys_device() với Android fd).
+     * FIX v38: Trước khi gọi nativeSetUsbFd, gọi UsbTransport.prepareForBulkTransfers()
+     * để Android-side claim interface — cần thiết cho NativeBridge.onNativeBulkWrite/Read
+     * hoạt động (UsbDeviceConnection.bulkTransfer() yêu cầu interface đã claim).
      */
     suspend fun setUsbFd(fd: Int, vendorId: Int, productId: Int): Boolean =
         withContext(Dispatchers.IO) {
@@ -86,9 +123,18 @@ class NativeBridge(private val context: Context) {
                 val epOut   = UsbTransport.getEndpointOutAddress()
                 val ifaceId = UsbTransport.getInterfaceId()
                 NativeLog.emit("[bridge] libusb_wrap_sys_device(fd=$fd vid=0x${vendorId.toString(16)} ep_in=0x${epIn.toString(16)} ep_out=0x${epOut.toString(16)} iface=$ifaceId)...")
+                /*
+                 * FIX v38: prepareForBulkTransfers() claim interface qua Android API
+                 * — đây là điều kiện cần để UsbDeviceConnection.bulkTransfer() hoạt động.
+                 * Native side sẽ tự động switch sang Android JNI transport mode sau khi
+                 * nativeSetUsbFd() được gọi.
+                 */
+                if (!UsbTransport.prepareForBulkTransfers()) {
+                    NativeLog.emit("[bridge] ⚠️ prepareForBulkTransfers() thất bại — bulkTransfer có thể fail")
+                }
                 val udid = UsbTransport.getSerialNumber()
                 val ok = nativeSetUsbFd(fd, vendorId, productId, udid, epIn, epOut, ifaceId)
-                if (ok) NativeLog.emit("[bridge] ✅ libusb sẵn sàng")
+                if (ok) NativeLog.emit("[bridge] ✅ libusb sẵn sàng (Android JNI mode)")
                 else    NativeLog.emit("[bridge] ❌ nativeSetUsbFd thất bại")
                 ok
             } catch (_: UnsatisfiedLinkError) {
@@ -151,7 +197,14 @@ class NativeBridge(private val context: Context) {
                          * FIX v37: Truyền endpoint addresses + interface id từ
                          * Kotlin xuống native để bypass discover_apple_endpoints()
                          * (thường fail với Android fd).
+                         *
+                         * FIX v38: prepareForBulkTransfers() TRƯỚC nativeSetUsbFd()
+                         * để Android claim interface → UsbDeviceConnection.bulkTransfer()
+                         * sẽ hoạt động khi native side switch sang Android JNI mode.
                          */
+                        if (!UsbTransport.prepareForBulkTransfers()) {
+                            NativeLog.emit("[bridge] ⚠️ prepareForBulkTransfers() thất bại — bulkTransfer có thể fail")
+                        }
                         val epIn    = UsbTransport.getEndpointInAddress()
                         val epOut   = UsbTransport.getEndpointOutAddress()
                         val ifaceId = UsbTransport.getInterfaceId()
@@ -162,7 +215,7 @@ class NativeBridge(private val context: Context) {
                             UsbTransport.close()
                             return@withContext false
                         }
-                        NativeLog.emit("[bridge] ✅ libusb bridge ready — fd sạch (termux-api pattern)")
+                        NativeLog.emit("[bridge] ✅ libusb bridge ready (Android JNI mode)")
                     } catch (_: UnsatisfiedLinkError) {
                         // Mode 2/3 — nativeSetUsbFd không tồn tại (symbol không được link)
                         // Cần claim interface cho bulk transfers

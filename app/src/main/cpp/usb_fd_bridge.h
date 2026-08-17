@@ -79,3 +79,45 @@ void usb_bridge_close(void);
  * Gọi trước version exchange hoặc khi gặp nhiều lỗi PIPE liên tiếp.
  */
 bool usb_bridge_clear_endpoints_halt(void);
+
+/*
+ * FIX v38: usb_bridge_set_android_mode — switch sang Android bulk transport.
+ *
+ * Khi libusb_claim_interface() fail với NOT_FOUND (thường gặp trên Android
+ * với wrapped fd), libusb_bulk_transfer() cũng sẽ fail với LIBUSB_ERROR_IO.
+ *
+ * Giải pháp: route bulk_write/read qua JNI callbacks → Android
+ * UsbDeviceConnection.bulkTransfer() — path ổn định vì Android USB service
+ * đã claim interface từ Kotlin side (UsbTransport.prepareForBulkTransfers()).
+ *
+ * Sau khi gọi hàm này:
+ *   - usb_bridge_bulk_write() sẽ gọi NativeBridge.onNativeBulkWrite() qua JNI
+ *   - usb_bridge_bulk_read() sẽ gọi NativeBridge.onNativeBulkRead() qua JNI
+ *   - usb_bridge_clear_endpoints_halt() return true (no-op, Android quản lý)
+ *   - usb_bridge_flush_in() vẫn dùng bulk_read (sẽ tự động route qua JNI)
+ *
+ * @return true nếu mode switch thành công
+ */
+bool usb_bridge_set_android_mode(void);
+
+/*
+ * usb_bridge_using_android_mode — return true nếu đang dùng Android JNI
+ * transport mode (sau khi set_android_mode() được gọi).
+ */
+bool usb_bridge_using_android_mode(void);
+
+/*
+ * FIX v38: JNI bridge — cache JavaVM và NativeBridge instance để
+ * có thể gọi onNativeBulkWrite/Read từ native code.
+ *
+ * usb_bridge_set_jvm() — gọi từ JNI_OnLoad (của jni_bridge_imd.c) để
+ * truyền JavaVM pointer xuống.
+ */
+void usb_bridge_set_jvm(void *vm);  /* void* để không require jni.h trong header */
+
+/*
+ * usb_bridge_set_bridge_ref() — gọi từ nativeInit() với NativeBridge
+ * instance (jobject). Cache global ref + pre-resolve method IDs để
+ * tránh FindClass/GetStaticMethodID mỗi lần bulk_write/read.
+ */
+void usb_bridge_set_bridge_ref(void *bridge_obj);  /* void* để không require jni.h trong header */
