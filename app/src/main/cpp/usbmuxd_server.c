@@ -486,6 +486,23 @@ static int usb_read_at_least(void *buf, int len, int timeout_ms) {
 }
 
 /* ── Gửi VERSION request theo usbmuxd upstream ─────────────────────────── */
+/*
+ * FIX v33: Thêm hex dump của VERSION packet để debug.
+ * Khi iPhone không phản hồi, hex dump cho phép xác nhận byte gửi đi
+ * khớp với upstream usbmuxd (00 00 00 00 | 00 00 00 14 | 00 00 00 02 |
+ * 00 00 00 00 | 00 00 00 00 → 20 bytes).
+ */
+static void log_hex(const char *prefix, const void *buf, int len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    char hex[16 * 3 + 1];
+    int off = 0;
+    int show = len < 32 ? len : 32;  /* dump max 32 bytes */
+    for (int i = 0; i < show; i++) {
+        off += snprintf(hex + off, sizeof(hex) - off, "%02x ", p[i]);
+    }
+    LOGI("%s (len=%d): %s%s", prefix, len, hex, len > 32 ? "..." : "");
+}
+
 static int usb_send_version(void) {
     /* Upstream device.c sends VERSION while dev->version == 0, therefore
      * send_packet() uses only protocol+length (8 bytes). */
@@ -501,8 +518,25 @@ static int usb_send_version(void) {
     body->minor = htonl(0);
     body->padding = 0;
 
+    log_hex("usb_send_version: pkt", pkt, (int)sizeof(pkt));
     LOGI("usb_send_version: VERSION upstream header 8-byte + version 2.0, length=%zu", sizeof(pkt));
-    return usb_write(pkt, (int)sizeof(pkt)) > 0 ? 0 : -1;
+    int written = usb_write(pkt, (int)sizeof(pkt));
+    if (written <= 0) {
+        LOGE("usb_send_version: usb_write() returned %d (mong đợi %zu)", written, sizeof(pkt));
+        return -1;
+    }
+    if (written != (int)sizeof(pkt)) {
+        LOGE("usb_send_version: partial write %d/%zu", written, sizeof(pkt));
+        return -1;
+    }
+    /*
+     * FIX v33: delay 50ms sau khi gửi VERSION để libusb kịp flush URB
+     * xuống device. Trên một số Android USB stack (đặc biệt là MediaTek/
+     * older Qualcomm), libusb_bulk_transfer() return ngay nhưng URB chưa
+     * thật sự được gửi đi. 50ms là đủ cho USB host controller schedule.
+     */
+    usleep(50 * 1000);
+    return 0;
 }
 
 static int usb_drain_bytes(uint32_t len, int timeout_ms) {
@@ -516,49 +550,82 @@ static int usb_drain_bytes(uint32_t len, int timeout_ms) {
     return 0;
 }
 
-/* VERSION response is also framed with the legacy 8-byte header because
- * device.version is still 0 until the response body is parsed. This mirrors
- * usbmuxd/src/device.c exactly; v2 magic/sequence fields start with SETUP. */
+/*
+ * FIX v33: Giảm timeout trong usb_recv_version từ 3000ms×10 → 1500ms×5.
+ *
+ * Lý do:
+ *   - 3000ms × 10 attempts = 30 giây mỗi lần gọi usb_recv_version()
+ *   - 5 outer retry × 30s = 150s = 2.5 phút chỉ cho version exchange
+ *   - iPhone thường phản hồi VERSION trong vòng 100-500ms nếu sẽ phản hồi
+ *   - Nếu sau 1500ms × 5 = 7.5s mà chưa có response, chắc chắn iPhone
+ *     không có ý định phản hồi trong lần thử này
+ *   - Fail nhanh → retry nhanh với clear_halt → cơ hội thành công cao hơn
+ */
 static int usb_recv_version(void) {
-    const int VERSION_TIMEOUT_MS = 3000;
+    const int VERSION_TIMEOUT_MS = 1500;
+    const int VERSION_ATTEMPTS   = 5;
 
-    for (int attempt = 0; attempt < 10; attempt++) {
+    for (int attempt = 0; attempt < VERSION_ATTEMPTS; attempt++) {
         v1_mux_hdr_t hdr;
         int n = usb_read_exact(&hdr, sizeof(hdr), VERSION_TIMEOUT_MS);
         if (n <= 0) {
-            if (attempt == 9) {
-                LOGE("usb_recv_version: timeout chờ version (%d lần)", attempt + 1);
+            if (attempt == VERSION_ATTEMPTS - 1) {
+                LOGE("usb_recv_version: timeout chờ version (%d lần × %dms) — "
+                     "iPhone không phản hồi VERSION packet",
+                     VERSION_ATTEMPTS, VERSION_TIMEOUT_MS);
                 return -1;
             }
             usleep(200 * 1000);
             continue;
         }
-        if (n != (int)sizeof(hdr)) return -1;
+        if (n != (int)sizeof(hdr)) {
+            LOGE("usb_recv_version: đọc được %d byte header (cần %zu)", n, sizeof(hdr));
+            return -1;
+        }
 
         uint32_t protocol = ntohl(hdr.protocol);
         uint32_t packet_len = ntohl(hdr.length);
+
+        /* Hex dump header để debug */
+        log_hex("usb_recv_version: hdr", &hdr, (int)sizeof(hdr));
+        LOGI("usb_recv_version: protocol=%u length=%u", protocol, packet_len);
+
         if (packet_len < sizeof(hdr) + sizeof(mux_version_body_t) || packet_len > 65536) {
-            LOGE("usb_recv_version: packet length không hợp lệ=%u", packet_len);
+            LOGE("usb_recv_version: packet length không hợp lệ=%u (mong đợi >= %zu và <= 65536)",
+                 packet_len, sizeof(hdr) + sizeof(mux_version_body_t));
+            /*
+             * FIX v33: Dump 32 byte tiếp theo để xem iPhone đang gửi gì.
+             * Có thể là v2 binary plist header (bplist00) hoặc garbage.
+             */
+            uint8_t peek[32];
+            int peek_n = usb_read_exact(peek, sizeof(peek), 500);
+            if (peek_n > 0) log_hex("usb_recv_version: peek", peek, peek_n);
             return -1;
         }
         uint32_t body_len = packet_len - (uint32_t)sizeof(hdr);
         if (protocol != MUX_PROTO_VERSION) {
-            LOGE("usb_recv_version: protocol trước version không hợp lệ=%u", protocol);
+            LOGE("usb_recv_version: protocol không hợp lệ=%u (mong đợi VERSION=0). "
+                 "Có thể iPhone đang dùng binary plist v2 protocol", protocol);
             if (usb_drain_bytes(body_len, 2000) < 0) return -1;
             continue;
         }
 
         mux_version_body_t body;
-        if (usb_read_exact(&body, sizeof(body), VERSION_TIMEOUT_MS) != (int)sizeof(body))
+        if (usb_read_exact(&body, sizeof(body), VERSION_TIMEOUT_MS) != (int)sizeof(body)) {
+            LOGE("usb_recv_version: không đọc đủ version body");
             return -1;
-        if (body_len > sizeof(body) && usb_drain_bytes(body_len - sizeof(body), 2000) < 0)
+        }
+        if (body_len > sizeof(body) && usb_drain_bytes(body_len - sizeof(body), 2000) < 0) {
+            LOGE("usb_recv_version: drain extra body thất bại");
             return -1;
+        }
 
         uint32_t major = ntohl(body.major);
         uint32_t minor = ntohl(body.minor);
         LOGI("usb_recv_version: iPhone mux version %u.%u (legacy header 8-byte)", major, minor);
         if (major < 2) {
-            LOGE("usb_recv_version: iPhone trả version %u, không hỗ trợ mux v2", major);
+            LOGE("usb_recv_version: iPhone trả version %u.%u, không hỗ trợ mux v2. "
+                 "Thiết bị quá cũ hoặc đang ở Recovery Mode?", major, minor);
             return -1;
         }
         return 0;
@@ -592,22 +659,57 @@ static int usb_send_setup(void) {
 bool usbmux_version_exchange(void) {
     if (g_version_done) return true;
 
+    /*
+     * FIX v33 (Critical): Luôn clear endpoint halt + flush IN endpoint
+     * TRƯỚC MỖI lần thử VERSION — kể cả lần đầu.
+     *
+     * Nguyên nhân gốc rễ của "version exchange thất bại sau 5 lần thử":
+     *   Sau khi libusb_wrap_sys_device() nhận Android fd, bulk endpoint
+     *   THƯỜNG ở trạng thái STALL (DATA0/DATA1 PID mismatch do Android
+     *   USB stack để lại toggle state từ session trước, hoặc do clear_halt
+     *   chưa được gọi). Khi gửi VERSION vào endpoint đang STALL, libusb
+     *   báo "thành công" (transferred=length) nhưng iPhone KHÔNG nhận
+     *   được byte nào → iPhone không bao giờ phản hồi → timeout.
+     *
+     *   Lần thử đầu tiên (attempt=0) trong code cũ KHÔNG clear/flush →
+     *   luôn fail. Code cũ chỉ clear/flush từ attempt=1 trở đi, nhưng
+     *   lúc đó iPhone đã ở trạng thái "endpoint halted xong" và cần
+     *   thêm USB reset mới nhận lại packet.
+     *
+     * Fix: gọi clear_halt + flush_in NGAY TẠI ĐẦU mỗi attempt, bao
+     * gồm attempt 0. Thêm delay 200ms sau clear_halt để USB stack kịp
+     * propagate STALL clearance xuống device.
+     */
     for (int attempt = 0; attempt < 5; attempt++) {
         if (attempt > 0) {
             LOGI("usbmux_version_exchange: retry %d/5", attempt + 1);
-            usb_bridge_clear_endpoints_halt();
-            usb_bridge_flush_in(8, 200);
-            usleep(1000 * 1000);
+            usleep(800 * 1000);  /* 800ms chờ trước retry */
         }
-        if (usb_send_version() < 0) continue;
-        if (usb_recv_version() < 0) continue;
-        if (usb_send_setup() < 0) continue;
+
+        /* Luôn clear endpoint halt + flush stale data trước mỗi attempt */
+        usb_bridge_clear_endpoints_halt();
+        usb_bridge_flush_in(8, 150);
+        usleep(200 * 1000);  /* 200ms cho USB stack propagate clear_halt */
+
+        if (usb_send_version() < 0) {
+            LOGE("usbmux_version_exchange: usb_send_version() thất bại (attempt %d)", attempt + 1);
+            continue;
+        }
+        if (usb_recv_version() < 0) {
+            LOGE("usbmux_version_exchange: usb_recv_version() thất bại (attempt %d)", attempt + 1);
+            continue;
+        }
+        if (usb_send_setup() < 0) {
+            LOGE("usbmux_version_exchange: usb_send_setup() thất bại (attempt %d)", attempt + 1);
+            continue;
+        }
 
         g_version_done = 1;
         LOGI("usbmux_version_exchange: mux v2 + SETUP OK (attempt %d)", attempt + 1);
         return true;
     }
-    LOGE("usbmux_version_exchange: thất bại sau 5 lần thử");
+    LOGE("usbmux_version_exchange: thất bại sau 5 lần thử — "
+         "kiểm tra cáp data, màn hình iPhone đã mở khóa, đã bấm Trust chưa");
     return false;
 }
 

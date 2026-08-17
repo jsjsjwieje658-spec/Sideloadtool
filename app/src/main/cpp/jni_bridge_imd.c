@@ -224,6 +224,36 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
     emit_log("[usbmux] Đã giữ raw USB fd; trì hoãn version exchange đến lúc Connect lockdown...");
 
     /*
+     * FIX v33: Eager version exchange "best-effort" ngay sau khi USB bridge
+     * sẵn sàng — KHÔNG bắt buộc phải thành công ở đây.
+     *
+     * Lý do thêm bước eager này:
+     *   - Upstream usbmuxd gửi VERSION NGAY khi device_add() được gọi (ngay
+     *     sau USB enumeration). iPhone có "mux session window" — nếu không
+     *     nhận được VERSION trong vài giây đầu, iPhone có thể vào trạng thái
+     *     "idle" và bỏ qua VERSION packet gửi sau đó.
+     *   - Code cũ CHỈ gửi VERSION khi Connect tới socket (lazy) → quá muộn
+     *     → iPhone đã idle → VERSION không được phản hồi → fail 5/5.
+     *   - Eager attempt ở đây cho iPhone cơ hội nhận VERSION sớm. Nếu fail,
+     *     không sao — lazy attempt trong do_usb_v1_connect() sẽ retry với
+     *     clear_halt đã được apply từ Fix v33.
+     *
+     * Quan trọng:KHÔNG return false nếu eager fail — vẫn cho phép server
+     * start và để lazy attempt xử lý.
+     */
+    {
+        emit_log("[usbmux] Eager version exchange (best-effort, non-blocking)...");
+        bool eager_ok = usbmux_version_exchange();
+        if (eager_ok) {
+            emit_log("[usbmux] ✅ Eager version exchange OK — iPhone đã sẵn sàng mux session");
+        } else {
+            emit_log("[usbmux] ⚠️ Eager version exchange fail — sẽ retry lazily khi Connect tới");
+            /* Reset state để lazy attempt trong do_usb_v1_connect() có cơ hội retry */
+            usbmuxd_server_reset_version_state();
+        }
+    }
+
+    /*
      * Bước 2: Khởi động usbmuxd server nội bộ.
      *
      * Khi chưa mở lockdown, chỉ dùng nhãn transport `pending-device`;
