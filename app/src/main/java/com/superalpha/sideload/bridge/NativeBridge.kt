@@ -86,6 +86,18 @@ class NativeBridge(private val context: Context) {
         @JvmStatic
         fun onNativeBulkWrite(data: ByteArray, timeoutMs: Int): Int {
             return try {
+                /*
+                 * FIX v40: Đảm bảo interface đã claim trước mỗi bulk_write.
+                 * Nếu chưa claim (vd: vừa switch sang Android mode), gọi
+                 * prepareForBulkTransfers() lần đầu. Các lần sau sẽ skip (idempotent).
+                 */
+                if (!UsbTransport.isInterfaceClaimed()) {
+                    Log.i(TAG, "onNativeBulkWrite: interface chưa claim — gọi prepareForBulkTransfers()")
+                    if (!UsbTransport.prepareForBulkTransfers()) {
+                        Log.e(TAG, "onNativeBulkWrite: prepareForBulkTransfers() thất bại — không thể bulk_write")
+                        return -1
+                    }
+                }
                 UsbTransport.nativeBulkWrite(data, timeoutMs)
             } catch (e: Exception) {
                 Log.e(TAG, "onNativeBulkWrite exception: ${e.message}")
@@ -96,6 +108,14 @@ class NativeBridge(private val context: Context) {
         @JvmStatic
         fun onNativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
             return try {
+                /* FIX v40: Tương tự onNativeBulkWrite — đảm bảo interface đã claim. */
+                if (!UsbTransport.isInterfaceClaimed()) {
+                    Log.i(TAG, "onNativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers()")
+                    if (!UsbTransport.prepareForBulkTransfers()) {
+                        Log.e(TAG, "onNativeBulkRead: prepareForBulkTransfers() thất bại — không thể bulk_read")
+                        return -1
+                    }
+                }
                 UsbTransport.nativeBulkRead(buf, timeoutMs)
             } catch (e: Exception) {
                 Log.e(TAG, "onNativeBulkRead exception: ${e.message}")

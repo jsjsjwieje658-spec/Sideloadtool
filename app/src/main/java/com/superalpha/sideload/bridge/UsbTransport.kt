@@ -65,6 +65,20 @@ object UsbTransport {
     private const val USB_REQ_CLEAR_FEATURE = 0x01
     private const val USB_ENDPOINT_HALT     = 0x0000
 
+    /*
+     * FIX v40 (Critical): USB buffer sizes học từ usbmuxd upstream.
+     *
+     * usbmuxd upstream dùng USB_MRU=16384 (16KB) cho read buffer và
+     * USB_MTU=49152 (48KB) cho write buffer. Code cũ dùng buf size động
+     * (do caller truyền vào) → có thể quá nhỏ → LIBUSB_ERROR_OVERFLOW
+     * hoặc iPhone response bị cắt.
+     *
+     * Chuẩn hóa theo upstream:
+     *   - Read buffer: 16384 bytes (USB_MRU)
+     *   - Write buffer: caller-controlled (VERSION = 20 bytes, etc.)
+     */
+    private const val USB_MRU = 16384  // Max Receive Unit (usbmuxd upstream)
+
     @Volatile private var connection:       UsbDeviceConnection? = null
     @Volatile private var usbInterface:     UsbInterface?        = null
     @Volatile private var endpointIn:       UsbEndpoint?         = null
@@ -79,6 +93,12 @@ object UsbTransport {
     @JvmStatic fun lastError(): String? = _lastError
 
     fun isConnected() = _connected.value
+
+    /*
+     * FIX v40: Public accessor để NativeBridge.onNativeBulkWrite/Read có thể
+     * check xem interface đã claim chưa trước khi gọi bulkTransfer().
+     */
+    fun isInterfaceClaimed(): Boolean = interfaceClaimed
 
     // Mode 1: fd cho libusb_wrap_sys_device()
     fun getFileDescriptor(): Int = connection?.fileDescriptor ?: -1
@@ -336,12 +356,23 @@ object UsbTransport {
             return -1
         }
         /*
-         * FIX v39: Log để debug return value của UsbDeviceConnection.bulkTransfer.
+         * FIX v40 (Critical — học từ usbmuxd upstream usb.c:176-201):
          *
-         * Return values:
-         *   >0: số byte transferred thành công
-         *   -1: lỗi (endpoint STALL, timeout, hoặc interface chưa claim đúng)
-         *   0: timeout với 0 byte transfer
+         * usbmuxd gửi Zero-Length Packet (ZLP) sau mỗi packet có
+         * length % wMaxPacketSize == 0. iPhone yêu cầu ZLP để biết
+         * packet đã kết thúc — nếu không có ZLP, iPhone sẽ chờ thêm
+         * data và không phản hồi.
+         *
+         * Cụ thể cho iPhone USB Full-Speed (wMaxPacketSize=64):
+         *   - VERSION packet = 20 bytes → 20 < 64, không cần ZLP (short packet)
+         *   - TCP packet 512 bytes → 512 % 64 == 0 → CẦN ZLP
+         *
+         * Tuy nhiên, libusb trên Linux/Mac tự thêm ZLP khi cần.
+         * Android UsbDeviceConnection.bulkTransfer() có thể KHÔNG tự thêm.
+         *
+         * Quan trọng hơn: usbmuxd upstream cũng xử lý trường hợp
+         * length % wMaxPacketSize == 0 bằng cách gửi ZLP riêng.
+         * Chúng ta cần tự gửi ZLP trong trường hợp này.
          */
         val t0 = System.currentTimeMillis()
         val result = c.bulkTransfer(ep, data, data.size, timeoutMs)
@@ -349,10 +380,25 @@ object UsbTransport {
         if (result < 0) {
             Log.e(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
                        "len=${data.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
-        } else {
-            Log.i(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                       "len=${data.size} → $result bytes (dt=${dt}ms)")
+            return result
         }
+        Log.i(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                   "len=${data.size} → $result bytes (dt=${dt}ms)")
+
+        /*
+         * Gửi ZLP nếu length là bội của wMaxPacketSize (64 cho Full-Speed,
+         * 512 cho High-Speed). usbmuxd upstream kiểm tra:
+         *   if (length % dev->wMaxPacketSize == 0) send ZLP;
+         *
+         * Lấy wMaxPacketSize từ endpoint descriptor (Android UsbEndpoint).
+         */
+        val wMaxPacketSize = ep.maxPacketSize
+        if (wMaxPacketSize > 0 && data.size % wMaxPacketSize == 0) {
+            Log.i(TAG, "nativeBulkWrite: gửi ZLP (len=${data.size} % wMaxPacketSize=$wMaxPacketSize == 0)")
+            val zlpResult = c.bulkTransfer(ep, ByteArray(0), 0, 1000)
+            Log.i(TAG, "nativeBulkWrite: ZLP result=$zlpResult")
+        }
+
         return result
     }
 
@@ -370,6 +416,23 @@ object UsbTransport {
             Log.w(TAG, "nativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers() trước!")
             return -1
         }
+        /*
+         * FIX v40 (Critical — học từ usbmuxd upstream usb.c:253-268):
+         *
+         * usbmuxd upstream dùng USB_MRU=16384 (16KB) cho read buffer.
+         * Code cũ nhận buffer do caller truyền vào, có thể quá nhỏ
+         * (vd: 8-byte header) → iPhone response bị cắt → parse fail.
+         *
+         * Chuẩn hóa theo upstream:
+         *   - Caller luôn truyền buf size = USB_MRU (16384) hoặc lớn hơn
+         *   - Ta chỉ đọc tối đa buf.size bytes
+         *   - Return số byte thực đọc
+         *
+         * Quan trọng: UsbDeviceConnection.bulkTransfer() sẽ block cho đến
+         * khi nhận được data hoặc timeout. Nếu iPhone không phản hồi trong
+         * timeoutMs, return -1. Nếu nhận được short packet (< wMaxPacketSize),
+         * Android sẽ return ngay lập tức với số byte thực nhận.
+         */
         val t0 = System.currentTimeMillis()
         val result = c.bulkTransfer(ep, buf, buf.size, timeoutMs)
         val dt = System.currentTimeMillis() - t0

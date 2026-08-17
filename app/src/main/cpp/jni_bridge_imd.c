@@ -162,13 +162,13 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v39 (2026-08-17)");
+    emit_log("[jni]   SideloadTool native v40 (2026-08-17)");
     emit_log("[jni]   Fixes:");
     emit_log("[jni]     v33 eager+clear, v34 log_hex overflow,");
     emit_log("[jni]     v35 libusb error codes, v36 UI log forwarding,");
-    emit_log("[jni]     v37 endpoints from Kotlin (bypass discover),");
-    emit_log("[jni]     v38 Android JNI bulk transport fallback,");
-    emit_log("[jni]     v39 only switch Android mode if libusb claim fail");
+    emit_log("[jni]     v37 endpoints from Kotlin, v38 Android JNI fallback,");
+    emit_log("[jni]     v39 don't force Android mode,");
+    emit_log("[jni]     v40 ZLP + auto prepareForBulkTransfers + isInterfaceClaimed");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
