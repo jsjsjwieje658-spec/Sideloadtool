@@ -610,9 +610,19 @@ int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
      * FIX v38: Nếu đang ở Android JNI transport mode, route qua JNI callbacks
      * thay vì libusb_bulk_transfer. Điều này xảy ra khi libusb_claim_interface()
      * đã fail với NOT_FOUND — libusb_bulk_transfer cũng sẽ fail với IO.
+     *
+     * FIX v41: Log return value để debug xem packet thực sự được gửi đi không.
      */
     if (g_use_android) {
-        return call_android_bulk_write(buf, len, timeout ? timeout : 5000);
+        int n = call_android_bulk_write(buf, len, timeout ? timeout : 5000);
+        if (n > 0) {
+            LOGI("bulk_write (android): sent %d/%d bytes", n, len);
+        } else if (n == 0) {
+            LOGE("bulk_write (android): sent 0 bytes (timeout?)");
+        } else {
+            LOGE("bulk_write (android): call_android_bulk_write returned %d", n);
+        }
+        return n;
     }
 
     if (!g_handle || !g_ep_out) {
@@ -692,9 +702,31 @@ int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
 int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
     /*
      * FIX v38: Route qua Android JNI transport nếu đã enable.
+     *
+     * FIX v41: Thêm log khi Android bulk_read trả data — cần để debug
+     * xem có phải loopback (TX packet bị echo vào RX) hay không.
      */
     if (g_use_android) {
-        return call_android_bulk_read(buf, len, timeout ? timeout : 10000);
+        int n = call_android_bulk_read(buf, len, timeout ? timeout : 10000);
+        if (n > 0) {
+            /* Log data nhận được để debug loopback */
+            char hex[32 * 3 + 8];
+            int off = 0;
+            int show = n < 32 ? n : 32;
+            for (int i = 0; i < show; i++) {
+                int written = snprintf(hex + off, sizeof(hex) - off,
+                                        "%02x ", ((const uint8_t *)buf)[i]);
+                if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
+                off += written;
+            }
+            LOGI("bulk_read (android): got %d bytes (requested %d): %s%s",
+                 n, len, hex, n > 32 ? "..." : "");
+        } else if (n == 0) {
+            LOGI("bulk_read (android): timeout, 0 bytes");
+        } else {
+            LOGE("bulk_read (android): call_android_bulk_read returned %d", n);
+        }
+        return n;
     }
 
     if (!g_handle || !g_ep_in) {
@@ -754,8 +786,46 @@ int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
 
 /* ════════════════════════════════════════════════════════════════════════
  * usb_bridge_flush_in — drain stale data, tiếp tục sau PIPE
+ *
+ * FIX v41: Khi g_use_android = 1, dùng call_android_bulk_read thay vì
+ * libusb_bulk_transfer để respect Android JNI transport mode.
+ *
+ * FIX v41 (Critical): Hex dump drained bytes để debug loopback issue.
+ * Trong log v40 user, flush_in drained 20 bytes = EXACTLY VERSION packet
+ * mà chúng ta vừa gửi → có thể là TX packet bị looped back vào RX queue
+ * do Android USB HAL hoặc USB controller quirk. Hex dump sẽ xác nhận.
  * ════════════════════════════════════════════════════════════════════════ */
 void usb_bridge_flush_in(int max_packets, int timeout_ms) {
+    if (g_use_android) {
+        /* Android mode — dùng call_android_bulk_read */
+        uint8_t *buf = malloc(65536);
+        if (!buf) return;
+        int drained = 0;
+        for (int i = 0; i < max_packets; i++) {
+            int n = call_android_bulk_read(buf, 65536, (unsigned int)timeout_ms);
+            if (n < 0) break;
+            if (n == 0) break;  /* timeout */
+            drained += n;
+            LOGI("flush_in: drained %d bytes (packet %d)", n, i+1);
+            /* FIX v41: Hex dump first 32 bytes để xem có phải loopback không */
+            if (n > 0 && i == 0) {
+                char hex[32 * 3 + 8];
+                int off = 0;
+                int show = n < 32 ? n : 32;
+                for (int j = 0; j < show; j++) {
+                    int written = snprintf(hex + off, sizeof(hex) - off, "%02x ", buf[j]);
+                    if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
+                    off += written;
+                }
+                LOGI("flush_in: hex dump (first %d bytes): %s%s",
+                     show, hex, n > 32 ? "..." : "");
+            }
+        }
+        free(buf);
+        LOGI("flush_in: tổng %d bytes drained (Android mode)", drained);
+        return;
+    }
+
     if (!g_handle || !g_ep_in) return;
 
     uint8_t *buf = malloc(65536);
@@ -773,13 +843,26 @@ void usb_bridge_flush_in(int max_packets, int timeout_ms) {
             libusb_clear_halt(g_handle, g_ep_in);
             usleep(50 * 1000);
             if (++pipe_count >= 3) break;
-            continue;  /* FIX: tiếp tục drain sau PIPE, không break ngay */
+            continue;
         }
         if (r != 0) break;
         if (transferred > 0) {
             drained += transferred;
             pipe_count = 0;
             LOGI("flush_in: drained %d bytes (packet %d)", transferred, i+1);
+            /* FIX v41: Hex dump first packet để debug */
+            if (i == 0) {
+                char hex[32 * 3 + 8];
+                int off = 0;
+                int show = transferred < 32 ? transferred : 32;
+                for (int j = 0; j < show; j++) {
+                    int written = snprintf(hex + off, sizeof(hex) - off, "%02x ", buf[j]);
+                    if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
+                    off += written;
+                }
+                LOGI("flush_in: hex dump (first %d bytes): %s%s",
+                     show, hex, transferred > 32 ? "..." : "");
+            }
         } else {
             break;
         }
