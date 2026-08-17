@@ -87,6 +87,26 @@ object UsbTransport {
     /** FIX UDID: Lấy UDID thật từ Android UsbDevice.serialNumber */
     fun getSerialNumber(): String? = currentDevice?.serialNumber
 
+    /*
+     * FIX v37: Expose endpoint addresses + interface number cho native layer.
+     *
+     * Trước đây, native layer discover_apple_endpoints() tự tìm interface
+     * Apple AMDI qua libusb_get_active_config_descriptor(). Nhưng khi dùng
+     * libusb_wrap_sys_device(fd) với Android fd, descriptor access không
+     * đáng tin — discovery thường fail → fallback endpoint mặc định
+     * (0x85/0x04) → libusb_claim_interface() KHÔNG được gọi →
+     * LIBUSB_ERROR_IO trên mọi bulk_transfer.
+     *
+     * Kotlin đã có sẵn thông tin này từ findUsbmuxIface() → truyền thẳng
+     * xuống native để bypass discovery.
+     */
+    /** Trả về endpoint IN address (vd: 0x85) hoặc 0 nếu chưa open */
+    fun getEndpointInAddress(): Int = endpointIn?.address?.toInt() ?: 0
+    /** Trả về endpoint OUT address (vd: 0x04) hoặc 0 nếu chưa open */
+    fun getEndpointOutAddress(): Int = endpointOut?.address?.toInt() ?: 0
+    /** Trả về interface number (vd: 0) hoặc -1 nếu chưa open */
+    fun getInterfaceId(): Int = usbInterface?.id ?: -1
+
     // ── Tìm thiết bị Apple ────────────────────────────────────────────────────
     fun findAppleDevice(usbManager: UsbManager): UsbDevice? =
         usbManager.deviceList.values.firstOrNull { it.vendorId == VENDOR_ID_APPLE }

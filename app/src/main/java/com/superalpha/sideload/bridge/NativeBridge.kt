@@ -72,12 +72,22 @@ class NativeBridge(private val context: Context) {
     }
 
     // ── setUsbFd — truyền Android USB fd vào libusb (Mode 1 only) ─────────────
+    /*
+     * FIX v37: Truyền epIn/epOut/ifaceNum từ Kotlin xuống native.
+     *
+     * Kotlin đã có sẵn thông tin này từ UsbTransport.findUsbmuxIface().
+     * Native layer không cần discover lại (thường fail khi dùng
+     * libusb_wrap_sys_device() với Android fd).
+     */
     suspend fun setUsbFd(fd: Int, vendorId: Int, productId: Int): Boolean =
         withContext(Dispatchers.IO) {
             try {
-                NativeLog.emit("[bridge] libusb_wrap_sys_device(fd=$fd vid=0x${vendorId.toString(16)})...")
+                val epIn    = UsbTransport.getEndpointInAddress()
+                val epOut   = UsbTransport.getEndpointOutAddress()
+                val ifaceId = UsbTransport.getInterfaceId()
+                NativeLog.emit("[bridge] libusb_wrap_sys_device(fd=$fd vid=0x${vendorId.toString(16)} ep_in=0x${epIn.toString(16)} ep_out=0x${epOut.toString(16)} iface=$ifaceId)...")
                 val udid = UsbTransport.getSerialNumber()
-                val ok = nativeSetUsbFd(fd, vendorId, productId, udid)
+                val ok = nativeSetUsbFd(fd, vendorId, productId, udid, epIn, epOut, ifaceId)
                 if (ok) NativeLog.emit("[bridge] ✅ libusb sẵn sàng")
                 else    NativeLog.emit("[bridge] ❌ nativeSetUsbFd thất bại")
                 ok
@@ -137,7 +147,15 @@ class NativeBridge(private val context: Context) {
                         /* Một Android fd chỉ được wrap một lần trong một USB session.
                          * termux-usbmuxd giữ nguyên descriptor và daemon; không retry
                          * bằng cách close/re-wrap cùng fd. */
-                        val fdOk = nativeSetUsbFd(fd, vid, pid, udid)
+                        /*
+                         * FIX v37: Truyền endpoint addresses + interface id từ
+                         * Kotlin xuống native để bypass discover_apple_endpoints()
+                         * (thường fail với Android fd).
+                         */
+                        val epIn    = UsbTransport.getEndpointInAddress()
+                        val epOut   = UsbTransport.getEndpointOutAddress()
+                        val ifaceId = UsbTransport.getInterfaceId()
+                        val fdOk = nativeSetUsbFd(fd, vid, pid, udid, epIn, epOut, ifaceId)
                         if (!fdOk) {
                             NativeLog.emit("[bridge] ❌ libusb/usbmux attach thất bại trên USB fd hiện tại")
                             NativeLog.emit("[bridge] 💡 Không claim interface fallback; mở lại USB session rồi thử lại")
@@ -264,7 +282,16 @@ class NativeBridge(private val context: Context) {
 
     // ── JNI declarations ───────────────────────────────────────────────────────
     private external fun nativeInit(filesDir: String)
-    private external fun nativeSetUsbFd(fd: Int, vendorId: Int, productId: Int, udid: String?): Boolean
+    /*
+     * FIX v37: nativeSetUsbFd giờ nhận thêm epIn, epOut, ifaceNum từ Kotlin.
+     * Điều này cho phép native layer bypass discover_apple_endpoints() —
+     * function này thường fail khi dùng libusb_wrap_sys_device() với fd
+     * Android vì descriptor access không đáng tin.
+     */
+    private external fun nativeSetUsbFd(
+        fd: Int, vendorId: Int, productId: Int, udid: String?,
+        epIn: Int, epOut: Int, ifaceNum: Int
+    ): Boolean
     private external fun nativeConnect(): Boolean
     private external fun nativePair(): Boolean
     private external fun nativeSideload(ipaPath: String): Boolean

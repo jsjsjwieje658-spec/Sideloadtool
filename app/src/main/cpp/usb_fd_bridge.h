@@ -41,6 +41,31 @@
  */
 bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id);
 
+/*
+ * FIX v37: usb_bridge_init_from_fd2 — nhận endpoint addresses + interface id
+ * trực tiếp từ Kotlin (đã discover qua UsbInterface API).
+ *
+ * Lý do: khi dùng libusb_wrap_sys_device(fd) với Android fd, hàm
+ * libusb_get_active_config_descriptor() thường fail (descriptor access
+ * không đáng tin với wrapped sys device). Khi đó discover_apple_endpoints()
+ * fallback về endpoint mặc định (0x85/0x04) NHƯNG không gọi
+ * libusb_claim_interface() → mọi bulk_transfer fail với LIBUSB_ERROR_IO.
+ *
+ * Giải pháp: Kotlin đã có endpoint addresses + interface number từ
+ * UsbInterface/UsbEndpoint API. Truyền thẳng xuống native → native
+ * gọi libusb_claim_interface(iface_num) trực tiếp, bỏ qua discovery.
+ *
+ * @param fd          Android USB fd (từ UsbDeviceConnection.getFileDescriptor())
+ * @param vendor_id   USB vendor ID (vd: 0x05ac cho Apple)
+ * @param product_id  USB product ID (vd: 0x12a8 cho iPhone)
+ * @param ep_in       Endpoint IN address (vd: 0x85) — 0 nếu không biết
+ * @param ep_out      Endpoint OUT address (vd: 0x04) — 0 nếu không biết
+ * @param iface_num   Interface number (vd: 0) — -1 nếu không biết
+ * @return true nếu init thành công, false nếu thất bại
+ */
+bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id,
+                              int ep_in, int ep_out, int iface_num);
+
 uint8_t usb_bridge_ep_in(void);
 uint8_t usb_bridge_ep_out(void);
 

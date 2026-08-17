@@ -155,9 +155,11 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      * Khi gặp lỗi, user nhìn lên đầu log sẽ biết ngay phiên bản nào đang chạy.
      */
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v36 (2026-08-17)");
-    emit_log("[jni]   Fixes: v33 eager+clear, v34 log_hex overflow,");
-    emit_log("[jni]          v35 libusb error codes, v36 UI log forwarding");
+    emit_log("[jni]   SideloadTool native v37 (2026-08-17)");
+    emit_log("[jni]   Fixes:");
+    emit_log("[jni]     v33 eager+clear, v34 log_hex overflow,");
+    emit_log("[jni]     v35 libusb error codes, v36 UI log forwarding,");
+    emit_log("[jni]     v37 endpoints from Kotlin (bypass discover_apple_endpoints)");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -171,11 +173,14 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
  *   1. usb_bridge_init_from_fd() → libusb handle + ep_in/ep_out
  *   2. usbmuxd_server_start()    → Unix socket + server thread
  *   (Không restart server sau khi biết UDID — dùng update_udid() thay thế)
+ *
+ * FIX v37: Nhận thêm epIn, epOut, ifaceNum từ Kotlin để bypass
+ * discover_apple_endpoints() — function này thường fail với Android fd.
  */
 JNIEXPORT jboolean JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
         JNIEnv *env, jobject obj, jint fd, jint vendorId, jint productId,
-        jstring udidHint) {
+        jstring udidHint, jint epIn, jint epOut, jint ifaceNum) {
     (void)obj;
 
     /* nativeSetUsbFd() bắt đầu một USB session mới. Dọn toàn bộ state cũ
@@ -200,12 +205,15 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[usb] libusb_wrap_sys_device(fd=%d, vid=0x%04x, pid=0x%04x)",
-             (int)fd, (int)vendorId, (int)productId);
+             "[usb] libusb_wrap_sys_device(fd=%d, vid=0x%04x, pid=0x%04x, "
+             "ep_in=0x%02x, ep_out=0x%02x, iface=%d)",
+             (int)fd, (int)vendorId, (int)productId,
+             (int)epIn, (int)epOut, (int)ifaceNum);
     emit_log(buf);
 
-    /* Bước 1: Khởi tạo libusb với Android USB fd */
-    bool ok = usb_bridge_init_from_fd((int)fd, (int)vendorId, (int)productId);
+    /* Bước 1: Khởi tạo libusb với Android USB fd + endpoints từ Kotlin */
+    bool ok = usb_bridge_init_from_fd2((int)fd, (int)vendorId, (int)productId,
+                                       (int)epIn, (int)epOut, (int)ifaceNum);
     if (!ok) {
         emit_log("[usb] \u274c libusb_wrap_sys_device() thất bại — kiểm tra quyền USB Host");
         return JNI_FALSE;

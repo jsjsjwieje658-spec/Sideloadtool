@@ -219,20 +219,7 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
 
     LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
 
-    /* FIX ROOT CAUSE #3: KHÔNG gọi libusb_reset_device().
-     *
-     * libusb_reset_device() gây USB bus reset → iPhone ngắt kết nối khỏi
-     * Android USB host → Android nhận USB_DEVICE_DETACHED event → Android
-     * huỷ UsbDeviceConnection → fd không còn hợp lệ → mọi libusb operation
-     * sau đó thất bại với LIBUSB_ERROR_NO_DEVICE hoặc LIBUSB_ERROR_IO.
-     *
-     * termux-usbmuxd KHÔNG cần reset vì nó nhận fd SẠCH (UsbAPI.java chỉ
-     * openDevice, không claim). Sideloadtool v27+ cũng dùng fd sạch
-     * (UsbTransport.open() không claimInterface nữa). Không cần reset.
-     *
-     * Thay thế: dùng clear_halt + flush sau khi discover endpoints — đủ để
-     * xóa trạng thái STALL mà không gây re-enumeration.
-     */
+    /* FIX ROOT CAUSE #3: KHÔNG gọi libusb_reset_device(). */
     LOGI("usb_bridge_init: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3 — gây re-enum)");
 
     if (!discover_apple_endpoints()) {
@@ -244,19 +231,158 @@ bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
         return false;
     }
 
-    /*
-     * Giữ nguyên endpoint sau khi wrap fd, giống termux-usbmuxd.
-     * Không gửi CLEAR_FEATURE/clear_halt chủ động trước phiên mux đầu tiên:
-     * Android UsbDeviceConnection đã cấp một fd mới, còn usbmuxd upstream sẽ
-     * tự xử lý stall khi bulk transfer thực tế báo PIPE. Việc phát sinh thêm
-     * control transfer trước khi mở lockdown có thể làm iPhone bỏ qua phiên
-     * mux đầu tiên trên một số bản iOS.
-     */
     LOGI("usb_bridge_init: giữ endpoint nguyên trạng; clear_halt chỉ khi transfer PIPE");
 
     g_initialized = 1;
     LOGI("usb_bridge_init: ✅ sẵn sàng — ep_in=0x%02x ep_out=0x%02x",
          g_ep_in, g_ep_out);
+    return true;
+}
+
+/*
+ * ════════════════════════════════════════════════════════════════════════
+ * usb_bridge_init_from_fd2 — FIX v37
+ *
+ * Tương tự usb_bridge_init_from_fd() nhưng nhận endpoint addresses +
+ * interface number trực tiếp từ Kotlin (đã discover qua UsbInterface API).
+ *
+ * Lý do (xem log user):
+ *   discover_apple_endpoints() fail với Android fd vì
+ *   libusb_get_active_config_descriptor() không trả descriptor đầy đủ
+ *   cho wrapped sys device → fallback endpoint mặc định (0x85/0x04)
+ *   NHƯNG libusb_claim_interface() KHÔNG được gọi → bulk_transfer
+ *   trả LIBUSB_ERROR_IO, clear_halt trả LIBUSB_ERROR_NOT_FOUND.
+ *
+ * Giải pháp: Kotlin đã có endpoint addresses + interface number từ
+ * UsbTransport.findUsbmuxIface(). Truyền thẳng xuống native.
+ *   1. libusb_wrap_sys_device(fd)
+ *   2. Nếu ep_in/ep_out/iface_num được cung cấp (≠ 0/-1) → DÙNG TRỰC TIẾP
+ *      và gọi libusb_claim_interface(iface_num)
+ *   3. Nếu không được cung cấp → fallback gọi discover_apple_endpoints()
+ *      như cũ
+ *   4. clear_halt() trên cả 2 endpoints
+ * ════════════════════════════════════════════════════════════════════════
+ */
+bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id,
+                              int ep_in, int ep_out, int iface_num) {
+    (void)vendor_id;
+
+    if (g_initialized) {
+        LOGI("usb_bridge_init2: đã init — reset trước");
+        usb_bridge_close();
+    }
+
+    int r = libusb_init(&g_ctx);
+    if (r != 0) {
+        LOGE("libusb_init() err=%d (%s)", r, libusb_error_name(r));
+        return false;
+    }
+
+    libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
+
+    r = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_handle);
+    if (r != 0) {
+        LOGE("libusb_wrap_sys_device(fd=%d, pid=0x%04x) err=%d (%s)",
+             fd, product_id, r, libusb_error_name(r));
+        libusb_exit(g_ctx);
+        g_ctx = NULL;
+        return false;
+    }
+
+    LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
+    LOGI("usb_bridge_init2: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3)");
+
+    /*
+     * FIX v37: Nếu caller cung cấp endpoint addresses + interface number,
+     * dùng trực tiếp thay vì discover. Đây là path chính trên Android.
+     */
+    bool have_endpoints = (ep_in != 0 && ep_out != 0 && iface_num >= 0);
+    if (have_endpoints) {
+        LOGI("usb_bridge_init2: dùng endpoint từ Kotlin: "
+             "ep_in=0x%02x ep_out=0x%02x iface=%d",
+             (uint8_t)ep_in, (uint8_t)ep_out, iface_num);
+
+        g_ep_in     = (uint8_t)ep_in;
+        g_ep_out    = (uint8_t)ep_out;
+        g_iface_num = iface_num;
+
+        /*
+         * CLAIM INTERFACE — bắt buộc cho bulk_transfer hoạt động.
+         *
+         * Trên Android với wrapped fd:
+         *   - LIBUSB_SUCCESS (0): fd sạch, libusb claim được
+         *   - LIBUSB_ERROR_BUSY (-6): Android đã claim → share fd, vẫn OK
+         *   - LIBUSB_ERROR_NOT_SUPPORTED (-12): Android kernel không hỗ trợ
+         *     claim qua wrapped fd → vẫn thử bulk_transfer, có thể hoạt động
+         *
+         * Nếu claim fail với error khác → thử detach kernel driver (Linux only)
+         * hoặc return false.
+         */
+        int cr = libusb_claim_interface(g_handle, iface_num);
+        if (cr == 0) {
+            g_iface_claimed = 1;
+            LOGI("usb_bridge_init2: ✅ interface %d claimed successfully (fd sạch)",
+                 iface_num);
+        } else if (cr == LIBUSB_ERROR_BUSY) {
+            LOGI("usb_bridge_init2: interface %d BUSY (Android pre-claimed) — share fd, tiếp tục",
+                 iface_num);
+            /* Đánh dấu claimed để release sau nếu cần */
+            g_iface_claimed = 0;
+        } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
+            LOGI("usb_bridge_init2: interface %d NOT_SUPPORTED — tiếp tục (thường trên Android)",
+                 iface_num);
+            g_iface_claimed = 0;
+        } else if (cr == LIBUSB_ERROR_NOT_FOUND) {
+            /*
+             * FIX v37: NOT_FOUND thường xảy ra khi descriptor access không
+             * hoạt động với wrapped fd (đây là tình huống đang gặp).
+             * Endpoint addresses đã được set từ Kotlin, nên chỉ cần tiếp
+             * tục — bulk_transfer có thể vẫn hoạt động qua shared fd.
+             */
+            LOGI("usb_bridge_init2: libusb_claim_interface(%d) NOT_FOUND — "
+                 "endpoint đã set từ Kotlin, tiếp tục bulk_transfer qua shared fd",
+                 iface_num);
+            g_iface_claimed = 0;
+        } else {
+            LOGE("usb_bridge_init2: libusb_claim_interface(%d) err=%d (%s) — tiếp tục anyway",
+                 iface_num, cr, libusb_error_name(cr));
+            g_iface_claimed = 0;
+        }
+
+        /* Clear halt trên cả 2 endpoints để đảm bảo sạch */
+        if (g_ep_out) {
+            int hr = libusb_clear_halt(g_handle, g_ep_out);
+            LOGI("usb_bridge_init2: clear_halt ep_out=0x%02x → %d (%s)",
+                 g_ep_out, hr, libusb_error_name(hr));
+            if (hr == 0 || hr == LIBUSB_ERROR_NOT_FOUND) {
+                /* NOT_FOUND không phải lỗi nghiêm trọng lúc init —
+                 * sẽ retry khi transfer PIPE */
+            }
+            usleep(80 * 1000);
+        }
+        if (g_ep_in) {
+            int hr = libusb_clear_halt(g_handle, g_ep_in);
+            LOGI("usb_bridge_init2: clear_halt ep_in=0x%02x → %d (%s)",
+                 g_ep_in, hr, libusb_error_name(hr));
+            usleep(80 * 1000);
+        }
+    } else {
+        /* Caller không cung cấp endpoints — fallback discovery */
+        LOGI("usb_bridge_init2: caller không cung cấp endpoints — fallback discover_apple_endpoints()");
+        if (!discover_apple_endpoints()) {
+            LOGE("usb_bridge_init2: discover_apple_endpoints() thất bại");
+            libusb_close(g_handle);
+            libusb_exit(g_ctx);
+            g_handle = NULL;
+            g_ctx    = NULL;
+            return false;
+        }
+    }
+
+    LOGI("usb_bridge_init2: ✅ sẵn sàng — ep_in=0x%02x ep_out=0x%02x iface=%d claimed=%d",
+         g_ep_in, g_ep_out, g_iface_num, g_iface_claimed);
+
+    g_initialized = 1;
     return true;
 }
 
