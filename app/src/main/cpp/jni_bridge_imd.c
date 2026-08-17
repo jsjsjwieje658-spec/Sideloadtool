@@ -162,12 +162,13 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v38 (2026-08-17)");
+    emit_log("[jni]   SideloadTool native v39 (2026-08-17)");
     emit_log("[jni]   Fixes:");
     emit_log("[jni]     v33 eager+clear, v34 log_hex overflow,");
     emit_log("[jni]     v35 libusb error codes, v36 UI log forwarding,");
     emit_log("[jni]     v37 endpoints from Kotlin (bypass discover),");
-    emit_log("[jni]     v38 Android JNI bulk transport fallback");
+    emit_log("[jni]     v38 Android JNI bulk transport fallback,");
+    emit_log("[jni]     v39 only switch Android mode if libusb claim fail");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -233,28 +234,35 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
     emit_log(buf);
 
     /*
-     * FIX v38: Auto-switch sang Android JNI transport mode.
+     * FIX v39: CHỈ switch sang Android JNI transport mode nếu libusb_claim_interface()
+     * đã thất bại (g_iface_claimed == 0). Nếu libusb_claim_interface() thành công
+     * (như trong log v38 của user), dùng libusb path bình thường — nó ổn định hơn.
      *
-     * Lý do: libusb_claim_interface() với Android wrapped fd gần như luôn
-     * trả NOT_FOUND (descriptor access không đáng tin). Khi claim fail,
-     * libusb_bulk_transfer() cũng fail với LIBUSB_ERROR_IO → không có lý do
-     * thử libusb path.
+     * Lý do phải thay đổi từ v38:
+     *   v38 luôn gọi set_android_mode() → Kotlin's prepareForBulkTransfers() được
+     *   gọi TRƯỚC nativeSetUsbFd() → claimInterface(iface, true) với force=true
+     *   → Android steals interface từ libusb → libusb_claim_interface vẫn trả
+     *   "claimed successfully" (nhưng thực ra là Android claim) → libusb_bulk_transfer
+     *   gửi packet vào endpoint nhưng không có ai đọc (Android không chủ động poll) →
+     *   iPhone nhận packet nhưng phản hồi của iPhone bị loopback vào buffer của
+     *   chúng ta (đó là lý do "flush_in: drained 20 bytes" = chính VERSION packet
+     *   mà chúng ta vừa gửi!).
      *
-     * Android JNI transport mode route bulk_write/read qua:
-     *   NativeBridge.onNativeBulkWrite/Read → UsbTransport.nativeBulkWrite/Read
-     *   → UsbDeviceConnection.bulkTransfer()
-     *
-     * Yêu cầu: Kotlin ĐÃ phải gọi UsbTransport.prepareForBulkTransfers() TRƯỚC
-     * khi gọi nativeSetUsbFd() — NativeBridge.setUsbFd() và connect() đảm bảo
-     * việc này. Nếu chưa prepareForBulkTransfers, bulk_transfer sẽ fail với -1.
-     *
-     * Caller đảm bảo: NativeBridge.connect() gọi UsbTransport.prepareForBulkTransfers()
-     * trước khi gọi nativeSetUsbFd() lần đầu (khi g_iface_claimed sẽ là 0).
+     *   Fix v39: KHÔNG gọi prepareForBulkTransfers() nếu libusb_claim_interface()
+     *   thành công. Để libusb path hoạt động bình thường.
      */
-    if (usb_bridge_set_android_mode()) {
-        emit_log("[usbmux] ✅ Đã switch sang Android JNI bulk transport mode");
-    } else {
-        emit_log("[usbmux] ⚠️ Không switch được Android mode — JNI callbacks chưa sẵn sàng");
+    if (!usb_bridge_using_android_mode()) {
+        /* Gọi accessor mới: usb_bridge_iface_claimed() return 1 nếu libusb claim OK */
+        if (!usb_bridge_iface_claimed()) {
+            emit_log("[usbmux] libusb_claim_interface fail — switch sang Android JNI transport mode");
+            if (usb_bridge_set_android_mode()) {
+                emit_log("[usbmux] ✅ Đã switch sang Android JNI bulk transport mode");
+            } else {
+                emit_log("[usbmux] ⚠️ Không switch được Android mode — JNI callbacks chưa sẵn sàng");
+            }
+        } else {
+            emit_log("[usbmux] libusb_claim_interface đã OK — dùng libusb path (không cần Android mode)");
+        }
     }
 
     /*

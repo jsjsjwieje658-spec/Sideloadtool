@@ -323,23 +323,65 @@ object UsbTransport {
 
     @JvmStatic
     fun nativeBulkWrite(data: ByteArray, timeoutMs: Int): Int {
-        val ep = endpointOut ?: return -1
-        val c  = connection  ?: return -1
+        val ep = endpointOut ?: run {
+            Log.e(TAG, "nativeBulkWrite: endpointOut NULL")
+            return -1
+        }
+        val c  = connection ?: run {
+            Log.e(TAG, "nativeBulkWrite: connection NULL")
+            return -1
+        }
         if (!interfaceClaimed) {
             Log.w(TAG, "nativeBulkWrite: interface chưa claim — gọi prepareForBulkTransfers() trước!")
             return -1
         }
-        return c.bulkTransfer(ep, data, data.size, timeoutMs)
+        /*
+         * FIX v39: Log để debug return value của UsbDeviceConnection.bulkTransfer.
+         *
+         * Return values:
+         *   >0: số byte transferred thành công
+         *   -1: lỗi (endpoint STALL, timeout, hoặc interface chưa claim đúng)
+         *   0: timeout với 0 byte transfer
+         */
+        val t0 = System.currentTimeMillis()
+        val result = c.bulkTransfer(ep, data, data.size, timeoutMs)
+        val dt = System.currentTimeMillis() - t0
+        if (result < 0) {
+            Log.e(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                       "len=${data.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
+        } else {
+            Log.i(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                       "len=${data.size} → $result bytes (dt=${dt}ms)")
+        }
+        return result
     }
 
     @JvmStatic
     fun nativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
-        val ep = endpointIn ?: return -1
-        val c  = connection ?: return -1
+        val ep = endpointIn ?: run {
+            Log.e(TAG, "nativeBulkRead: endpointIn NULL")
+            return -1
+        }
+        val c  = connection ?: run {
+            Log.e(TAG, "nativeBulkRead: connection NULL")
+            return -1
+        }
         if (!interfaceClaimed) {
             Log.w(TAG, "nativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers() trước!")
             return -1
         }
-        return c.bulkTransfer(ep, buf, buf.size, timeoutMs)
+        val t0 = System.currentTimeMillis()
+        val result = c.bulkTransfer(ep, buf, buf.size, timeoutMs)
+        val dt = System.currentTimeMillis() - t0
+        if (result < 0) {
+            Log.e(TAG, "nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                       "len=${buf.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
+        } else if (result == 0) {
+            Log.i(TAG, "nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
+        } else {
+            Log.i(TAG, "nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                       "→ $result bytes (dt=${dt}ms)")
+        }
+        return result
     }
 }

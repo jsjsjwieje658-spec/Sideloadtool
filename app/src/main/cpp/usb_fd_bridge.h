@@ -107,6 +107,13 @@ bool usb_bridge_set_android_mode(void);
 bool usb_bridge_using_android_mode(void);
 
 /*
+ * usb_bridge_iface_claimed — return 1 nếu libusb_claim_interface() đã thành công
+ * (trong usb_bridge_init_from_fd2). Caller dùng để quyết định có cần switch sang
+ * Android JNI transport mode không.
+ */
+bool usb_bridge_iface_claimed(void);
+
+/*
  * FIX v38: JNI bridge — cache JavaVM và NativeBridge instance để
  * có thể gọi onNativeBulkWrite/Read từ native code.
  *

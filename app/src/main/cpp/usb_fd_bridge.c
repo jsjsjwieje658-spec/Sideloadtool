@@ -192,6 +192,10 @@ bool usb_bridge_using_android_mode(void) {
     return g_use_android != 0;
 }
 
+bool usb_bridge_iface_claimed(void) {
+    return g_iface_claimed != 0;
+}
+
 /*
  * call_android_bulk_write — gọi NativeBridge.onNativeBulkWrite(buf, timeout)
  */
