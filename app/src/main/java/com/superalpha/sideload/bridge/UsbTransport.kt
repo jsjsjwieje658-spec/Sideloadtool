@@ -4,7 +4,6 @@ import android.hardware.usb.*
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-
 /**
  * UsbTransport — Quản lý kết nối USB thô với iPhone/iPad qua Android USB Host API.
  *
@@ -52,6 +51,24 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 object UsbTransport {
     private const val TAG = "UsbTransport"
+
+    /*
+     * FIX v42 (Critical): Forward ALL logs to UI log viewer via NativeLog.emit().
+     *
+     * Trước đây, UsbTransport chỉ dùng Log.i/Log.e → log chỉ vào Android logcat,
+     * KHÔNG vào UI log viewer. User không thấy được return value của bulkTransfer,
+     * prepareForBulkTransfers, v.v. → không debug được.
+     *
+     * Giờ dùng uiLog() helper — log vào CẢ logcat VÀ UI.
+     */
+    private fun uiLog(msg: String) {
+        Log.i(TAG, msg)
+        NativeLog.emit("[usb] $msg")
+    }
+    private fun uiLogE(msg: String) {
+        Log.e(TAG, msg)
+        NativeLog.emit("[usb] ❌ $msg")
+    }
 
     const val VENDOR_ID_APPLE     = 0x05AC
     private const val IFACE_CLASS    = 0xFF   // Vendor Specific
@@ -249,7 +266,7 @@ object UsbTransport {
         val iface = usbInterface ?: return false
         if (interfaceClaimed) return true  // đã claim rồi
 
-        Log.i(TAG, "prepareForBulkTransfers: claiming interface ${iface.id}...")
+        uiLog("prepareForBulkTransfers: claiming interface ${iface.id}...")
 
         /*
          * FIX (Bug 7 — HIGH): setConfiguration() must be called BEFORE claimInterface().
@@ -268,15 +285,15 @@ object UsbTransport {
          * and call setConfiguration() before each claimInterface() attempt.
          */
         val found = findUsbmuxIface(currentDevice ?: run {
-            Log.e(TAG, "prepareForBulkTransfers: no currentDevice"); return false
+            uiLogE("prepareForBulkTransfers: no currentDevice"); return false
         }) ?: run {
-            Log.e(TAG, "prepareForBulkTransfers: usbmux iface not found"); return false
+            uiLogE("prepareForBulkTransfers: usbmux iface not found"); return false
         }
         try {
             conn.setConfiguration(found.config)
-            Log.i(TAG, "prepareForBulkTransfers: setConfiguration(${found.config.id}) OK")
+            uiLog("prepareForBulkTransfers: setConfiguration(${found.config.id}) OK")
         } catch (e: Exception) {
-            Log.w(TAG, "prepareForBulkTransfers: setConfiguration exception (non-fatal): $e")
+            uiLogE("prepareForBulkTransfers: setConfiguration exception (non-fatal): $e")
         }
 
         // Claim với retry (8 lần, exponential backoff)
@@ -285,11 +302,11 @@ object UsbTransport {
         for (i in 0 until 8) {
             if (i > 0) Thread.sleep(delays.getOrElse(i) { 2500L })
             if (conn.claimInterface(iface, true)) { claimed = true; break }
-            Log.w(TAG, "prepareForBulkTransfers: claimInterface retry $i")
+            uiLogE("prepareForBulkTransfers: claimInterface retry $i")
         }
 
         if (!claimed) {
-            Log.e(TAG, "prepareForBulkTransfers: claimInterface thất bại sau 8 lần")
+            uiLogE("prepareForBulkTransfers: claimInterface thất bại sau 8 lần")
             return false
         }
 
@@ -300,7 +317,7 @@ object UsbTransport {
         clearEndpointHaltAndroid(endpointOut)
         clearEndpointHaltAndroid(endpointIn)
 
-        Log.i(TAG, "✅ prepareForBulkTransfers: interface claimed, endpoints ready")
+        uiLog("✅ prepareForBulkTransfers: interface claimed, endpoints ready")
         return true
     }
 
@@ -344,59 +361,33 @@ object UsbTransport {
     @JvmStatic
     fun nativeBulkWrite(data: ByteArray, timeoutMs: Int): Int {
         val ep = endpointOut ?: run {
-            Log.e(TAG, "nativeBulkWrite: endpointOut NULL")
+            uiLogE("nativeBulkWrite: endpointOut NULL")
             return -1
         }
         val c  = connection ?: run {
-            Log.e(TAG, "nativeBulkWrite: connection NULL")
+            uiLogE("nativeBulkWrite: connection NULL")
             return -1
         }
         if (!interfaceClaimed) {
-            Log.w(TAG, "nativeBulkWrite: interface chưa claim — gọi prepareForBulkTransfers() trước!")
+            uiLogE("nativeBulkWrite: interface chưa claim")
             return -1
         }
-        /*
-         * FIX v40 (Critical — học từ usbmuxd upstream usb.c:176-201):
-         *
-         * usbmuxd gửi Zero-Length Packet (ZLP) sau mỗi packet có
-         * length % wMaxPacketSize == 0. iPhone yêu cầu ZLP để biết
-         * packet đã kết thúc — nếu không có ZLP, iPhone sẽ chờ thêm
-         * data và không phản hồi.
-         *
-         * Cụ thể cho iPhone USB Full-Speed (wMaxPacketSize=64):
-         *   - VERSION packet = 20 bytes → 20 < 64, không cần ZLP (short packet)
-         *   - TCP packet 512 bytes → 512 % 64 == 0 → CẦN ZLP
-         *
-         * Tuy nhiên, libusb trên Linux/Mac tự thêm ZLP khi cần.
-         * Android UsbDeviceConnection.bulkTransfer() có thể KHÔNG tự thêm.
-         *
-         * Quan trọng hơn: usbmuxd upstream cũng xử lý trường hợp
-         * length % wMaxPacketSize == 0 bằng cách gửi ZLP riêng.
-         * Chúng ta cần tự gửi ZLP trong trường hợp này.
-         */
         val t0 = System.currentTimeMillis()
         val result = c.bulkTransfer(ep, data, data.size, timeoutMs)
         val dt = System.currentTimeMillis() - t0
         if (result < 0) {
-            Log.e(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+            uiLogE("nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
                        "len=${data.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
             return result
         }
-        Log.i(TAG, "nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+        uiLog("nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
                    "len=${data.size} → $result bytes (dt=${dt}ms)")
 
-        /*
-         * Gửi ZLP nếu length là bội của wMaxPacketSize (64 cho Full-Speed,
-         * 512 cho High-Speed). usbmuxd upstream kiểm tra:
-         *   if (length % dev->wMaxPacketSize == 0) send ZLP;
-         *
-         * Lấy wMaxPacketSize từ endpoint descriptor (Android UsbEndpoint).
-         */
         val wMaxPacketSize = ep.maxPacketSize
         if (wMaxPacketSize > 0 && data.size % wMaxPacketSize == 0) {
-            Log.i(TAG, "nativeBulkWrite: gửi ZLP (len=${data.size} % wMaxPacketSize=$wMaxPacketSize == 0)")
+            uiLog("nativeBulkWrite: gửi ZLP (len=${data.size} % wMaxPacketSize=$wMaxPacketSize == 0)")
             val zlpResult = c.bulkTransfer(ep, ByteArray(0), 0, 1000)
-            Log.i(TAG, "nativeBulkWrite: ZLP result=$zlpResult")
+            uiLog("nativeBulkWrite: ZLP result=$zlpResult")
         }
 
         return result
@@ -405,45 +396,33 @@ object UsbTransport {
     @JvmStatic
     fun nativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
         val ep = endpointIn ?: run {
-            Log.e(TAG, "nativeBulkRead: endpointIn NULL")
+            uiLogE("nativeBulkRead: endpointIn NULL")
             return -1
         }
         val c  = connection ?: run {
-            Log.e(TAG, "nativeBulkRead: connection NULL")
+            uiLogE("nativeBulkRead: connection NULL")
             return -1
         }
         if (!interfaceClaimed) {
-            Log.w(TAG, "nativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers() trước!")
+            uiLogE("nativeBulkRead: interface chưa claim")
             return -1
         }
-        /*
-         * FIX v40 (Critical — học từ usbmuxd upstream usb.c:253-268):
-         *
-         * usbmuxd upstream dùng USB_MRU=16384 (16KB) cho read buffer.
-         * Code cũ nhận buffer do caller truyền vào, có thể quá nhỏ
-         * (vd: 8-byte header) → iPhone response bị cắt → parse fail.
-         *
-         * Chuẩn hóa theo upstream:
-         *   - Caller luôn truyền buf size = USB_MRU (16384) hoặc lớn hơn
-         *   - Ta chỉ đọc tối đa buf.size bytes
-         *   - Return số byte thực đọc
-         *
-         * Quan trọng: UsbDeviceConnection.bulkTransfer() sẽ block cho đến
-         * khi nhận được data hoặc timeout. Nếu iPhone không phản hồi trong
-         * timeoutMs, return -1. Nếu nhận được short packet (< wMaxPacketSize),
-         * Android sẽ return ngay lập tức với số byte thực nhận.
-         */
         val t0 = System.currentTimeMillis()
         val result = c.bulkTransfer(ep, buf, buf.size, timeoutMs)
         val dt = System.currentTimeMillis() - t0
         if (result < 0) {
-            Log.e(TAG, "nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
+            uiLogE("nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
                        "len=${buf.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
         } else if (result == 0) {
-            Log.i(TAG, "nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
+            uiLog("nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
         } else {
-            Log.i(TAG, "nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                       "→ $result bytes (dt=${dt}ms)")
+            /* FIX v42: Hex dump first 32 bytes để xem có phải loopback không */
+            val hex = StringBuilder()
+            val show = if (result < 32) result else 32
+            for (i in 0 until show) {
+                hex.append(String.format("%02x ", buf[i]))
+            }
+            uiLog("nativeBulkRead: got $result bytes (dt=${dt}ms): $hex${if (result > 32) "..." else ""}")
         }
         return result
     }

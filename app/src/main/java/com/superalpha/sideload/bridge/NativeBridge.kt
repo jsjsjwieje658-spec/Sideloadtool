@@ -88,19 +88,18 @@ class NativeBridge(private val context: Context) {
             return try {
                 /*
                  * FIX v40: Đảm bảo interface đã claim trước mỗi bulk_write.
-                 * Nếu chưa claim (vd: vừa switch sang Android mode), gọi
-                 * prepareForBulkTransfers() lần đầu. Các lần sau sẽ skip (idempotent).
+                 * FIX v42: Forward logs to UI via NativeLog.emit().
                  */
                 if (!UsbTransport.isInterfaceClaimed()) {
-                    Log.i(TAG, "onNativeBulkWrite: interface chưa claim — gọi prepareForBulkTransfers()")
+                    NativeLog.emit("[bridge] onNativeBulkWrite: interface chưa claim — gọi prepareForBulkTransfers()")
                     if (!UsbTransport.prepareForBulkTransfers()) {
-                        Log.e(TAG, "onNativeBulkWrite: prepareForBulkTransfers() thất bại — không thể bulk_write")
+                        NativeLog.emit("[bridge] ❌ onNativeBulkWrite: prepareForBulkTransfers() thất bại")
                         return -1
                     }
                 }
                 UsbTransport.nativeBulkWrite(data, timeoutMs)
             } catch (e: Exception) {
-                Log.e(TAG, "onNativeBulkWrite exception: ${e.message}")
+                NativeLog.emit("[bridge] ❌ onNativeBulkWrite exception: ${e.message}")
                 -1
             }
         }
@@ -108,17 +107,17 @@ class NativeBridge(private val context: Context) {
         @JvmStatic
         fun onNativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
             return try {
-                /* FIX v40: Tương tự onNativeBulkWrite — đảm bảo interface đã claim. */
+                /* FIX v40 + v42: đảm bảo interface claim + forward logs to UI */
                 if (!UsbTransport.isInterfaceClaimed()) {
-                    Log.i(TAG, "onNativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers()")
+                    NativeLog.emit("[bridge] onNativeBulkRead: interface chưa claim — gọi prepareForBulkTransfers()")
                     if (!UsbTransport.prepareForBulkTransfers()) {
-                        Log.e(TAG, "onNativeBulkRead: prepareForBulkTransfers() thất bại — không thể bulk_read")
+                        NativeLog.emit("[bridge] ❌ onNativeBulkRead: prepareForBulkTransfers() thất bại")
                         return -1
                     }
                 }
                 UsbTransport.nativeBulkRead(buf, timeoutMs)
             } catch (e: Exception) {
-                Log.e(TAG, "onNativeBulkRead exception: ${e.message}")
+                NativeLog.emit("[bridge] ❌ onNativeBulkRead exception: ${e.message}")
                 -1
             }
         }
