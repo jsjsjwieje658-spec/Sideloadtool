@@ -162,9 +162,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v45 (2026-08-18)");
-    emit_log("[jni]   Fixes: v33-v44 + v45 RST handling + dynamic source port");
-    emit_log("[jni]   v45 fixes 'Trust popup not shown' — ACK/RST infinite loop");
+    emit_log("[jni]   SideloadTool native v46 (2026-08-18)");
+    emit_log("[jni]   Fixes: v33-v45 + v46 UNKNOWN_ERROR=-256 handling");
+    emit_log("[jni]   v46 fixes 'Trust popup not shown' — handle err=-256 as retry");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -571,20 +571,62 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
              */
             case LOCKDOWN_E_MUX_ERROR:
             case LOCKDOWN_E_RECEIVE_TIMEOUT:
-            case LOCKDOWN_E_SSL_ERROR: {
+            case LOCKDOWN_E_SSL_ERROR:
+            /*
+             * FIX v46 (Critical — Trust popup không hiện trên iPhone):
+             *
+             * Trên iOS 16/17+, khi app gửi Pair request, lockdownd thường:
+             *   1. Hiển thị "Trust This Computer" popup trên iPhone
+             *   2. Đóng TCP connection (RST) — yêu cầu client retry
+             *
+             * libimobiledevice 1.3.0 (phiên bản đang dùng) không có
+             * LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING cho flow mới; thay vào
+             * đó nó map response "PairingDialogResponsePending" hoặc RST giữa
+             * chừng thành LOCKDOWN_E_UNKNOWN_ERROR (-256).
+             *
+             * Không xử lý -256 → code rơi vào default case → return false ngay
+             * lập tức → user không có thời gian bấm "Trust" → popup trust
+             * không bao giờ được xử lý đầy đủ.
+             *
+             * Fix: xem -256 (UNKNOWN_ERROR) như một "transport/pairing dialog
+             * pending" — re-establish lockdown client, chờ user bấm Trust,
+             * retry lockdownd_pair. Tối đa PAIR_RETRY_MAX (20) lần = 40 giây.
+             */
+            case LOCKDOWN_E_UNKNOWN_ERROR: {
                 /*
-                 * FIX v45: Transport error (do iPhone RST). Re-establish
-                 * lockdown client — sẽ tạo TCP connection MỚI với source port
-                 * mới nhờ alloc_source_port() trong usbmuxd_server.c.
+                 * FIX v45/v46: Transport error (do iPhone RST hoặc PairingDialog
+                 * pending). Re-establish lockdown client — sẽ tạo TCP connection
+                 * MỚI với source port mới nhờ alloc_source_port() trong
+                 * usbmuxd_server.c.
                  *
                  * Loop counter `i` đã tự động giới hạn tổng số retry
                  * (PAIR_RETRY_MAX = 20), không cần counter riêng.
                  */
-                char msg[200];
+                int is_unknown = (err == LOCKDOWN_E_UNKNOWN_ERROR);
+                char msg[256];
                 snprintf(msg, sizeof(msg),
-                         "[pair] \u26a0\ufe0f Transport err=%d (RST?) — re-establish lockdown client (loop %d/%d)",
+                         "[pair] \u26a0\ufe0f %s err=%d (RST hoặc Trust dialog pending?) — "
+                         "re-establish lockdown client (loop %d/%d)",
+                         is_unknown ? "UNKNOWN_ERROR" : "Transport",
                          (int)err, i + 1, PAIR_RETRY_MAX);
                 emit_log(msg);
+
+                /* FIX v46: Thông báo cho UI biết đang chờ user bấm Trust */
+                if (is_unknown && g_jvm) {
+                    JNIEnv *e = NULL; bool dt = false;
+                    if ((*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
+                        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&e, NULL); dt = true;
+                    }
+                    jclass cls = (*e)->FindClass(e,
+                        "com/superalpha/sideload/bridge/NativeBridge");
+                    if (cls) {
+                        jmethodID mid = (*e)->GetStaticMethodID(e, cls,
+                            "onTrustRequired", "()V");
+                        if (mid) (*e)->CallStaticVoidMethod(e, cls, mid);
+                        (*e)->DeleteLocalRef(e, cls);
+                    }
+                    if (dt) (*g_jvm)->DetachCurrentThread(g_jvm);
+                }
 
                 /* Free old lockdown client (dead transport) */
                 if (g_lockdown) { lockdownd_client_free(g_lockdown); g_lockdown = NULL; }
@@ -604,6 +646,10 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
                 emit_log("[pair] \u2705 Re-established lockdown client — retry pair");
                 /* Brief delay cho iPhone usbmuxd dọn TIME_WAIT state cũ */
                 usleep(300 * 1000);
+                /* FIX v46: Extra delay cho UNKNOWN_ERROR để user có thời gian bấm Trust */
+                if (is_unknown) {
+                    usleep(500 * 1000);  /* +500ms = 800ms total */
+                }
                 continue;  /* retry lockdownd_pair */
             }
 

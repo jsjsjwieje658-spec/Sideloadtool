@@ -880,7 +880,30 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
     uint16_t mux_tx = ntohs(mhdr.tx_seq);
     uint16_t mux_rx = ntohs(mhdr.rx_seq);
     pthread_mutex_lock(&g_mux_seq_mutex);
-    g_mux_rx_seq = mux_rx;
+    /*
+     * FIX v46 (Critical — Trust popup không hiện):
+     *
+     * Bug cũ: g_mux_rx_seq = mux_rx (iPhone's rx_seq field)
+     *
+     * iPhone's rx_seq field = OUR last tx_seq (echo semantics). Nên nếu
+     * gán bằng iPhone's rx_seq, ta sẽ echo NGƯỢC lại chính tx_seq của mình
+     * — điều này khiến iPhone nhận được một rx_seq field mà nó KHÔNG mong đợi.
+     *
+     * Ví dụ trace log user:
+     *   Our SYN:    tx_seq=1, rx_seq=0xFFFF
+     *   iPhone ACK: tx_seq=0, rx_seq=1   ← iPhone echo our tx=1
+     *   Our ACK:    tx_seq=2, rx_seq=1    ← BUG: chúng ta echo ngược iPhone's rx_seq (=1),
+     *                                       thay vì echo iPhone's tx_seq (=0)
+     *   iPhone expect: our rx_seq = 0 (echo iPhone's tx=0) hoặc 1 (next expected = 0+1)
+     *   We sent: rx_seq = 1 (hợp lệ theo "next expected" semantics, may work)
+     *
+     * Tuy nhiên cho các packet sau (data), rx_seq sẽ lệch và có thể gây
+     * "no matching socket" trên iPhone.
+     *
+     * Fix: g_mux_rx_seq = mux_tx + 1 (next expected — học từ upstream usbmuxd:
+     * dev->rx_seq = header->tx_seq + 1).
+     */
+    g_mux_rx_seq = (uint16_t)(mux_tx + 1);
     pthread_mutex_unlock(&g_mux_seq_mutex);
     uint32_t data_len_raw = total_len - sizeof(v2_mux_hdr_t) - tcp_hdr_len;
 
@@ -1068,6 +1091,18 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
 
         LOGI("do_usb_v1_connect: SYN+ACK nhận, remote_seq=%u (expected ack=%u)",
              st->remote_seq, isn + 1);
+
+        /*
+         * FIX v46: Delay ngắn (50ms) giữa SYN+ACK và ACK.
+         *
+         * Trên iOS 16/17+, lockdownd đôi khi cần một khoảng thời gian nhỏ
+         * để tạo socket entry trong usbmuxd socket table SAU khi gửi SYN+ACK.
+         * Nếu ACK (và data) đến quá nhanh, iPhone có thể chưa kịp tạo socket
+         * → "handleMuxTCPInput no matching socket" → RST.
+         *
+         * 50ms là đủ cho iPhone tạo socket mà không ảnh hưởng UX.
+         */
+        usleep(50 * 1000);
 
         /* Bước 3: ACK */
         st->local_seq = isn + 1;   /* SYN tiêu thụ 1 sequence number */
