@@ -352,6 +352,9 @@ object UsbTransport {
         endpointOut     = null
         currentDevice   = null
         interfaceClaimed = false
+        /* FIX v43: Clear pending read buffer khi close */
+        pendingLen = 0
+        pendingOff = 0
         _connected.value = false
     }
 
@@ -393,7 +396,31 @@ object UsbTransport {
         return result
     }
 
+    /*
+     * FIX v43 (CRITICAL): Internal read buffer + pending data tracking.
+     *
+     * Vấn đề trong v42 (xem log user):
+     *   nativeBulkRead(buf, len=8, timeout=1500ms) → -1 (dt=0ms)
+     *
+     * Caller (usbmuxd_server.c usb_read_exact) truyền len=8 vì muốn đọc
+     * 8-byte mux header. Nhưng iPhone gửi 20+ byte VERSION response trong
+     * một USB bulk packet. Khi Android UsbDeviceConnection.bulkTransfer()
+     * nhận được 20 byte nhưng buf chỉ chứa được 8 byte → USB HAL stall
+     * endpoint → tất cả các lần read sau đều trả -1 ngay lập tức.
+     *
+     * Fix: nativeBulkRead LUÔN dùng internal buffer 16KB (USB_MRU) để đọc
+     * tất cả data có sẵn, sau đó copy vào buf của caller. Data dư thừa
+     * được giữ lại trong pendingBuf cho lần đọc tiếp theo.
+     *
+     * Học từ usbmuxd upstream (usb.c:253-268): họ dùng USB_MRU=16384
+     * cho read buffer, không bao giờ đọc với buffer nhỏ hơn.
+     */
+    private val pendingBuf = ByteArray(USB_MRU)
+    private var pendingLen = 0
+    private var pendingOff = 0
+
     @JvmStatic
+    @Synchronized
     fun nativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
         val ep = endpointIn ?: run {
             uiLogE("nativeBulkRead: endpointIn NULL")
@@ -407,23 +434,60 @@ object UsbTransport {
             uiLogE("nativeBulkRead: interface chưa claim")
             return -1
         }
+
+        /*
+         * Bước 1: Nếu có pending data từ lần đọc trước, trả về ngay.
+         * Ví dụ: caller muốn 8 byte header, nhưng lần trước iPhone gửi
+         * 20 byte → ta đã buffer 12 byte còn lại → trả về 8 byte ngay.
+         */
+        if (pendingLen > 0) {
+            val copy = if (pendingLen < buf.size) pendingLen else buf.size
+            System.arraycopy(pendingBuf, pendingOff, buf, 0, copy)
+            pendingOff += copy
+            pendingLen -= copy
+            if (pendingLen == 0) pendingOff = 0
+            uiLog("nativeBulkRead: returned $copy bytes from pending buffer (${pendingLen} bytes còn lại)")
+            return copy
+        }
+
+        /*
+         * Bước 2: Không có pending data — đọc mới từ USB với buffer 16KB.
+         * Quan trọng: dùng pendingBuf (16KB) làm buffer đọc, KHÔNG dùng
+         * buf của caller (có thể chỉ 8 byte). Tránh STALL endpoint.
+         */
         val t0 = System.currentTimeMillis()
-        val result = c.bulkTransfer(ep, buf, buf.size, timeoutMs)
+        val result = c.bulkTransfer(ep, pendingBuf, USB_MRU, timeoutMs)
         val dt = System.currentTimeMillis() - t0
         if (result < 0) {
             uiLogE("nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                       "len=${buf.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
-        } else if (result == 0) {
-            uiLog("nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
-        } else {
-            /* FIX v42: Hex dump first 32 bytes để xem có phải loopback không */
-            val hex = StringBuilder()
-            val show = if (result < 32) result else 32
-            for (i in 0 until show) {
-                hex.append(String.format("%02x ", buf[i]))
-            }
-            uiLog("nativeBulkRead: got $result bytes (dt=${dt}ms): $hex${if (result > 32) "..." else ""}")
+                       "len=$USB_MRU timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
+            return result
         }
-        return result
+        if (result == 0) {
+            uiLog("nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
+            return 0
+        }
+
+        /* FIX v42/v43: Hex dump first 32 bytes để xác nhận là iPhone response */
+        val hex = StringBuilder()
+        val show = if (result < 32) result else 32
+        for (i in 0 until show) {
+            hex.append(String.format("%02x ", pendingBuf[i]))
+        }
+        uiLog("nativeBulkRead: got $result bytes (dt=${dt}ms): $hex${if (result > 32) "..." else ""}")
+
+        /*
+         * Bước 3: Copy vào buf của caller. Nếu caller cần ít hơn result,
+         * phần dư được giữ lại trong pendingBuf/pendingOff/pendingLen.
+         */
+        val copy = if (result < buf.size) result else buf.size
+        System.arraycopy(pendingBuf, 0, buf, 0, copy)
+        if (result > copy) {
+            /* Data dư — buffer lại cho lần sau */
+            pendingOff = copy
+            pendingLen = result - copy
+            uiLog("nativeBulkRead: copied $copy to caller, buffered ${pendingLen} bytes for next read")
+        }
+        return copy
     }
 }

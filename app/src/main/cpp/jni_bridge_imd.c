@@ -162,8 +162,8 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v42 (2026-08-17)");
-    emit_log("[jni]   Fixes: v33-v41 + v42 forward Kotlin logs to UI");
+    emit_log("[jni]   SideloadTool native v43 (2026-08-17)");
+    emit_log("[jni]   Fixes: v33-v42 + v43 16KB read buffer (no STALL)");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
