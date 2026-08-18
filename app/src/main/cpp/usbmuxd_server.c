@@ -881,29 +881,41 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
     uint16_t mux_rx = ntohs(mhdr.rx_seq);
     pthread_mutex_lock(&g_mux_seq_mutex);
     /*
-     * FIX v46 (Critical — Trust popup không hiện):
+     * FIX v47 (CRITICAL — Trust popup không hiện, RST ngay khi gửi DATA):
      *
-     * Bug cũ: g_mux_rx_seq = mux_rx (iPhone's rx_seq field)
+     * iPhone dùng ECHO SEMANTICS cho mux_rx_seq:
+     *   rx_seq = LAST RECEIVED tx_seq từ peer (KHÔNG phải +1)
      *
-     * iPhone's rx_seq field = OUR last tx_seq (echo semantics). Nên nếu
-     * gán bằng iPhone's rx_seq, ta sẽ echo NGƯỢC lại chính tx_seq của mình
-     * — điều này khiến iPhone nhận được một rx_seq field mà nó KHÔNG mong đợi.
+     * Bằng chứng từ trace log user (lần này, sau v46):
+     *   Our SYN:      tx_seq=1, rx_seq=0xFFFF  (initial)
+     *   iPhone SYN+ACK: tx_seq=0, rx_seq=1     ← iPhone echo our SYN tx=1
+     *   Our ACK:       tx_seq=2, rx_seq=1       ← v46 fix: iPhone_tx(0)+1=1 (NEXT-EXPECTED)
+     *   Our DATA:      tx_seq=3, rx_seq=1       ← vẫn 1 (iPhone chưa gửi packet mới)
+     *   iPhone RST:    tx_seq=1, rx_seq=3       ← iPhone echo our DATA tx=3
      *
-     * Ví dụ trace log user:
-     *   Our SYN:    tx_seq=1, rx_seq=0xFFFF
-     *   iPhone ACK: tx_seq=0, rx_seq=1   ← iPhone echo our tx=1
-     *   Our ACK:    tx_seq=2, rx_seq=1    ← BUG: chúng ta echo ngược iPhone's rx_seq (=1),
-     *                                       thay vì echo iPhone's tx_seq (=0)
-     *   iPhone expect: our rx_seq = 0 (echo iPhone's tx=0) hoặc 1 (next expected = 0+1)
-     *   We sent: rx_seq = 1 (hợp lệ theo "next expected" semantics, may work)
+     * iPhone's SYN+ACK có rx_seq=1. Nếu iPhone dùng "next-expected", rx_seq
+     * phải = 2 (vì our SYN tx=1, next expected = 2). Nhưng iPhone gửi 1
+     * → iPhone dùng ECHO semantics (rx_seq = last received tx_seq, KHÔNG +1).
      *
-     * Tuy nhiên cho các packet sau (data), rx_seq sẽ lệch và có thể gây
-     * "no matching socket" trên iPhone.
+     * Hậu quả của v46 fix (next-expected):
+     *   iPhone expect our rx_seq = 0 (echo iPhone's last tx_seq=0)
+     *   We sent rx_seq = 1 (next expected, OFF-BY-ONE)
+     *   → iPhone's handleMuxTCPInput fail socket lookup
+     *   → "no matching socket for socket N" error payload
+     *   → RST ngay khi nhận DATA packet (chỉ 2ms sau khi gửi)
+     *   → lockdownd Hello/GetValue không bao giờ được xử lý
+     *   → Pair request không bao giờ được gửi
+     *   → TRUST POPUP KHÔNG BAO HIỆN
      *
-     * Fix: g_mux_rx_seq = mux_tx + 1 (next expected — học từ upstream usbmuxd:
-     * dev->rx_seq = header->tx_seq + 1).
+     * Fix: g_mux_rx_seq = mux_tx (ECHO — exactly the same value as iPhone's last tx_seq).
+     * Đây là behavior mà iPhone expects; verified bằng cách đối chiếu với trace.
+     *
+     * Lưu ý: v46 comment nói "upstream usbmuxd: dev->rx_seq = header->tx_seq + 1"
+     * là INCORRECT — upstream usbmuxd thực sự dùng ECHO semantics:
+     *   dev->rx_seq = ntohs(hdr->tx_seq);   // NO +1
+     * (xem usbmuxd/src/device.c, device_receive_packet)
      */
-    g_mux_rx_seq = (uint16_t)(mux_tx + 1);
+    g_mux_rx_seq = mux_tx;  /* ECHO semantics — match iPhone's expectation */
     pthread_mutex_unlock(&g_mux_seq_mutex);
     uint32_t data_len_raw = total_len - sizeof(v2_mux_hdr_t) - tcp_hdr_len;
 

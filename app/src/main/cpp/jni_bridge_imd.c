@@ -162,9 +162,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v46 (2026-08-18)");
-    emit_log("[jni]   Fixes: v33-v45 + v46 UNKNOWN_ERROR=-256 handling");
-    emit_log("[jni]   v46 fixes 'Trust popup not shown' — handle err=-256 as retry");
+    emit_log("[jni]   SideloadTool native v47 (2026-08-18)");
+    emit_log("[jni]   Fixes: v33-v46 + v47 ECHO rx_seq semantics (root cause)");
+    emit_log("[jni]   v47 fixes 'Trust popup not shown' — iPhone RST on DATA, off-by-one mux_rx_seq");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -458,42 +458,94 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
      * bao giờ đi tới bước Pair/Trust. Pairing được thực hiện riêng trong
      * nativePair() trên chính client này. */
     emit_log("[lockdown] Mở lockdownd client (no-TLS, chờ Pair)...");
-    lockdownd_error_t ld_err = lockdownd_client_new(
-            g_device, &g_lockdown, "sideloadtool");
-    if (ld_err != LOCKDOWN_E_SUCCESS || !g_lockdown) {
-        char msg[160];
+
+    /*
+     * FIX v47 (CRITICAL — Trust popup không hiện):
+     *
+     * Retry loop cho lockdownd_client_new + lockdownd_get_value.
+     *
+     * Vấn đề: lockdownd_client_new() chỉ mở TCP connection (mux Connect),
+     * chưa gửi data. Nó return SUCCESS ngay cả khi iPhone sắp RST trên
+     * DATA packet đầu tiên (do mux_rx_seq semantics sai, hoặc iPhone
+     * usbmuxd chưa kịp tạo socket entry). Khi lockdownd_get_value() gửi
+     * DATA packet đầu tiên và bị RST, function return error nhưng
+     * nativeConnect() cũ chỉ log "UDID chưa đọc được" và return JNI_TRUE.
+     * Kết quả: nativePair() được gọi trên dead client → fail luôn.
+     *
+     * Fix: nếu lockdownd_get_value() fail với transport error (MUX_ERROR,
+     * RECEIVE_TIMEOUT, UNKNOWN_ERROR), re-establish lockdown client (tạo
+     * TCP connection MỚI với source port mới nhờ alloc_source_port()) và
+     * retry. Tối đa 3 lần.
+     */
+    int ld_attempts = 3;
+    lockdownd_error_t ld_err = LOCKDOWN_E_UNKNOWN_ERROR;
+    for (int ld_attempt = 0; ld_attempt < ld_attempts; ld_attempt++) {
+        if (ld_attempt > 0) {
+            emit_log("[lockdown] Retry mở lockdownd client (sau RST trước đó)...");
+            usleep(300 * 1000);  /* 300ms cho iPhone dọn TIME_WAIT */
+        }
+        /* Free old lockdown client nếu có (dead transport) */
+        if (g_lockdown) {
+            lockdownd_client_free(g_lockdown);
+            g_lockdown = NULL;
+        }
+        ld_err = lockdownd_client_new(g_device, &g_lockdown, "sideloadtool");
+        if (ld_err != LOCKDOWN_E_SUCCESS || !g_lockdown) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "[lockdown] ❌ lockdownd_client_new() err=%d (lần %d/%d)",
+                     (int)ld_err, ld_attempt + 1, ld_attempts);
+            emit_log(msg);
+            g_lockdown = NULL;
+            continue;
+        }
+
+        /* Lấy UniqueDeviceID thật từ lockdown, không lấy từ placeholder trong
+         * usbmuxd_device_info_t. Nếu iPhone chưa cho đọc, vẫn giữ session để
+         * nativePair() có thể yêu cầu Trust. */
+        plist_t unique_value = NULL;
+        lockdownd_error_t value_err = lockdownd_get_value(
+                g_lockdown, NULL, "UniqueDeviceID", &unique_value);
+        char *real_udid = NULL;
+        if (value_err == LOCKDOWN_E_SUCCESS && unique_value) {
+            plist_get_string_val(unique_value, &real_udid);
+        }
+
+        if (value_err == LOCKDOWN_E_SUCCESS) {
+            /* SUCCESS — UDID đọc được (hoặc empty), connection alive */
+            if (real_udid && is_real_udid(real_udid)) {
+                strncpy(g_udid, real_udid, sizeof(g_udid) - 1);
+                g_udid[sizeof(g_udid) - 1] = '\0';
+                usbmuxd_server_update_udid(g_udid);
+                char msg[128];
+                snprintf(msg, sizeof(msg), "[imd] ✅ iPhone UDID thật: %s", g_udid);
+                emit_log(msg);
+            } else {
+                emit_log("[imd] UDID thật chưa đọc được từ lockdown; không dùng UDID giả");
+            }
+            if (real_udid) free(real_udid);
+            if (unique_value) plist_free(unique_value);
+            break;  /* connection alive — exit retry loop */
+        }
+
+        /* Transport error — connection died (RST received) */
+        char msg[256];
         snprintf(msg, sizeof(msg),
-                 "[lockdown] ❌ lockdownd_client_new() err=%d",
-                 (int)ld_err);
+                 "[lockdown] ⚠️ lockdownd_get_value() err=%d (lần %d/%d) — "
+                 "transport died (RST?), sẽ re-establish lockdown client",
+                 (int)value_err, ld_attempt + 1, ld_attempts);
         emit_log(msg);
-        g_lockdown = NULL;
+        if (real_udid) free(real_udid);
+        if (unique_value) plist_free(unique_value);
+        /* Loop continues — will re-create lockdown client */
+    }
+
+    if (!g_lockdown) {
+        emit_log("[lockdown] ❌ Không thể mở lockdownd client sau nhiều lần thử");
         idevice_free(g_device);
         g_device = NULL;
         return JNI_FALSE;
     }
-
-    /* Lấy UniqueDeviceID thật từ lockdown, không lấy từ placeholder trong
-     * usbmuxd_device_info_t. Nếu iPhone chưa cho đọc, vẫn giữ session để
-     * nativePair() có thể yêu cầu Trust. */
-    plist_t unique_value = NULL;
-    lockdownd_error_t value_err = lockdownd_get_value(
-            g_lockdown, NULL, "UniqueDeviceID", &unique_value);
-    char *real_udid = NULL;
-    if (value_err == LOCKDOWN_E_SUCCESS && unique_value) {
-        plist_get_string_val(unique_value, &real_udid);
-    }
-    if (real_udid && is_real_udid(real_udid)) {
-        strncpy(g_udid, real_udid, sizeof(g_udid) - 1);
-        g_udid[sizeof(g_udid) - 1] = '\0';
-        usbmuxd_server_update_udid(g_udid);
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[imd] ✅ iPhone UDID thật: %s", g_udid);
-        emit_log(msg);
-    } else {
-        emit_log("[imd] UDID thật chưa đọc được từ lockdown; không dùng UDID giả");
-    }
-    if (real_udid) free(real_udid);
-    if (unique_value) plist_free(unique_value);
 
     emit_log("[lockdown] ✅ lockdownd client OK (no-TLS; sẵn sàng Pair/Trust)");
     return JNI_TRUE;
