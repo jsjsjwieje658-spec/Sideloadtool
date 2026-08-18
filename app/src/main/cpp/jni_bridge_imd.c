@@ -162,8 +162,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v44 (2026-08-17)");
-    emit_log("[jni]   Fixes: v33-v43 + v44 skip magic check (like upstream)");
+    emit_log("[jni]   SideloadTool native v45 (2026-08-18)");
+    emit_log("[jni]   Fixes: v33-v44 + v45 RST handling + dynamic source port");
+    emit_log("[jni]   v45 fixes 'Trust popup not shown' — ACK/RST infinite loop");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -555,6 +556,56 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
             case LOCKDOWN_E_INVALID_HOST_ID:
                 emit_log("[pair] \u274c HostID không hợp lệ — thử pair lại");
                 return JNI_FALSE;
+
+            /*
+             * FIX v45 (Critical — Trust popup không hiện):
+             *
+             * Transport errors (MUX_ERROR, RECEIVE_TIMEOUT, SSL_ERROR) xảy ra
+             * khi underlying TCP connection bị iPhone reset (RST). Trước fix v45,
+             * code rơi vào default case và return false ngay lập tức → user
+             * phải bấm Pair lại thủ công.
+             *
+             * Fix: re-establish lockdown client (sẽ tạo TCP connection MỚI với
+             * source port mới nhờ alloc_source_port() trong usbmuxd_server.c),
+             * rồi retry lockdownd_pair. Tối đa 3 lần retry trên transport error.
+             */
+            case LOCKDOWN_E_MUX_ERROR:
+            case LOCKDOWN_E_RECEIVE_TIMEOUT:
+            case LOCKDOWN_E_SSL_ERROR: {
+                /*
+                 * FIX v45: Transport error (do iPhone RST). Re-establish
+                 * lockdown client — sẽ tạo TCP connection MỚI với source port
+                 * mới nhờ alloc_source_port() trong usbmuxd_server.c.
+                 *
+                 * Loop counter `i` đã tự động giới hạn tổng số retry
+                 * (PAIR_RETRY_MAX = 20), không cần counter riêng.
+                 */
+                char msg[200];
+                snprintf(msg, sizeof(msg),
+                         "[pair] \u26a0\ufe0f Transport err=%d (RST?) — re-establish lockdown client (loop %d/%d)",
+                         (int)err, i + 1, PAIR_RETRY_MAX);
+                emit_log(msg);
+
+                /* Free old lockdown client (dead transport) */
+                if (g_lockdown) { lockdownd_client_free(g_lockdown); g_lockdown = NULL; }
+
+                /* Re-create lockdown client → triggers new TCP connection via
+                 * our usbmuxd server, with NEW source port (alloc_source_port). */
+                lockdownd_error_t ld_err = lockdownd_client_new(
+                        g_device, &g_lockdown, "sideloadtool");
+                if (ld_err != LOCKDOWN_E_SUCCESS || !g_lockdown) {
+                    char msg2[160];
+                    snprintf(msg2, sizeof(msg2),
+                             "[pair] \u274c Re-establish lockdown client err=%d", (int)ld_err);
+                    emit_log(msg2);
+                    g_lockdown = NULL;
+                    return JNI_FALSE;
+                }
+                emit_log("[pair] \u2705 Re-established lockdown client — retry pair");
+                /* Brief delay cho iPhone usbmuxd dọn TIME_WAIT state cũ */
+                usleep(300 * 1000);
+                continue;  /* retry lockdownd_pair */
+            }
 
             default: {
                 char msg[128];
