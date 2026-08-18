@@ -794,10 +794,33 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
     int n = usb_read_exact(&mhdr, sizeof(mhdr), timeout_ms);
     if (n < (int)sizeof(mhdr)) return -1;
 
-    if (ntohl(mhdr.magic) != V2_MAGIC) {
-        LOGE("usb_recv_tcp: bad magic=0x%08x", ntohl(mhdr.magic));
-        return -1;
+    /*
+     * FIX v44 (Critical): KHÔNG kiểm tra magic trên RX.
+     *
+     * Quan sát từ log v43 của user:
+     *   TX (we sent):    magic = htonl(0xfeedface) → bytes FE ED FA CE
+     *   RX (iPhone sent): magic = 0xfaceface → bytes FA CE FA CE
+     *
+     * iPhone chấp nhận magic 0xfeedface của chúng ta (gửi SYN+ACK lại),
+     * nhưng response của iPhone dùng magic 0xfaceface (khác!).
+     * Có thể iPhone dùng magic khác cho TCP, hoặc đây là quirk của iOS.
+     *
+     * Học từ upstream usbmuxd (device.c dòng 760-820):
+     *   Upstream KHÔNG kiểm tra magic trên RX. Họ chỉ parse:
+     *     - protocol (để biết packet type)
+     *     - length (để biết kích thước)
+     *     - tx_seq/rx_seq (cho v2)
+     *   Và switch theo protocol.
+     *
+     * Fix: bỏ hoàn toàn magic check. Chỉ log warning nếu magic khác 0xfeedface
+     * để debug, nhưng vẫn xử lý packet bình thường.
+     */
+    uint32_t rx_magic = ntohl(mhdr.magic);
+    if (rx_magic != V2_MAGIC) {
+        LOGI("usb_recv_tcp: magic=0x%08x (khác 0x%08x, nhưng vẫn xử lý — upstream không check)",
+             rx_magic, V2_MAGIC);
     }
+
     uint32_t packet_len = ntohl(mhdr.length);
     if (packet_len < sizeof(mhdr) || packet_len > 1024 * 1024) {
         LOGE("usb_recv_tcp: packet length không hợp lệ=%u", packet_len);
