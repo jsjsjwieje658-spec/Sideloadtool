@@ -476,62 +476,76 @@ bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id,
         /*
          * CLAIM INTERFACE — bắt buộc cho bulk_transfer hoạt động.
          *
-         * Trên Android với wrapped fd:
-         *   - LIBUSB_SUCCESS (0): fd sạch, libusb claim được
-         *   - LIBUSB_ERROR_BUSY (-6): Android đã claim → share fd, vẫn OK
-         *   - LIBUSB_ERROR_NOT_SUPPORTED (-12): Android kernel không hỗ trợ
-         *     claim qua wrapped fd → vẫn thử bulk_transfer, có thể hoạt động
+         * FIX v48: Phân loại rõ ràng hơn:
+         *   - LIBUSB_SUCCESS (0): fd sạch, libusb claim OK → dùng libusb path
+         *   - LIBUSB_ERROR_BUSY (-6): Android đã claim → share fd, libusb bulk
+         *     transfer CÓ THỂ hoạt động (tùy OEM)
+         *   - LIBUSB_ERROR_NOT_FOUND (-5): descriptor access fail trên wrapped fd
+         *     → libusb_bulk_transfer sẽ THẤT BẠI → cần Android JNI fallback
+         *   - LIBUSB_ERROR_NOT_SUPPORTED (-12): Android kernel không hỗ trợ claim
+         *     qua wrapped fd → bulk_transfer có thể hoạt động
          *
-         * Nếu claim fail với error khác → thử detach kernel driver (Linux only)
-         * hoặc return false.
+         * Lưu ý: Khi g_iface_claimed = 0, usb_bridge_bulk_write/read sẽ
+         * thử libusb_bulk_transfer → có thể trả IO/PIPE error. JNI layer
+         * (NativeBridge.onNativeBulkWrite/Read) sẽ detect và chuyển sang
+         * Android JNI transport mode.
          */
         int cr = libusb_claim_interface(g_handle, iface_num);
         if (cr == 0) {
             g_iface_claimed = 1;
-            LOGI("usb_bridge_init2: ✅ interface %d claimed successfully (fd sạch)",
+            LOGI("usb_bridge_init2: ✅ interface %d claimed successfully (fd sạch — libusb path)",
                  iface_num);
         } else if (cr == LIBUSB_ERROR_BUSY) {
-            LOGI("usb_bridge_init2: interface %d BUSY (Android pre-claimed) — share fd, tiếp tục",
-                 iface_num);
-            /* Đánh dấu claimed để release sau nếu cần */
-            g_iface_claimed = 0;
-        } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
-            LOGI("usb_bridge_init2: interface %d NOT_SUPPORTED — tiếp tục (thường trên Android)",
+            /*
+             * Android USB service đã claim interface.
+             * libusb vẫn CÓ THỂ hoạt động qua shared fd, nhưng cần
+             *格外 cẩn thận — KHÔNG gọi libusb_release_interface khi close.
+             */
+            LOGI("usb_bridge_init2: ⚠️ interface %d BUSY (Android pre-claimed) — "
+                 "share fd, libusb bulk transfer có thể hoạt động",
                  iface_num);
             g_iface_claimed = 0;
         } else if (cr == LIBUSB_ERROR_NOT_FOUND) {
             /*
-             * FIX v37: NOT_FOUND thường xảy ra khi descriptor access không
-             * hoạt động với wrapped fd (đây là tình huống đang gặp).
-             * Endpoint addresses đã được set từ Kotlin, nên chỉ cần tiếp
-             * tục — bulk_transfer có thể vẫn hoạt động qua shared fd.
+             * FIX v37/v48: NOT_FOUND = descriptor access fail trên wrapped fd.
+             * libusb_bulk_transfer SẼ THẤT BẠI với IO/PIPE error.
+             * JNI layer sẽ detect và switch sang Android JNI transport mode.
              */
-            LOGI("usb_bridge_init2: libusb_claim_interface(%d) NOT_FOUND — "
-                 "endpoint đã set từ Kotlin, tiếp tục bulk_transfer qua shared fd",
+            LOGI("usb_bridge_init2: ⚠️ interface %d NOT_FOUND — "
+                 "libusb bulk transfer sẽ fail, JNI fallback sẽ activate",
+                 iface_num);
+            g_iface_claimed = 0;
+        } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
+            LOGI("usb_bridge_init2: ⚠️ interface %d NOT_SUPPORTED — "
+                 "thử bulk_transfer, JNI fallback nếu fail",
                  iface_num);
             g_iface_claimed = 0;
         } else {
-            LOGE("usb_bridge_init2: libusb_claim_interface(%d) err=%d (%s) — tiếp tục anyway",
+            LOGE("usb_bridge_init2: libusb_claim_interface(%d) err=%d (%s) — "
+                 "thử bulk_transfer, JNI fallback nếu fail",
                  iface_num, cr, libusb_error_name(cr));
             g_iface_claimed = 0;
         }
 
-        /* Clear halt trên cả 2 endpoints để đảm bảo sạch */
+        /*
+         * FIX v48: Clear halt trên cả 2 endpoints SAU KHI claim.
+         * Delay tăng từ 80ms → 120ms cho iOS 17+ (USB stack chậm hơn).
+         *
+         * Quan trọng: clear_halt có thể trả NOT_FOUND nếu interface
+         * chưa được claim bởi libusb (g_iface_claimed=0). Đây là behavior
+         *expected — JNI fallback sẽ handle.
+         */
         if (g_ep_out) {
             int hr = libusb_clear_halt(g_handle, g_ep_out);
             LOGI("usb_bridge_init2: clear_halt ep_out=0x%02x → %d (%s)",
                  g_ep_out, hr, libusb_error_name(hr));
-            if (hr == 0 || hr == LIBUSB_ERROR_NOT_FOUND) {
-                /* NOT_FOUND không phải lỗi nghiêm trọng lúc init —
-                 * sẽ retry khi transfer PIPE */
-            }
-            usleep(80 * 1000);
+            usleep(120 * 1000);
         }
         if (g_ep_in) {
             int hr = libusb_clear_halt(g_handle, g_ep_in);
             LOGI("usb_bridge_init2: clear_halt ep_in=0x%02x → %d (%s)",
                  g_ep_in, hr, libusb_error_name(hr));
-            usleep(80 * 1000);
+            usleep(120 * 1000);
         }
     } else {
         /* Caller không cung cấp endpoints — fallback discovery */

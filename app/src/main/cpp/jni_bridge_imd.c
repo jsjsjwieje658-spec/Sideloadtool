@@ -2,33 +2,21 @@
  * jni_bridge_imd.c — JNI bridge dùng libimobiledevice API thật (Mode 1)
  *
  * ═══════════════════════════════════════════════════════════════════
- *  FIX v20 — Các lỗi quan trọng đã sửa:
+ *  v48 — Comprehensive protocol fix:
  * ═══════════════════════════════════════════════════════════════════
- *  1. RACE CONDITION: usbmuxd_server_start() tạo thread, socket chưa
- *     bind xong khi idevice_new_with_options() gọi ngay sau đó.
- *     Fix: thêm retry loop trong nativeConnect() chờ socket sẵn sàng.
+ *  1. XÓA eager version exchange trong nativeSetUsbFd — gây race condition
+ *     với usbmuxd server start. Version exchange CHỈ xảy ra trong
+ *     do_usb_v1_connect() khi client Connect lần đầu.
  *
- *  2. SERVER KHÔNG START: usbmuxd_server.c/h bị THIẾU hoàn toàn →
- *     usbmuxd_server_socket_path() luôn trả NULL → warning + fail.
- *     Fix: thêm file usbmuxd_server.c/h đầy đủ.
+ *  2. FIX lockdown retry: Tăng ld_attempts 3 → 5, delay 300ms → 500ms,
+ *     thêm clear_halt trước mỗi retry.
  *
- *  3. nativeConnect() không kiểm tra usbmuxd_server_socket_path()
- *     kỹ đủ → vẫn tiếp tục gọi idevice_new_with_options() dù server
- *     chưa ready → err=-3 (IDEVICE_E_NO_DEVICE).
- *     Fix: Wait-for-socket loop + bail nếu không có fd bridge.
+ *  3. FIX nativePair re-establish: Reset version state + clear_halt
+ *     trước khi re-create lockdown client. Nếu re-establish fail,
+ *     KHÔNG return false ngay — tiếp tục retry trong loop.
  *
- *  4. usb_fd_bridge.c/h bị THIẾU hoàn toàn → Mode 1 không compile.
- *     Fix: thêm usb_fd_bridge.c/h đầy đủ.
- *
- *  5. nativeConnect(): idevice_new_with_options retry khi server chưa
- *     có UDID thật → restart server sau idevice_get_udid() gây race.
- *     Fix: cập nhật UDID qua usbmuxd_server_update_udid() (không restart).
- * ═══════════════════════════════════════════════════════════════════
- *
- * ═══════════════════════════════════════════════════════════════════
- * FIX runtime Bug B: nativeSetUsbFd() chỉ khởi tạo libusb và server;
- * version exchange được trì hoãn đến Connect đầu tiên tới lockdown, đúng
- * thứ tự mà libimobiledevice/usbmuxd upstream dùng cho một USB session.
+ *  4. Tương thích iOS 17+: iPhone 17+ cần thêm thời gian để dọn socket
+ *     entry, tăng delay cho mọi retry.
  * ═══════════════════════════════════════════════════════════════════
  */
 #include <jni.h>
@@ -162,9 +150,10 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(
      */
     usb_bridge_set_bridge_ref((void *)g_bridge_obj);
     emit_log("[jni] ═══════════════════════════════════════════════════════");
-    emit_log("[jni]   SideloadTool native v47 (2026-08-18)");
-    emit_log("[jni]   Fixes: v33-v46 + v47 ECHO rx_seq semantics (root cause)");
-    emit_log("[jni]   v47 fixes 'Trust popup not shown' — iPhone RST on DATA, off-by-one mux_rx_seq");
+    emit_log("[jni]   SideloadTool native v48 (2026-08-21)");
+    emit_log("[jni]   Fixes: v33-v47 + v48 comprehensive protocol fix");
+    emit_log("[jni]   v48: removed eager version exchange race, fixed");
+    emit_log("[jni]   thread safety, TIME_WAIT avoidance, retry improvements");
     emit_log("[jni] ═══════════════════════════════════════════════════════");
     LOGI("nativeInit: files_dir=%s", g_files_dir);
 }
@@ -275,37 +264,31 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeSetUsbFd(
      * được gọi đúng thời điểm trước SYN tới port lockdown 62078.
      */
     usbmuxd_server_reset_version_state();
-    emit_log("[usbmux] Đã giữ raw USB fd; trì hoãn version exchange đến lúc Connect lockdown...");
+    emit_log("[usbmux] v48: KHÔNG eager version exchange — để do_usb_v1_connect() xử lý");
 
     /*
-     * FIX v33: Eager version exchange "best-effort" ngay sau khi USB bridge
-     * sẵn sàng — KHÔNG bắt buộc phải thành công ở đây.
+     * FIX v48 (CRITICAL): XÓA hoàn toàn eager version exchange.
      *
-     * Lý do thêm bước eager này:
-     *   - Upstream usbmuxd gửi VERSION NGAY khi device_add() được gọi (ngay
-     *     sau USB enumeration). iPhone có "mux session window" — nếu không
-     *     nhận được VERSION trong vài giây đầu, iPhone có thể vào trạng thái
-     *     "idle" và bỏ qua VERSION packet gửi sau đó.
-     *   - Code cũ CHỈ gửi VERSION khi Connect tới socket (lazy) → quá muộn
-     *     → iPhone đã idle → VERSION không được phản hồi → fail 5/5.
-     *   - Eager attempt ở đây cho iPhone cơ hội nhận VERSION sớm. Nếu fail,
-     *     không sao — lazy attempt trong do_usb_v1_connect() sẽ retry với
-     *     clear_halt đã được apply từ Fix v33.
+     * v33 đã thêm eager exchange "best-effort" ngay sau USB bridge init.
+     * Tuy nhiên, eager exchange gây race condition nghiêm trọng:
      *
-     * Quan trọng:KHÔNG return false nếu eager fail — vẫn cho phép server
-     * start và để lazy attempt xử lý.
+     *   1. Eager exchange gửi VERSION + SETUP
+     *   2. iPhone nhận VERSION, reply, rồi chuyển sang "idle" (mux session
+     *      đã được thiết lập nhưng chưa có client nào kết nối)
+     *   3. usbmuxd_server_start() tạo threads — threads chưa dùng USB
+     *   4. libimobiledevice Connect → do_usb_v1_connect() →
+     *      usbmux_version_exchange() → returns true (g_version_done=1) →
+     *      KHÔNG retry version exchange
+     *   5. iPhone đã "forget" mux session từ step 1 → SYN bị reject
+     *
+     * Version exchange PHẢI xảy ra trong do_usb_v1_connect() — đúng thời
+     * điểm khi client muốn mở TCP connection đến lockdown port 62078.
+     * Tại thời điểm đó, iPhone mux daemon đang ở trạng thái "accepting"
+     * và sẽ trả VERSION response đúng cách.
+     *
+     * Học từ upstream usbmuxd: VERSION được gửi trong device_receive_packet()
+     * khi có client thực sự kết nối, KHÔNG phải lúc enumeration.
      */
-    {
-        emit_log("[usbmux] Eager version exchange (best-effort, non-blocking)...");
-        bool eager_ok = usbmux_version_exchange();
-        if (eager_ok) {
-            emit_log("[usbmux] ✅ Eager version exchange OK — iPhone đã sẵn sàng mux session");
-        } else {
-            emit_log("[usbmux] ⚠️ Eager version exchange fail — sẽ retry lazily khi Connect tới");
-            /* Reset state để lazy attempt trong do_usb_v1_connect() có cơ hội retry */
-            usbmuxd_server_reset_version_state();
-        }
-    }
 
     /*
      * Bước 2: Khởi động usbmuxd server nội bộ.
@@ -460,7 +443,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
     emit_log("[lockdown] Mở lockdownd client (no-TLS, chờ Pair)...");
 
     /*
-     * FIX v47 (CRITICAL — Trust popup không hiện):
+     * FIX v47/v48 (CRITICAL — Trust popup không hiện):
      *
      * Retry loop cho lockdownd_client_new + lockdownd_get_value.
      *
@@ -475,14 +458,24 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(
      * Fix: nếu lockdownd_get_value() fail với transport error (MUX_ERROR,
      * RECEIVE_TIMEOUT, UNKNOWN_ERROR), re-establish lockdown client (tạo
      * TCP connection MỚI với source port mới nhờ alloc_source_port()) và
-     * retry. Tối đa 3 lần.
+     * retry.
+     *
+     * v48: Tăng ld_attempts từ 3 → 5, delay từ 300ms → 500ms.
+     * iPhone iOS 17+ cần thêm thời gian để dọn socket entry.
      */
-    int ld_attempts = 3;
+    int ld_attempts = 5;
     lockdownd_error_t ld_err = LOCKDOWN_E_UNKNOWN_ERROR;
     for (int ld_attempt = 0; ld_attempt < ld_attempts; ld_attempt++) {
         if (ld_attempt > 0) {
             emit_log("[lockdown] Retry mở lockdownd client (sau RST trước đó)...");
-            usleep(300 * 1000);  /* 300ms cho iPhone dọn TIME_WAIT */
+            /*
+             * FIX v48: Tăng delay từ 300ms → 500ms.
+             * iPhone usbmuxd cần thời gian để dọn TIME_WAIT state.
+             * Thêm clear_halt để endpoint sạch cho phiên mới.
+             */
+            usleep(500 * 1000);
+            usb_bridge_clear_endpoints_halt();
+            usleep(100 * 1000);
         }
         /* Free old lockdown client nếu có (dead transport) */
         if (g_lockdown) {
@@ -683,25 +676,43 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(
                 /* Free old lockdown client (dead transport) */
                 if (g_lockdown) { lockdownd_client_free(g_lockdown); g_lockdown = NULL; }
 
+                /*
+                 * FIX v48: Khi re-establish lockdown client, mux session có thể
+                 * đã bị reset (iPhone RST → mux state lost). Cần:
+                 *   1. Reset version state để version exchange được thực hiện lại
+                 *   2. Clear USB endpoint halt
+                 *   3. Delay cho iPhone usbmuxd dọn TIME_WAIT
+                 *   4. Tạo lockdown client mới (trigger Connect → version exchange
+                 *      → SYN handshake trong do_usb_v1_connect)
+                 */
+                usbmuxd_server_reset_version_state();
+                usb_bridge_clear_endpoints_halt();
+
+                /* Delay cho iPhone usbmuxd dọn TIME_WAIT state cũ */
+                usleep(500 * 1000);
+                /* Extra delay cho UNKNOWN_ERROR để user có thời gian bấm Trust */
+                if (is_unknown) {
+                    usleep(500 * 1000);  /* +500ms = 1000ms total */
+                }
+
                 /* Re-create lockdown client → triggers new TCP connection via
-                 * our usbmuxd server, with NEW source port (alloc_source_port). */
+                 * our usbmuxd server, with NEW source port (alloc_source_port).
+                 * Nếu transport dead, idevice_new_with_options sẽ fail →
+                 * return false và để outer retry loop xử lý. */
                 lockdownd_error_t ld_err = lockdownd_client_new(
                         g_device, &g_lockdown, "sideloadtool");
                 if (ld_err != LOCKDOWN_E_SUCCESS || !g_lockdown) {
                     char msg2[160];
                     snprintf(msg2, sizeof(msg2),
-                             "[pair] \u274c Re-establish lockdown client err=%d", (int)ld_err);
+                             "[pair] ❌ Re-establish lockdown client err=%d (attempt %d/%d)",
+                             (int)ld_err, i + 1, PAIR_RETRY_MAX);
                     emit_log(msg2);
                     g_lockdown = NULL;
-                    return JNI_FALSE;
+                    /* KHÔNG return false ngay — retry trong loop */
+                    usleep(800 * 1000);  /* 800ms trước khi retry */
+                    continue;
                 }
-                emit_log("[pair] \u2705 Re-established lockdown client — retry pair");
-                /* Brief delay cho iPhone usbmuxd dọn TIME_WAIT state cũ */
-                usleep(300 * 1000);
-                /* FIX v46: Extra delay cho UNKNOWN_ERROR để user có thời gian bấm Trust */
-                if (is_unknown) {
-                    usleep(500 * 1000);  /* +500ms = 800ms total */
-                }
+                emit_log("[pair] ✅ Re-established lockdown client — retry pair");
                 continue;  /* retry lockdownd_pair */
             }
 

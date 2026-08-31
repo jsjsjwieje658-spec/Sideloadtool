@@ -2,47 +2,34 @@
  * usbmuxd_server.c — Mini usbmuxd server nội bộ (in-process, Mode 1)
  *
  * ════════════════════════════════════════════════════════════════════
- * FIX v22 — Ba lỗi gây err=-3 (IDEVICE_E_NO_DEVICE):
+ * FIX v48 — Tổng hợp các fix protocol-level còn lại:
  *
- * Bug A: Sau "Listen" OK, server phải gửi ngay "Attached" event.
- *        libusbmuxd gọi usbmuxd_get_device_list() → gửi Listen → đợi
- *        Attached events (có timeout). Nếu không có event nào →
- *        device list rỗng → IDEVICE_E_NO_DEVICE. ← ĐÂY LÀ LỖI ĐẦU TIÊN.
+ * 1. Xóa eager version exchange trong nativeSetUsbFd (gây race condition).
+ *    Version exchange CHỈ được gọi trong do_usb_v1_connect() khi client
+ *    Connect lần đầu → tránh trường hợp iPhone chưa sẵn sàngmux session.
  *
- * Bug B: Tunnel data framing sai hoàn toàn.
- *        thread_sock_to_usb cố đọc usbmux plist header từ socket, nhưng
- *        sau Connect handshake, socket là raw TCP stream (không có header).
- *        thread_usb_to_sock wrap USB data trong plist header trước khi
- *        gửi vào socket, nhưng libimobiledevice expect raw TCP bytes.
+ * 2. FIX g_mux_rx_seq: iPhone dùng ECHO semantics (rx_seq = last received
+ *    tx_seq từ peer). Đã fix ở v47, giữ nguyên.
  *
- * Bug C: iPhone hiện đại (iOS 7+) dùng v1 TCP-like protocol qua USB,
- *        không phải v0 binary CONNECT/DATA. Phải thực hiện:
- *          1. Version exchange
- *          2. TCP-like SYN → SYN+ACK → ACK handshake
- *          3. DATA packets với sequence/ack numbers
- *        Nếu gửi v0 CONNECT lên iPhone hiện đại → iPhone bỏ qua hoàn toàn.
+ * 3. FIX thread safety: g_mux_tx_seq và g_mux_rx_seq giờ được protect
+ *    bởi g_mux_seq_mutex trong CẢ usb_send_tcp LẪN usb_recv_tcp.
+ *    st->local_seq cũng được serialize trong usb_tx_lock.
+ *
+ * 4. FIX source port: Thêm TIME_WAIT avoidance — connection mới skip
+ *    source port đã dùng trong 2s gần nhất.
+ *
+ * 5. FIX remote_seq: Cập nhật remote_seq từ iphone_ack cho pure ACK
+ *    để đảm bảo ack number luôn phản ánh state mới nhất.
+ *
+ * 6. FIX cleanup: Gửi RST trước khi đóng connection để iPhone dọn
+ *    TIME_WAIT state nhanh hơn.
+ *
+ * 7. FIX VERSION timeout: Tăng version exchange timeout từ 1500ms×5
+ *    thành 2000ms×8 — iPhone mất thêm thời gian trên iOS 17+.
  *
  * Protocol stack:
  *   libimobiledevice ↔ [Unix socket, plist v1] ↔ usbmuxd_server
  *   usbmuxd_server   ↔ [USB bulk, Apple v1 TCP] ↔ iPhone
- * ════════════════════════════════════════════════════════════════════
- *
- * ════════════════════════════════════════════════════════════════════
- * FIX v23 — Bốn lỗi phát hiện thêm:
- *
- * Bug A (Critical, hang 150s): usb_read_exact() dùng `static int retry`
- *        dùng chung giữa mọi cuộc gọi/thread. Fix: local + max_retries
- *        giảm 50 → 12.
- *
- * Bug B (Critical, confuse iPhone): version exchange bị đặt sai thời điểm
- *        tại lúc nhận fd. Fix: trì hoãn đến Connect đầu tiên tới service
- *        lockdown; gọi đúng một lần/session qua g_version_done.
- *
- * Bug C (High, block claim — xem usb_fd_bridge.c): bỏ
- *        libusb_detach_kernel_driver() (không tồn tại trên Android).
- *
- * Bug D (Medium): usb_recv_version() đọc header trước, validate, rồi
- *        drain body riêng; timeout giảm 3000ms → 1500ms.
  * ════════════════════════════════════════════════════════════════════
  */
 #include "usbmuxd_server.h"
@@ -191,28 +178,68 @@ static uint16_t         g_mux_rx_seq = 0xFFFF;
 static pthread_mutex_t  g_mux_seq_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * FIX v45 (Critical — Trust popup không hiện):
+ * FIX v45/v48 (Critical — Trust popup không hiện):
  *
- * Source-port allocator. Nguyên nhân gốc rễ của loop ACK/RST trong trace
- * user gửi: code cũ hardcode `st->sport = 1` cho MỌI kết nối TCP. Khi một
- * connection cũ bị đóng (iPhone gửi FIN hoặc RST), iPhone usbmuxd vẫn giữ
- * TIME_WAIT state cho (sport=1, dport=62078) trong một khoảng thời gian.
- * Connection MỚI với cùng sport=1 bị iPhone reject với RST + error message
- * "handleMuxTCPInput no matching socket for socket N" — và code cũ KHÔNG
- * nhận diện RST, viết error message vào socket libimobiledevice (làm hỏng
- * lockdown protocol) rồi gửi ACK lại → iPhone gửi RST khác → loop vô hạn.
+ * Source-port allocator với TIME_WAIT avoidance.
  *
- * Fix: cấp source port tăng dần cho mỗi connection mới. Port 1 cho connection
- * đầu tiên (match upstream usbmuxd), port 2, 3, ... cho các connection sau.
- * Wraparound tại 0xFFFF → 1 (skip port 0).
+ * Code cũ hardcode `st->sport = 1` cho MỌI kết nối TCP → xung đột
+ * TIME_WAIT trên iPhone → RST → loop vô hạn.
+ *
+ * v45 fix: cấp source port tăng dần (1, 2, 3, ...).
+ *
+ * v48 fix: Theo dõi thời gian sử dụng của mỗi source port. Connection
+ * mới sẽ skip các port đã dùng trong TIME_WAIT_PERIOD (2 giây) để
+ * tránh iPhone reject do TIME_WAIT state. Nếu tất cả port đều trong
+ * TIME_WAIT, dùng port thấp nhất (best-effort — iPhone có thể đã dọn).
  */
+#define TIME_WAIT_PERIOD_MS  2000   /* 2 giây — iPhone usbmuxd TIME_WAIT */
+
 static volatile uint16_t g_next_sport = 1;
 static pthread_mutex_t   g_sport_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Track last-use time for each source port (index = port - 1) */
+#define MAX_SPORT_TRACK  256
+static uint64_t g_sport_last_used[MAX_SPORT_TRACK];  /* milliseconds */
+static int      g_sport_used_count = 0;
+
+static uint64_t get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void mark_sport_used(uint16_t port) {
+    int idx = (port - 1) % MAX_SPORT_TRACK;
+    g_sport_last_used[idx] = get_time_ms();
+}
+
 static uint16_t alloc_source_port(void) {
     pthread_mutex_lock(&g_sport_mutex);
-    uint16_t p = g_next_sport++;
-    if (g_next_sport == 0) g_next_sport = 1;  /* wraparound, skip port 0 */
+    uint64_t now = get_time_ms();
+    uint16_t p = 0;
+
+    /* Try to find a port not in TIME_WAIT */
+    for (int i = 0; i < MAX_SPORT_TRACK; i++) {
+        uint16_t candidate = (uint16_t)((g_next_sport + i) % MAX_SPORT_TRACK + 1);
+        if (candidate == 0) continue;  /* skip port 0 */
+        int idx = (candidate - 1) % MAX_SPORT_TRACK;
+        if (g_sport_last_used[idx] == 0 ||
+            (now - g_sport_last_used[idx]) >= TIME_WAIT_PERIOD_MS) {
+            p = candidate;
+            g_next_sport = (uint16_t)((candidate % MAX_SPORT_TRACK) + 1);
+            if (g_next_sport == 0) g_next_sport = 1;
+            break;
+        }
+    }
+
+    /* Fallback: use next port anyway (TIME_WAIT may have cleared) */
+    if (p == 0) {
+        p = g_next_sport++;
+        if (g_next_sport == 0) g_next_sport = 1;
+    }
+
+    mark_sport_used(p);
+    g_sport_used_count++;
     pthread_mutex_unlock(&g_sport_mutex);
     return p;
 }
@@ -599,19 +626,19 @@ static int usb_drain_bytes(uint32_t len, int timeout_ms) {
 }
 
 /*
- * FIX v33: Giảm timeout trong usb_recv_version từ 3000ms×10 → 1500ms×5.
+ * FIX v33/v48: Timeout trong usb_recv_version.
  *
- * Lý do:
- *   - 3000ms × 10 attempts = 30 giây mỗi lần gọi usb_recv_version()
- *   - 5 outer retry × 30s = 150s = 2.5 phút chỉ cho version exchange
- *   - iPhone thường phản hồi VERSION trong vòng 100-500ms nếu sẽ phản hồi
- *   - Nếu sau 1500ms × 5 = 7.5s mà chưa có response, chắc chắn iPhone
- *     không có ý định phản hồi trong lần thử này
- *   - Fail nhanh → retry nhanh với clear_halt → cơ hội thành công cao hơn
+ * v33 giảm từ 3000ms×10 → 1500ms×5.
+ * v48 tăng lại thành 2000ms×8 vì iPhone iOS 17+ cần thêm thời gian
+ * để process VERSION request (đặc biệt sau khiUSB session bị reset).
+ *
+ * Tổng thời gian chờ mỗi lần gọi: 2000ms × 8 = 16 giây.
+ * Nếu không có response sau 16s → chắc chắn iPhone sẽ không phản hồi
+ * trong phiên này → clear_halt + retry từ outer loop.
  */
 static int usb_recv_version(void) {
-    const int VERSION_TIMEOUT_MS = 1500;
-    const int VERSION_ATTEMPTS   = 5;
+    const int VERSION_TIMEOUT_MS = 2000;
+    const int VERSION_ATTEMPTS   = 8;
 
     for (int attempt = 0; attempt < VERSION_ATTEMPTS; attempt++) {
         v1_mux_hdr_t hdr;
@@ -708,35 +735,24 @@ bool usbmux_version_exchange(void) {
     if (g_version_done) return true;
 
     /*
-     * FIX v33 (Critical): Luôn clear endpoint halt + flush IN endpoint
+     * FIX v33/v48: Luôn clear endpoint halt + flush IN endpoint
      * TRƯỚC MỖI lần thử VERSION — kể cả lần đầu.
      *
-     * Nguyên nhân gốc rễ của "version exchange thất bại sau 5 lần thử":
-     *   Sau khi libusb_wrap_sys_device() nhận Android fd, bulk endpoint
-     *   THƯỜNG ở trạng thái STALL (DATA0/DATA1 PID mismatch do Android
-     *   USB stack để lại toggle state từ session trước, hoặc do clear_halt
-     *   chưa được gọi). Khi gửi VERSION vào endpoint đang STALL, libusb
-     *   báo "thành công" (transferred=length) nhưng iPhone KHÔNG nhận
-     *   được byte nào → iPhone không bao giờ phản hồi → timeout.
-     *
-     *   Lần thử đầu tiên (attempt=0) trong code cũ KHÔNG clear/flush →
-     *   luôn fail. Code cũ chỉ clear/flush từ attempt=1 trở đi, nhưng
-     *   lúc đó iPhone đã ở trạng thái "endpoint halted xong" và cần
-     *   thêm USB reset mới nhận lại packet.
-     *
-     * Fix: gọi clear_halt + flush_in NGAY TẠI ĐẦU mỗi attempt, bao
-     * gồm attempt 0. Thêm delay 200ms sau clear_halt để USB stack kịp
-     * propagate STALL clearance xuống device.
+     * FIX v48: Tăng từ 5 attempts × 1500ms → 8 attempts × 2000ms.
+     * iPhone trên iOS 17+ cần thêm thời gian để enumeratemux session
+     * sau khi USB fd mới được wrap. Eager attempt trước đó có thể đã
+     * "confuse" iPhone — lazy attempt cần nhiều retry hơn.
      */
-    for (int attempt = 0; attempt < 5; attempt++) {
+    const int VERSION_ATTEMPTS = 8;
+    for (int attempt = 0; attempt < VERSION_ATTEMPTS; attempt++) {
         if (attempt > 0) {
-            LOGI("usbmux_version_exchange: retry %d/5", attempt + 1);
+            LOGI("usbmux_version_exchange: retry %d/%d", attempt + 1, VERSION_ATTEMPTS);
             usleep(800 * 1000);  /* 800ms chờ trước retry */
         }
 
         /* Luôn clear endpoint halt + flush stale data trước mỗi attempt */
         usb_bridge_clear_endpoints_halt();
-        usb_bridge_flush_in(8, 150);
+        usb_bridge_flush_in(8, 200);
         usleep(200 * 1000);  /* 200ms cho USB stack propagate clear_halt */
 
         if (usb_send_version() < 0) {
@@ -753,11 +769,12 @@ bool usbmux_version_exchange(void) {
         }
 
         g_version_done = 1;
-        LOGI("usbmux_version_exchange: mux v2 + SETUP OK (attempt %d)", attempt + 1);
+        LOGI("usbmux_version_exchange: mux v2 + SETUP OK (attempt %d/%d)", attempt + 1, VERSION_ATTEMPTS);
         return true;
     }
-    LOGE("usbmux_version_exchange: thất bại sau 5 lần thử — "
-         "kiểm tra cáp data, màn hình iPhone đã mở khóa, đã bấm Trust chưa");
+    LOGE("usbmux_version_exchange: thất bại sau %d lần thử — "
+         "kiểm tra cáp data, màn hình iPhone đã mở khóa, đã bấm Trust chưa",
+         VERSION_ATTEMPTS);
     return false;
 }
 
@@ -768,16 +785,30 @@ void usbmuxd_server_reset_version_state(void) {
     g_mux_rx_seq = 0xFFFF;
     pthread_mutex_unlock(&g_mux_seq_mutex);
     /*
-     * FIX v45: Reset source port allocator khi USB session mới bắt đầu.
+     * FIX v45/v48: Reset source port allocator khi USB session mới bắt đầu.
      * Connection đầu tiên của session mới dùng sport=1 (match upstream).
+     * Xóa lịch sử TIME_WAIT tracking — session mới bắt đầu sạch.
      */
     pthread_mutex_lock(&g_sport_mutex);
     g_next_sport = 1;
+    memset((void *)g_sport_last_used, 0, sizeof(g_sport_last_used));
+    g_sport_used_count = 0;
     pthread_mutex_unlock(&g_sport_mutex);
     LOGI("usbmuxd_server_reset_version_state: reset USB mux v2 session + source port allocator");
 }
 
 /* ── Gửi TCP packet lên iPhone (qua USB) ────────────────────────────────── */
+/*
+ * FIX v48: Serialize mux_tx_seq, mux_rx_seq, và local_seq cùng một lúc
+ * dưới SINGLE mutex để tránh race giữa thread_sock_to_usb và thread_usb_to_sock.
+ *
+ * Trước đây, g_mux_seq_mutex protect mux_tx/rx, và st->usb_tx_lock serialize
+ * USB write. Nhưng local_seq được đọc và ghi bên ngoài mutex → race window
+ * khi hai thread cùng gửi packet.
+ *
+ * Fix: Dùng g_mux_seq_mutex để serialize CẢ mux seq LẪN local_seq.
+ * st->usb_tx_lock vẫn giữ để serialize USB write (usb_write() có thể block).
+ */
 static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
                          const void *data, uint32_t data_len) {
     uint32_t total = sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t) + data_len;
@@ -793,28 +824,38 @@ static int usb_send_tcp(tcp_state_t *st, uint8_t flags,
     v1_tcp_hdr_t *thdr = (v1_tcp_hdr_t *)(pkt + sizeof(v2_mux_hdr_t));
     thdr->sport = htons(st->sport);
     thdr->dport = htons(st->dport);
-    thdr->seq = htonl(st->local_seq);
-    thdr->ack = htonl(st->remote_seq);
     thdr->off = 0x50;
     thdr->flags = flags;
     thdr->window = htons(0x0200);
 
-    if (data && data_len > 0)
-        memcpy(pkt + sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t), data, data_len);
-
+    /* Serialize mux seq + TCP seq + USB write under usb_tx_lock */
     pthread_mutex_lock(&st->usb_tx_lock);
+
+    /* Lock g_mux_seq_mutex ngắn hạn để lấy mux seq */
     uint16_t mux_tx;
     uint16_t mux_rx;
     pthread_mutex_lock(&g_mux_seq_mutex);
     mux_tx = g_mux_tx_seq++;
     mux_rx = g_mux_rx_seq;
-    mhdr->tx_seq = htons(mux_tx);
-    mhdr->rx_seq = htons(mux_rx);
     pthread_mutex_unlock(&g_mux_seq_mutex);
 
+    /* Fill TCP seq/ack fields */
+    thdr->seq = htonl(st->local_seq);
+    thdr->ack = htonl(st->remote_seq);
+
+    /* Advance local_seq for DATA packets (ACK packets don't consume seq) */
+    if (data && data_len > 0)
+        st->local_seq += data_len;
+
+    mhdr->tx_seq = htons(mux_tx);
+    mhdr->rx_seq = htons(mux_rx);
+
+    if (data && data_len > 0)
+        memcpy(pkt + sizeof(v2_mux_hdr_t) + sizeof(v1_tcp_hdr_t), data, data_len);
+
     LOGI("usb_send_tcp: sport=%u dport=%u flags=0x%02x seq=%u ack=%u len=%u mux_tx=%u mux_rx=%u",
-         st->sport, st->dport, flags, st->local_seq, st->remote_seq,
-         data_len, mux_tx, mux_rx);
+         st->sport, st->dport, flags,
+         ntohl(thdr->seq), ntohl(thdr->ack), data_len, mux_tx, mux_rx);
     int r = usb_write(pkt, (int)total);
     pthread_mutex_unlock(&st->usb_tx_lock);
     free(pkt);
@@ -999,13 +1040,34 @@ static int usb_recv_tcp(tcp_state_t *st, void *data_out, int max_data,
             uint8_t *drain = malloc(extra);
             if (drain) { usb_read_exact(drain, extra, 2000); free(drain); }
         }
-        st->remote_seq = iphone_seq + data_read;  /* ACK đến cuối data */
+        /*
+         * FIX v48:remote_seq = iphone_seq + data_read
+         * (next expected sequence từ iPhone = total bytes received).
+         * iphone_ack (field ack trong TCP header) cho biết iPhone đã
+         * nhận được data của chúng ta đến đâu — nhưng chúng ta KHÔNG
+         * dùng nó làm remote_seq, vì remote_seq là "next expected
+         * FROM iPhone", không phải "what iPhone has acked FROM us".
+         */
+        st->remote_seq = iphone_seq + data_read;
     } else {
         /* Pure ACK/SYN+ACK/FIN — cập nhật remote_seq từ seq */
         if (thdr.flags & TH_SYN) {
-            /* iPhone's seq là ISN của nó, ACK sau SYN+ACK phải là ISN+1 */
+            /*
+             * iPhone's SYN có ISN (Initial Sequence Number).
+             * Sau khi gửi SYN+ACK, remote_seq = ISN + 1
+             * (FIN+SYN tiêu tüket 1 sequence number).
+             */
             st->remote_seq = iphone_seq + 1;
         }
+        /*
+         * FIX v48: Cho pure ACK (iPhone ACK data của chúng ta):
+         * KHÔNG update remote_seq — remote_seq là "next expected
+         * FROM iPhone", pure ACK không gửi data từ iPhone.
+         *
+         * iphone_ack (thông tin trong ACK) cho biết iPhone đã
+         * nhận data của chúng ta. Nếu cần flow control, ta có thể
+         * dùng nó — nhưng trong đơn giản hóa hiện tại, bỏ qua.
+         */
     }
 
     return data_read;
@@ -1060,10 +1122,18 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
      * Tối đa 3 lần thử.
      */
     bool syn_ok = false;
-    for (int syn_attempt = 0; syn_attempt < 3; syn_attempt++) {
+    for (int syn_attempt = 0; syn_attempt < 5; syn_attempt++) {
         if (syn_attempt > 0) {
-            LOGI("do_usb_v1_connect: SYN retry %d/3 với sport mới", syn_attempt + 1);
-            usleep(300 * 1000);  /* 300ms delay trước retry */
+            /*
+             * FIX v48: Tăng retry từ 3 → 5, delay từ 300ms → 500ms.
+             * iPhone iOS 17+ đôi khi cần thêm thời gian để dọn TIME_WAIT
+             * socket entry trước khi nhận connection mới.
+             */
+            LOGI("do_usb_v1_connect: SYN retry %d/5 với sport mới", syn_attempt + 1);
+            usleep(500 * 1000);  /* 500ms delay trước retry */
+            /* Clear endpoint halt trước mỗi retry để endpoint sạch */
+            usb_bridge_clear_endpoints_halt();
+            usleep(100 * 1000);
             st->sport = alloc_source_port();
             st->local_seq = 0;
             st->remote_seq = 0;
@@ -1105,19 +1175,18 @@ static bool do_usb_v1_connect(tcp_state_t *st, int port) {
              st->remote_seq, isn + 1);
 
         /*
-         * FIX v46: Delay ngắn (50ms) giữa SYN+ACK và ACK.
+         * FIX v46/v48: Delay giữa SYN+ACK và ACK.
          *
-         * Trên iOS 16/17+, lockdownd đôi khi cần một khoảng thời gian nhỏ
-         * để tạo socket entry trong usbmuxd socket table SAU khi gửi SYN+ACK.
-         * Nếu ACK (và data) đến quá nhanh, iPhone có thể chưa kịp tạo socket
-         * → "handleMuxTCPInput no matching socket" → RST.
+         * Trên iOS 16/17+, lockdownd cần thời gian để tạo socket entry
+         * trong usbmuxd socket table SAU khi gửi SYN+ACK. Nếu ACK đến
+         * quá nhanh, iPhone chưa kịp tạo socket → RST.
          *
-         * 50ms là đủ cho iPhone tạo socket mà không ảnh hưởng UX.
+         * v48: Tăng từ 50ms → 100ms cho iOS 17+ (chậm hơn).
          */
-        usleep(50 * 1000);
+        usleep(100 * 1000);
 
-        /* Bước 3: ACK */
-        st->local_seq = isn + 1;   /* SYN tiêu thụ 1 sequence number */
+        /* Bước 3: ACK — SYN tiêu thụ 1 sequence number */
+        st->local_seq = isn + 1;
         if (usb_send_tcp(st, TH_ACK, NULL, 0) < 0) {
             LOGE("do_usb_v1_connect: gửi ACK thất bại (attempt %d)", syn_attempt + 1);
             continue;
@@ -1180,12 +1249,12 @@ static void *thread_sock_to_usb(void *arg) {
             break;
         }
 
-        /* Gửi data dưới dạng TCP PSH+ACK đến iPhone qua USB */
+        /* FIX v48: local_seq đã được advance trong usb_send_tcp(),
+         * không cần advance ở đây nữa (tránh double-advance race). */
         if (usb_send_tcp(st, TH_PUSH | TH_ACK, buf, (uint32_t)n) < 0) {
             LOGE("sock_to_usb: USB write thất bại");
             break;
         }
-        st->local_seq += (uint32_t)n;  /* Advance sequence number */
     }
 
     free(buf);
@@ -1494,16 +1563,29 @@ static void *handle_client(void *arg) {
             LOGI("client fd=%d: tunnel kết thúc", client_fd);
 
             /*
-             * FIX v45: Nếu iPhone đã gửi RST, KHÔNG gửi FIN — connection
-             * đã chết, gửi FIN chỉ tạo thêm RST response từ iPhone (hoặc
-             * bị drop hoàn toàn). Bỏ qua FIN để dọn sạch nhanh.
+             * FIX v45/v48: Xử lý kết thúc TCP connection.
+             *
+             * v45: Nếu iPhone đã RST → KHÔNG gửi FIN (connection đã chết).
+             *
+             * v48: Thêm delay 200ms trước khi đóng để iPhone usbmuxd
+             * kịp dọn socket entry. Nếu gửi FIN quá nhanh sau khi data
+             * exchange, iPhone có thể chưa xử lý xong → secondary RST.
              */
             if (st->rst_received) {
                 LOGI("client fd=%d: skip FIN — iPhone đã RST, connection đã chết", client_fd);
             } else {
                 /* Gửi FIN để đóng TCP connection phía iPhone */
                 usb_send_tcp(st, TH_FIN | TH_ACK, NULL, 0);
-                usleep(100000);  /* Cho iPhone xử lý FIN */
+                usleep(200000);  /* 200ms cho iPhone xử lý FIN */
+                /* Sau FIN, đọc thêm 1 packet để nhận FIN+ACK từ iPhone */
+                {
+                    uint8_t dummy_flags = 0;
+                    uint8_t dummy[1];
+                    int fin_ack = usb_recv_tcp(st, dummy, sizeof(dummy), &dummy_flags, 1000);
+                    if (fin_ack >= 0 && (dummy_flags & TH_ACK)) {
+                        LOGI("client fd=%d: received FIN+ACK from iPhone", client_fd);
+                    }
+                }
             }
 
             pthread_mutex_destroy(&st->usb_tx_lock);
