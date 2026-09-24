@@ -68,6 +68,7 @@ usbmuxd) → libusbmuxd + libimobiledevice **nguyên bản**.
 | 18 | **zsign ký FILE IPA GỐC** sau khi đã đổi bundle id trong thư mục giải nén → bundle id mới bị bỏ, profile lệch → ApplicationVerificationFailed. | Đổi bundle id → tải profile → ký **thư mục .app đã sửa**. |
 | 19 | Extension (.appex) không có App ID/profile riêng, zsign 1 `-m`. | App ID + profile cho từng .appex, zsign nhiều `-m` (app chính trước), không `-b`. |
 | 20 | UDID fallback cuối là **đường dẫn filesDir**; `"2fa_completed"` → KeyError. | Kết nối + ghép nối iPhone TRƯỚC, lấy UDID thật; xử lý đúng các trường hợp. |
+| 21 | Hộp thoại nhập liệu (`PromptDialog.kt`) đặt câu hỏi làm *label* của ô nhập 1 dòng → câu hỏi nhiều dòng ("bỏ extension?", DSID) bị cắt, không đọc được; không có nút huỷ; `UiPrompt.submitResponse()` dùng `SynchronousQueue.put()` trên main thread → bấm "Gửi" 2 lần là **treo app (ANR)**. Đường này nay mới thật sự được dùng vì 2FA đi qua dialog (#17). | Câu hỏi hiện thành nội dung (cuộn được), ô nhập riêng; mã 2FA dùng bàn phím số, lọc 6 chữ số; thêm nút **Huỷ** (gửi rỗng = huỷ/bỏ qua phía Python); `offer()` không bao giờ chặn main thread. |
 
 ---
 
