@@ -75,6 +75,12 @@ jobs:
 
       - name: "🤖 Setup Android SDK"
         uses: android-actions/setup-android@v3
+        with:
+          # Mặc định action cài "tools platform-tools", nhưng gói "tools" (SDK
+          # Tools cũ) đã bị Google gỡ khỏi kho → sdkmanager (cmdline-tools 16.0)
+          # báo "Failed to find package 'tools'" và thoát mã 1 (run #151).
+          # NDK/platform/build-tools do bước kế tiếp tự cài.
+          packages: "platform-tools"
 
       - name: "📦 Install NDK ${{ env.NDK_VERSION }}"
         run: |
