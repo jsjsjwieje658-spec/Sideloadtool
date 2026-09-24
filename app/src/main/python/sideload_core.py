@@ -30,7 +30,8 @@ from apple_auth import AppleAuth, fetch_official_servers
 from developer_api import DeveloperAPI, classify_app_id_error
 from utils import (
     run_command, extract_ipa, find_app_bundle, get_bundle_id, get_app_name,
-    set_bundle_id, save_certificate_as_pem, decode_apple_data_field,
+    set_bundle_id, set_extension_bundle_id, find_extensions,
+    save_certificate_as_pem, decode_apple_data_field,
 )
 import config_manager
 import device_link
@@ -180,140 +181,344 @@ def _clear_cert_from_state(state: dict):
     _save_state(state)
 
 
-# ── App ID resolution ─────────────────────────────────────────────────────────
+# ── Nhập liệu qua UI ──────────────────────────────────────────────────────────
 #
-# BUGFIX v13 [CRITICAL]: Trước đây, khi Apple trả resultCode 9401 ("An App ID
-# with Identifier '...' is not available. Please enter a different string.")
-# — đúng lỗi thấy trong log người dùng report với 'com.SideStore.SideStore' —
-# code CHỈ gọi classify_app_id_error() để in ra một thông báo lỗi thân thiện
-# hơn, RỒI VẪN return False NGAY, bỏ cuộc hoàn toàn. Docstring của FIX-4 trong
-# developer_api.py (classify_app_id_error/delete_app_id) đã ghi rõ ý định
-# "nền tảng cho chức năng tự động đổi bundle id khi bị trùng" và tham chiếu
-# một hàm `sideload_core.py::_resolve_app_id()` — nhưng hàm đó CHƯA TỪNG được
-# viết. Nói cách khác: hạ tầng phân loại lỗi đã có, nhưng phần XỬ LÝ THẬT bị
-# thiếu — đây chính là lý do "Ký & Cài đặt" luôn thất bại với bundle id phổ
-# biến (SideStore, AltStore, ...) đã bị hàng nghìn tài khoản khác đăng ký mất,
-# vì App ID là chuỗi DUY NHẤT TOÀN CẦU trên Apple Developer, không chỉ trong
-# phạm vi tài khoản của bạn.
+# BUGFIX v49: AppleAuth() trước đây được tạo KHÔNG có input_func, nên khi Apple
+# hỏi mã 2FA, apple_auth gọi input() của Python — trên Android không có stdin →
+# EOFError → 2FA luôn thất bại. Nay mọi câu hỏi đi qua UiPrompt (dialog).
+
+def _ui_input(prompt) -> str:
+    try:
+        value = UiPrompt.requestInput(str(prompt))
+        return "" if value is None else str(value)
+    except Exception as e:
+        print(f"[ui] Không hiện được hộp nhập liệu: {e}")
+        return ""
+
+
+def _new_auth(anisette_url: str = ""):
+    effective = anisette_url or config_manager.get_anisette_url()
+    return AppleAuth(anisette_url=effective or None, input_func=_ui_input)
+
+
+def _login(apple_id: str, password: str, anisette_url: str = ""):
+    """Đăng nhập Apple ID → (auth, dev_api, team_id) hoặc (None, None, None)."""
+    print("Đang đăng nhập Apple ID...")
+    auth = _new_auth(anisette_url)
+    session = auth.authenticate(apple_id, password)
+    if not session or not session.get("authenticated"):
+        print("❌ Đăng nhập Apple ID thất bại.")
+        return None, None, None
+    if session.get("authenticated") == "2fa_completed":
+        # chuỗi "2fa_completed" là truthy nhưng KHÔNG có session_token
+        print("ℹ️  2FA đã xác nhận nhưng Apple chưa cấp phiên đầy đủ — bấm chạy lại một lần nữa.")
+        return None, None, None
+    print("✅ Đăng nhập thành công.")
+    dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
+    teams = dev_api.list_teams()
+    if not teams:
+        print("❌ Không lấy được Development Team.")
+        return None, None, None
+    team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
+    dev_api.set_team(team_id)
+    print(f"Team: {team_id}")
+    return auth, dev_api, team_id
+
+
+# ── UDID ──────────────────────────────────────────────────────────────────────
+
+def _normalize_udid(value) -> str:
+    s = "".join(str(value or "").split())
+    if len(s) == 24 and "-" not in s:          # iPhone XS+: 8-16
+        s = s[:8] + "-" + s[8:]
+    return s
+
+
+def _looks_like_udid(value) -> bool:
+    s = _normalize_udid(value)
+    hexchars = [c for c in s if c != "-"]
+    return (24 <= len(s) <= 64 and len(hexchars) >= 24
+            and all(c in "0123456789abcdefABCDEF" for c in hexchars)
+            and any(c != "0" for c in hexchars))
+
+
+# ── App ID + provisioning profile ─────────────────────────────────────────────
 #
-# _resolve_app_id() bên dưới lấp đúng lỗ hổng này:
-#   - 'unavailable' (9401): tự thêm hậu tố ngẫu nhiên vào bundle id và thử
-#     lại (tối đa 5 lần) — đúng cách AltStore/SideStore/Sideloadly xử lý.
-#   - 'quota' (giới hạn 10 App ID mới/7 ngày của tài khoản free): tự xoá 1
-#     App ID cũ do CHÍNH TOOL NÀY tạo trước đó (tra trong registry cục bộ
-#     state["app_id_map"], KHÔNG bao giờ đụng App ID không rõ nguồn gốc) để
-#     giải phóng hạn mức, rồi thử lại.
-#   - Kết quả (bundle id hiệu lực + appIdId) được lưu lại trong state để lần
-#     sideload SAU của CÙNG app trên CÙNG tài khoản dùng lại đúng App ID đó,
-#     tránh vừa tốn thêm App ID trong hạn mức mỗi lần bấm "Ký & Cài đặt", vừa
-#     tránh cài app đó thành 2 bản riêng biệt trên máy chỉ vì bundle id đổi
-#     ngẫu nhiên mỗi lần.
+# BUGFIX v49 (port từ bản Termux đã chạy thật trên máy người dùng):
+#   (1) IPA PHẢI mang đúng App ID đã nộp cho Apple. Bản cũ gọi set_bundle_id()
+#       trên thư mục đã giải nén rồi lại đưa FILE IPA GỐC cho zsign → mọi thay
+#       đổi bundle id bị bỏ qua, profile (application-identifier = TEAM.<id mới>)
+#       lệch bundle id thật → iOS từ chối (ApplicationVerificationFailed).
+#       Nay: đổi bundle id → tải profile → ký CHÍNH thư mục .app đã sửa.
+#   (2) Mỗi .appex (widget, share extension…) cần App ID + profile RIÊNG khớp
+#       bundle id của nó; zsign nhận nhiều -m (app chính trước). Bản cũ chỉ có
+#       một profile cho cả gói → extension ký sai entitlements → không cài được.
+#   (3) 9401 "not available" = bundle id bị TÀI KHOẢN KHÁC chiếm (App ID là duy
+#       nhất toàn cầu) → dùng id phái sinh; quota 10 App ID/7 ngày → tái dùng
+#       App ID sẵn có chưa bị app nào trên máy chiếm. Lựa chọn được ghi vào
+#       state["app_id_map"] để lần sau cập nhật đúng app cũ, không tốn quota.
 
-_APP_ID_UNAVAILABLE_MAX_RETRIES = 5
+def _first_present(d, keys, default=None):
+    for k in keys:
+        v = (d or {}).get(k)
+        if v not in (None, ""):
+            return v
+    return default
 
 
-def _random_bundle_suffix(length: int = 5) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+def _app_id_identifier(app_id) -> str:
+    return str((app_id or {}).get("identifier") or (app_id or {}).get("bundleId") or "").strip()
 
 
-def _find_app_id_by_bundle(dev_api: "DeveloperAPI", team_id: str, bundle: str):
-    """Tra list_app_ids() cho identifier == '{team_id}.{bundle}' (định dạng
-    Apple trả về từ old plist API — xem BUGFIX v11/BUG-5). Trả về appIdId
-    hoặc None."""
-    full_id = f"{team_id}.{bundle}"
-    for a in dev_api.list_app_ids():
-        identifier = a.get("identifier") or a.get("attributes", {}).get("identifier", "")
-        if identifier == full_id:
-            return a.get("appIdId") or a.get("id")
+def _app_id_key(app_id):
+    return _first_present(app_id or {}, ["appIdId", "id"])
+
+
+def _find_app_id(app_ids, identifier, ignore_case=False):
+    target = str(identifier or "")
+    for a in app_ids or []:
+        ident = _app_id_identifier(a)
+        if not ident or "*" in ident:
+            continue
+        if ident == target or (ignore_case and ident.lower() == target.lower()):
+            return a
     return None
 
 
-def _free_one_own_app_id(dev_api: "DeveloperAPI", state: dict, skip_map_key: str = None) -> bool:
-    """Xoá 1 App ID cũ do CHÍNH TOOL NÀY tạo (tra trong state["app_id_map"])
-    để giải phóng hạn mức 10 App ID mới/7 ngày. KHÔNG xoá App ID đang cần
-    dùng (skip_map_key) và KHÔNG đụng App ID nào không có trong registry cục
-    bộ này — App ID lạ có thể do Xcode hoặc app khác của người dùng tạo."""
-    app_id_map = state.setdefault("app_id_map", {})
-    for key, entry in list(app_id_map.items()):
-        if key == skip_map_key:
+def _error_text(dev_api) -> str:
+    err = getattr(dev_api, "last_error", None)
+    if not isinstance(err, dict):
+        return str(err or "")
+    parts = [str(err.get("resultCode", "")), str(err.get("userString", ""))]
+    raw = err.get("raw") or {}
+    for ve in (raw.get("validationErrors") or err.get("validationErrors") or []):
+        parts.append(str(ve))
+    return " | ".join(p for p in parts if p and p != "None")
+
+
+def _is_identifier_taken(dev_api) -> bool:
+    if classify_app_id_error(getattr(dev_api, "last_error", None)) == "unavailable":
+        return True
+    low = _error_text(dev_api).lower()
+    return "already been registered" in low or "already exists" in low
+
+
+def _is_app_id_limit(dev_api) -> bool:
+    err = getattr(dev_api, "last_error", None) or {}
+    if str(err.get("resultCode", "")) == "9120":
+        return True
+    return classify_app_id_error(err) == "quota"
+
+
+def _suffixed_identifier(base: str) -> str:
+    import re
+    base = re.sub(r"[^A-Za-z0-9.\-]", "", str(base)).strip(".").strip("-")
+    while ".." in base:
+        base = base.replace("..", ".")
+    suffix = "s" + uuid.uuid4().hex[:6]
+    room = 128 - len(suffix) - 1
+    if len(base) > room:
+        base = base[:room].rstrip(".")
+    return f"{base}.{suffix}"
+
+
+def _installed_bundle_ids() -> set:
+    try:
+        return set(device_link.list_installed_apps({}) or [])
+    except Exception as e:
+        print(f"[appid] Không đọc được danh sách app trên iPhone: {e}")
+        return set()
+
+
+def _choose_replacement_app_id(app_ids, original_bundle_id, installed):
+    exact, prefixed, other = [], [], []
+    for a in app_ids or []:
+        ident = _app_id_identifier(a)
+        if not ident or "*" in ident or ident in installed:
             continue
-        app_id_id = entry.get("app_id_id")
-        if not app_id_id:
-            continue
-        if dev_api.delete_app_id(app_id_id):
-            app_id_map.pop(key, None)
-            _save_state(state)
-            return True
-    return False
+        if ident == original_bundle_id:
+            exact.append(a)
+        elif ident.startswith(original_bundle_id + ".") or ident.startswith(original_bundle_id + "-"):
+            prefixed.append(a)
+        else:
+            other.append(a)
+    for bucket in (exact, prefixed, other):
+        if bucket:
+            return _app_id_identifier(bucket[0]), bucket[0]
+    return None, None
 
 
-def _resolve_app_id(dev_api: "DeveloperAPI", team_id: str, base_bundle: str, app_name: str, state: dict):
-    """Tạo hoặc tái sử dụng App ID cho base_bundle. Trả về
-    (effective_bundle_id, app_id_id), hoặc (None, None) nếu thất bại hẳn."""
-    map_key = f"{team_id}:{base_bundle}"
-    app_id_map = state.setdefault("app_id_map", {})
+def _remember_app_id(state, team_id, base_bundle, ident, app_id):
+    state.setdefault("app_id_map", {})[f"{team_id}:{base_bundle}"] = {
+        "effective_bundle": ident, "app_id_id": _app_id_key(app_id)}
+    _save_state(state)
 
-    # 1) Đã "chốt" một bundle id hiệu lực cho đúng app + team này trước đây?
-    cached = app_id_map.get(map_key)
-    if cached:
-        effective_bundle = cached.get("effective_bundle", base_bundle)
-        app_id_id = _find_app_id_by_bundle(dev_api, team_id, effective_bundle)
-        if app_id_id:
-            print(f"Dùng lại App ID đã chốt trước đó: {team_id}.{effective_bundle}")
-            return effective_bundle, app_id_id
-        # App ID đã biến mất phía Apple (vd hết hạn/bị revoke) — xoá cache hỏng.
-        app_id_map.pop(map_key, None)
 
-    # 2) App ID với đúng bundle id gốc đã có sẵn trên tài khoản?
-    existing = _find_app_id_by_bundle(dev_api, team_id, base_bundle)
+def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
+    """→ (app_id_dict, final_identifier) hoặc (None, None)."""
+    remembered = (state.get("app_id_map") or {}).get(f"{team_id}:{bundle_id}") or {}
+    rem_ident = remembered.get("effective_bundle")
+    if rem_ident:
+        found = _find_app_id(app_ids, rem_ident)
+        if found:
+            print(f"[appid] ♻️  Dùng lại App ID đã chọn lần trước: {rem_ident}")
+            return found, rem_ident
+
+    existing = _find_app_id(app_ids, bundle_id) or _find_app_id(app_ids, bundle_id, ignore_case=True)
     if existing:
-        print(f"Dùng lại App ID: {team_id}.{base_bundle}")
-        app_id_map[map_key] = {"effective_bundle": base_bundle, "app_id_id": existing}
-        _save_state(state)
-        return base_bundle, existing
+        ident = _app_id_identifier(existing)
+        print(f"[appid] ✅ Đã có App ID '{ident}' — dùng lại.")
+        _remember_app_id(state, team_id, bundle_id, ident, existing)
+        return existing, ident
 
-    # 3) Tạo mới — tự xử lý 'unavailable' (đổi bundle id) và 'quota' (giải
-    #    phóng App ID cũ) thay vì bỏ cuộc ngay ở lần thử đầu tiên.
-    candidate = base_bundle
-    attempt = 0
-    quota_freed_once = False
-    while True:
-        print(f"Đang tạo App ID: {team_id}.{candidate}")
-        result = dev_api.create_app_id(candidate, app_name)
-        if result:
-            app_id_id = result.get("appIdId") or result.get("id")
-            print(f"✅ Tạo App ID thành công: {team_id}.{candidate}")
-            app_id_map[map_key] = {"effective_bundle": candidate, "app_id_id": app_id_id}
-            _save_state(state)
-            return candidate, app_id_id
+    print(f"[appid] Chưa có App ID cho '{bundle_id}' — đang tạo...")
+    created = dev_api.create_app_id(bundle_id, app_name)
+    if created:
+        print(f"[appid] ✅ Đã tạo App ID '{bundle_id}'.")
+        app_ids.append(created)
+        _remember_app_id(state, team_id, bundle_id, bundle_id, created)
+        return created, bundle_id
 
-        kind = classify_app_id_error(dev_api.last_error)
-        err_msg = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
+    refreshed = dev_api.list_app_ids()
+    again = _find_app_id(refreshed, bundle_id) or _find_app_id(refreshed, bundle_id, ignore_case=True)
+    if again:
+        ident = _app_id_identifier(again)
+        print(f"[appid] ✅ Liệt kê lại thì thấy App ID '{ident}' — dùng lại.")
+        app_ids[:] = refreshed
+        _remember_app_id(state, team_id, bundle_id, ident, again)
+        return again, ident
 
-        if kind == "unavailable" and attempt < _APP_ID_UNAVAILABLE_MAX_RETRIES:
-            attempt += 1
-            suffix = _random_bundle_suffix()
-            print(
-                f"⚠️  Bundle id '{team_id}.{candidate}' đã bị MỘT TÀI KHOẢN KHÁC đăng ký mất "
-                f"(App ID là duy nhất TOÀN CẦU trên Apple Developer, không chỉ trong tài khoản "
-                f"của bạn) — tự đổi bundle id và thử lại (lần {attempt}/{_APP_ID_UNAVAILABLE_MAX_RETRIES})..."
-            )
-            candidate = f"{base_bundle}-{suffix}"
-            continue
-
-        if kind == "quota" and not quota_freed_once:
-            quota_freed_once = True
-            if _free_one_own_app_id(dev_api, state, skip_map_key=map_key):
-                print("Đã giải phóng 1 App ID cũ do tool này tạo trước đó — thử lại...")
-                continue
-            print(
-                "❌ Tài khoản đã đạt giới hạn 10 App ID mới/7 ngày và không có App ID cũ nào "
-                f"của tool này để tự giải phóng: {err_msg}"
-            )
-            return None, None
-
-        print(f"❌ Không tạo được App ID '{team_id}.{candidate}': {err_msg}")
+    taken, limit = _is_identifier_taken(dev_api), _is_app_id_limit(dev_api)
+    print(f"[appid] ❌ Apple từ chối App ID '{bundle_id}': {_error_text(dev_api)}")
+    if not (taken or limit):
         return None, None
+    if taken:
+        print("[appid]    → bundle id này đã bị MỘT TÀI KHOẢN APPLE KHÁC đăng ký (App ID là duy nhất"
+              " toàn cầu — rất hay gặp với SideStore/AltStore). Sẽ đổi bundle id của IPA.")
+    if limit:
+        print("[appid]    → tài khoản đã hết lượt tạo App ID (10 / 7 ngày). Sẽ tái dùng App ID sẵn có.")
+
+    for a in app_ids:                          # App ID phái sinh từ lần chạy trước
+        ident = _app_id_identifier(a)
+        if "*" not in ident and (ident.startswith(bundle_id + ".") or ident.startswith(bundle_id + "-")):
+            print(f"[appid] ♻️  Tái dùng App ID phái sinh có sẵn: {ident}")
+            _remember_app_id(state, team_id, bundle_id, ident, a)
+            return a, ident
+
+    if not limit:
+        for _ in range(4):
+            candidate = _suffixed_identifier(bundle_id)
+            print(f"[appid] Đang tạo App ID thay thế: {candidate}...")
+            new_app_id = dev_api.create_app_id(candidate, app_name)
+            if new_app_id:
+                print(f"[appid] ✅ Đã tạo App ID thay thế: {candidate}")
+                app_ids.append(new_app_id)
+                _remember_app_id(state, team_id, bundle_id, candidate, new_app_id)
+                return new_app_id, candidate
+            if _is_identifier_taken(dev_api):
+                continue
+            if _is_app_id_limit(dev_api):
+                print("[appid] ⚠️  Đã chạm giới hạn App ID — chuyển sang tái dùng App ID sẵn có.")
+            else:
+                print(f"[appid] ❌ Không tạo được '{candidate}': {_error_text(dev_api)}")
+            break
+
+    new_id, app_id = _choose_replacement_app_id(app_ids, bundle_id, _installed_bundle_ids())
+    if new_id:
+        print(f"[appid] ♻️  Dùng App ID sẵn có chưa bị app nào trên iPhone chiếm: {new_id}")
+        _remember_app_id(state, team_id, bundle_id, new_id, app_id)
+        return app_id, new_id
+    print("[appid] ❌ Hết cách: bundle id gốc bị chiếm, hết quota tạo App ID và không còn App ID"
+          " trống. Chờ hết chu kỳ 7 ngày hoặc dọn App ID cũ trên developer.apple.com.")
+    return None, None
+
+
+def _ensure_app_id(dev_api, app_ids, identifier, display_name):
+    """App ID cho một .appex → (app_id_dict, final_identifier) hoặc (None, None)."""
+    found = _find_app_id(app_ids, identifier) or _find_app_id(app_ids, identifier, ignore_case=True)
+    if found:
+        print(f"[appid] ✅ Đã có App ID cho extension '{_app_id_identifier(found)}' — dùng lại.")
+        return found, _app_id_identifier(found)
+    for _ in range(4):
+        created = dev_api.create_app_id(identifier, display_name)
+        if created:
+            print(f"[appid] ✅ Đã tạo App ID '{identifier}'.")
+            app_ids.append(created)
+            return created, identifier
+        if _is_identifier_taken(dev_api):
+            new_identifier = _suffixed_identifier(identifier)
+            print(f"[appid] ⚠️  '{identifier}' đã bị tài khoản khác đăng ký → thử '{new_identifier}'")
+            identifier = new_identifier
+            continue
+        print(f"[appid] ❌ Không tạo được App ID '{identifier}': {_error_text(dev_api)}")
+        return None, None
+    return None, None
+
+
+def _remove_extensions(app_bundle_path):
+    removed = []
+    for sub in ("PlugIns", "Extensions"):
+        d = os.path.join(app_bundle_path, sub)
+        if os.path.isdir(d):
+            removed.extend(sorted(os.listdir(d)))
+            shutil.rmtree(d, ignore_errors=True)
+    print(f"[appid] 🗑  Đã bỏ {len(removed)} extension: {', '.join(removed) or '(không có)'}")
+
+
+def _ask_drop_extensions(failed_id) -> bool:
+    answer = _ui_input(
+        f"Không đăng ký được App ID cho extension '{failed_id}' (thường do hết 10 App ID/7 ngày).\n"
+        "App chính vẫn cài được nếu bỏ extension (mất widget/share extension…).\n"
+        "Gõ C để bỏ extension và tiếp tục, bỏ trống để huỷ:")
+    return answer.strip().lower() in ("c", "co", "có", "y", "yes")
+
+
+def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name, state, team_id):
+    """→ list[(bundle_path, bundle_id, profile_path)] (phần tử đầu = app chính)."""
+    app_ids = dev_api.list_app_ids()
+    print(f"[appid] Tài khoản đang có {len(app_ids)} App ID.")
+    main_app_id, final_bundle_id = _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id)
+    if not main_app_id:
+        return None
+    final_bundle_id = _app_id_identifier(main_app_id) or final_bundle_id
+    if final_bundle_id != bundle_id:
+        print(f"[appid] Ghi đè bundle id trong IPA cho khớp App ID đã nộp: {bundle_id} → {final_bundle_id}")
+        set_bundle_id(app_bundle_path, final_bundle_id)
+
+    targets = [(app_bundle_path, final_bundle_id, main_app_id)]
+    for appex_path, appex_id in find_extensions(app_bundle_path):     # đọc SAU khi đã đổi
+        label = f"{app_name} {os.path.splitext(os.path.basename(appex_path))[0]}"
+        appex_app_id, final_appex_id = _ensure_app_id(dev_api, app_ids, appex_id, label)
+        if not appex_app_id:
+            if _ask_drop_extensions(appex_id):
+                _remove_extensions(app_bundle_path)
+                targets = targets[:1]
+                break
+            return None
+        if final_appex_id != appex_id:
+            print(f"[appid] Ghi đè bundle id của extension: {appex_id} → {final_appex_id}")
+            set_extension_bundle_id(appex_path, final_appex_id)
+        targets.append((appex_path, final_appex_id, appex_app_id))
+
+    result = []
+    for bundle_path, ident, app_id_obj in targets:
+        app_id_id = _app_id_key(app_id_obj)
+        if not app_id_id:
+            print(f"[profile] ❌ App ID '{ident}' không có appIdId.")
+            return None
+        print(f"[profile] Tải provisioning profile cho {ident}...")
+        profile = dev_api.download_provisioning_profile(app_id_id)
+        raw = _first_present(profile or {}, ["encodedProfile", "profileContent", "content"])
+        if not raw:
+            print(f"[profile] ❌ Không tải được profile cho {ident} (thiết bị đã vào team chưa?).")
+            return None
+        data = decode_apple_data_field(raw)
+        out_path = os.path.join(bundle_path, "embedded.mobileprovision")
+        with open(out_path, "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+        print(f"[profile] ✅ Nhúng {len(data)} byte vào {os.path.basename(bundle_path)}")
+        result.append((bundle_path, ident, out_path))
+    return result
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -325,290 +530,165 @@ def do_sideload(
     udid_override: str = "",
     anisette_url: str = "",
 ) -> bool:
-    """Ký và cài đặt IPA lên thiết bị iOS đang kết nối USB."""
+    """Ký và cài đặt IPA lên iPhone đang cắm USB."""
     try:
         print("══ Bắt đầu quá trình sideload ══")
+        if not ipa_path or not os.path.isfile(ipa_path):
+            print(f"❌ Không tìm thấy file IPA: {ipa_path}")
+            return False
 
-        # ── Chuẩn bị thư mục làm việc ───────────────────────────────────────
+        # ── Bước 0: kết nối + ghép nối iPhone TRƯỚC (lấy UDID thật) ──────────
+        # Bản cũ lấy UDID từ nhiều nguồn, fallback cuối là... đường dẫn filesDir,
+        # rồi đăng ký chuỗi đó với Apple. UDID đúng nhất là UniqueDeviceID do
+        # lockdownd của chính iPhone trả về; kiểm tra USB trước cũng giúp không
+        # tốn lượt App ID khi cáp/ghép nối còn lỗi.
+        print("[Bước 0/5] Kết nối và ghép nối iPhone qua USB...")
+        try:
+            pair_record = device_link.pair_device()
+        except device_link.LockdownError as e:
+            print(f"❌ Không kết nối/ghép nối được iPhone: {e}")
+            return False
+        udid = _normalize_udid(pair_record.get("udid"))
+        if not _looks_like_udid(udid):
+            for cand in (udid_override, _current_udid):
+                if _looks_like_udid(cand):
+                    udid = _normalize_udid(cand)
+                    break
+        if not _looks_like_udid(udid):
+            print("❌ Không đọc được UDID của iPhone — không thể đăng ký thiết bị với Apple.")
+            return False
+        print(f"UDID: {udid}")
+
+        # ── Bước 1: Apple ID ────────────────────────────────────────────────
+        print("[Bước 1/5] Đăng nhập Apple ID...")
+        auth, dev_api, team_id = _login(apple_id, password, anisette_url)
+        if not dev_api:
+            return False
+
+        devices = dev_api.list_devices()
+        registered = any(
+            str(d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")).lower() == udid.lower()
+            for d in devices
+        )
+        if not registered:
+            name = f"iPhone-{udid.replace('-', '')[:8]}"
+            print(f"Đang đăng ký thiết bị (name='{name}', UDID={udid})...")
+            if not dev_api.register_device(name, udid):
+                err = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
+                print(f"❌ Apple từ chối đăng ký thiết bị {udid}: {err}")
+                print("   Dừng lại: profile tải về sẽ không chứa máy này → cài chắc chắn thất bại.")
+                return False
+            print(f"✅ Thiết bị đã vào team: {udid}")
+        else:
+            print("Thiết bị đã có trong team.")
+
+        # ── Bước 2: Certificate ─────────────────────────────────────────────
+        print("[Bước 2/5] Chuẩn bị certificate...")
         work_dir = os.path.join(str(AppPaths.filesDir()), "sideload_work")
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
         os.makedirs(work_dir, exist_ok=True)
 
-        # ── Giải nén IPA ─────────────────────────────────────────────────────
-        print("Đang giải nén IPA...")
-        # BUGFIX v12: extract_ipa() trả về output_dir (work_dir), KHÔNG phải
-        # đường dẫn tới .app bundle. Gọi trực tiếp app_dir = extract_ipa(...)
-        # rồi get_bundle_id(app_dir) → tìm Info.plist trong sideload_work/ →
-        # không tồn tại → "Info.plist không tìm thấy trong .../sideload_work".
-        # Fix: tách thành 2 bước — giải nén xong, rồi find_app_bundle() để
-        # lấy đường dẫn thật tới SomeApp.app/
-        extract_ipa(ipa_path, work_dir)
-        app_dir = find_app_bundle(work_dir)
-        bundle_id = get_bundle_id(app_dir)
-        app_name  = get_app_name(app_dir)
-        print(f"Ứng dụng: {app_name} ({bundle_id})")
-
-        # ── Xác thực Apple ID ─────────────────────────────────────────────────
-        print("Đang đăng nhập Apple ID...")
-        effective_anisette = anisette_url or config_manager.get_anisette_url()
-        auth = AppleAuth(anisette_url=effective_anisette or None)
-        # BUGFIX v11: AppleAuth dùng authenticate() không phải sign_in()
-        session = auth.authenticate(apple_id, password)
-        if not session or not session.get("authenticated"):
-            print("❌ Đăng nhập Apple ID thất bại.")
-            return False
-        print("✅ Đăng nhập thành công.")
-
-        # ── Lấy Development Team ─────────────────────────────────────────────
-        # BUGFIX v11: DeveloperAPI cần (auth_object, dsid, session_token) —
-        # không phải session dict. auth.session là requests.Session dùng để gọi HTTP.
-        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
-        teams = dev_api.list_teams()
-        if not teams:
-            print("❌ Không lấy được Development Team.")
-            return False
-        team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
-        dev_api.set_team(team_id)
-        print(f"Team: {team_id}")
-
-        # ── Certificate ───────────────────────────────────────────────────────
         state = _load_state()
-        cert_id    = state.get("certificate_id")
-        cert_pem   = state.get("certificate_pem")
-        key_pem    = state.get("private_key_pem")
-        reuse_cert = False
-
+        cert_id, cert_pem, key_pem = state.get("certificate_id"), state.get("certificate_pem"), state.get("private_key_pem")
+        reuse = False
         if cert_id and cert_pem and key_pem:
-            existing = [c for c in dev_api.list_certificates() if c.get("id") == cert_id]
-            if existing:
-                print(f"Dùng lại certificate hiện có: {cert_id}")
-                reuse_cert = True
-
-        if not reuse_cert:
+            if any(str(c.get("id")) == str(cert_id) for c in dev_api.list_certificates()):
+                print(f"Dùng lại certificate: {cert_id}")
+                reuse = True
+        if not reuse:
             print("Đang tạo certificate mới...")
-            # BUGFIX v11: create_certificate() tự sinh RSA key + CSR nội bộ.
-            # Không gọi generate_csr() (không tồn tại) hay truyền arg vào.
-            # Kết quả trả về: {"certificateId":..., "certContent":..., "_private_key_pem":...}
             cert_data = dev_api.create_certificate()
             if not cert_data:
-                print("❌ Không tạo được certificate.")
+                print("❌ Không tạo được certificate. Nếu tài khoản đã đủ số certificate, vào mục"
+                      " \"Thu hồi chứng chỉ\" để revoke cái cũ rồi chạy lại.")
                 return False
-
             cert_id = cert_data.get("certificateId") or cert_data.get("id", "")
-            # certContent là DER bytes (đã được decode_apple_data_field xử lý)
             raw_cert = cert_data.get("certContent") or cert_data.get("certificateContent") or b""
             cert_bytes = decode_apple_data_field(raw_cert)
             if not cert_bytes:
-                print("❌ Không lấy được nội dung certificate (certContent rỗng).")
+                print("❌ Apple không trả nội dung certificate.")
                 return False
-            # Chuyển DER → PEM để zsign đọc được
             import base64 as _b64
             if isinstance(cert_bytes, bytes) and not cert_bytes.startswith(b"-----"):
-                cert_pem = (
-                    "-----BEGIN CERTIFICATE-----\n"
-                    + _b64.encodebytes(cert_bytes).decode("ascii")
-                    + "-----END CERTIFICATE-----\n"
-                )
+                cert_pem = ("-----BEGIN CERTIFICATE-----\n" + _b64.encodebytes(cert_bytes).decode("ascii")
+                            + "-----END CERTIFICATE-----\n")
             else:
                 cert_pem = cert_bytes.decode("utf-8") if isinstance(cert_bytes, bytes) else cert_bytes
-
-            # _private_key_pem đã là PEM (TraditionalOpenSSL) từ cryptography lib
             key_pem = cert_data.get("_private_key_pem", "")
             if not key_pem:
-                print("❌ Không lấy được private key từ create_certificate().")
+                print("❌ Không có private key cho certificate mới.")
                 return False
-
             state.update({"certificate_id": cert_id, "certificate_pem": cert_pem, "private_key_pem": key_pem})
             _save_state(state)
             print(f"✅ Tạo certificate thành công: {cert_id}")
-
-        # Ghi cert và key ra file để zsign dùng
         cert_file = os.path.join(work_dir, "cert.pem")
-        key_file  = os.path.join(work_dir, "key.pem")
-        with open(cert_file, "w") as f: f.write(cert_pem)
-        with open(key_file,  "w") as f: f.write(key_pem)
+        key_file = os.path.join(work_dir, "key.pem")
+        with open(cert_file, "w") as f:
+            f.write(cert_pem)
+        with open(key_file, "w") as f:
+            f.write(key_pem)
 
-        # ── App ID ────────────────────────────────────────────────────────────
-        # BUGFIX v13: trước đây, một lỗi 'unavailable' (resultCode 9401 — bundle
-        # id đã bị tài khoản khác đăng ký mất, vd 'com.SideStore.SideStore')
-        # khiến hàm bỏ cuộc ngay lập tức. Giờ dùng _resolve_app_id(), tự động
-        # đổi bundle id (thêm hậu tố) khi bị trùng, và tự giải phóng App ID cũ
-        # khi đạt giới hạn 10 App ID mới/7 ngày — xem chú thích đầy đủ ở định
-        # nghĩa _resolve_app_id() phía trên.
-        safe_bundle = bundle_id.replace("_", "-")
-        effective_bundle, app_id_id = _resolve_app_id(dev_api, team_id, safe_bundle, app_name, state)
-        if not app_id_id:
-            print("❌ Không tạo được App ID — xem log phía trên để biết nguyên nhân cụ thể.")
+        # ── Bước 3: App ID + profile (IPA đổi theo App ID TRƯỚC khi ký) ──────
+        print("[Bước 3/5] App ID + provisioning profile...")
+        extracted = os.path.join(work_dir, "extracted")
+        extract_ipa(ipa_path, extracted)
+        app_dir = find_app_bundle(extracted)
+        bundle_id = get_bundle_id(app_dir)
+        app_name = get_app_name(app_dir)
+        print(f"Ứng dụng: {app_name} ({bundle_id})")
+        targets = _prepare_app_ids_and_profiles(dev_api, app_dir, bundle_id, app_name, state, team_id)
+        if not targets:
+            print("❌ Không chuẩn bị được App ID / provisioning profile — dừng.")
             return False
-        full_app_id = f"{team_id}.{effective_bundle}"
-        if effective_bundle != safe_bundle:
-            print(f"ℹ️  App ID hiệu lực: {full_app_id} (đã đổi từ '{safe_bundle}' do bị trùng).")
+        print(f"[appid] Bundle id trong IPA: {targets[0][1]}"
+              + "".join(f"\n[appid]   + extension: {t[1]}" for t in targets[1:]))
 
-        # ── Provisioning Profile ──────────────────────────────────────────────
-        print("Đang tạo Provisioning Profile...")
-        udid = udid_override or _current_udid or config_manager.get_connected_udid() or str(AppPaths.filesDir())
-
-        # Đăng ký UDID thiết bị nếu chưa có
-        # BUGFIX v11: list_devices() dùng old plist API → device dict có
-        # "deviceNumber" (UDID), không có lớp "attributes" như v1 API.
-        devices = dev_api.list_devices()
-        registered = any(
-            (d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")) == udid
-            for d in devices
-        )
-        if not registered:
-            print(f"Đang đăng ký thiết bị UDID: {udid}")
-            # BUGFIX v12: register_device(device_name, device_udid) — args cũ bị
-            # đảo ngược: udid được truyền vào tham số device_NAME → Apple nhận
-            # deviceNumber="Android Sideload Device" (tên thiết bị thay vì UDID).
-            #
-            # BUGFIX v14: giá trị trả về CHƯA TỪNG được kiểm tra — nếu Apple từ
-            # chối đăng ký (vd UDID sai định dạng, hoặc lỗi tạm thời), code cũ
-            # vẫn đi tiếp bình thường tới bước tải Provisioning Profile như thể
-            # thiết bị đã đăng ký thành công. Vì team chưa thực sự có thiết bị
-            # nào, Apple sẽ báo resultCode 8220 "Your team has no devices from
-            # which to generate a provisioning profile" ở bước SAU — rất khó
-            # truy về đúng nguyên nhân gốc (đăng ký thiết bị thất bại) từ lỗi
-            # đó. Giờ kiểm tra ngay và dừng lại với thông báo rõ ràng.
-            if not dev_api.register_device("Android Sideload Device", udid):
-                err_msg = (dev_api.last_error or {}).get("userString") or "lỗi không xác định"
-                print(f"❌ Không đăng ký được thiết bị UDID {udid}: {err_msg}")
-                return False
-            print(f"✅ Đăng ký thiết bị thành công: {udid}")
-
-        # BUGFIX v11: download_provisioning_profile(appIdId) là method đúng.
-        # create_provisioning_profile() không tồn tại trong developer_api.py.
-        # Old plist API trả về provisioningProfile.encodedProfile (base64 DER).
-        profile_data = dev_api.download_provisioning_profile(app_id_id)
-        if not profile_data:
-            print("❌ Không tải được Provisioning Profile.")
-            return False
-        # encodedProfile từ old API (không phải attributes.profileContent từ v1)
-        raw_profile = profile_data.get("encodedProfile") or profile_data.get("profileContent") or ""
-        profile_bytes = decode_apple_data_field(raw_profile)
-        if not profile_bytes:
-            print("❌ Provisioning Profile rỗng sau decode.")
-            return False
-        profile_file  = os.path.join(work_dir, "profile.mobileprovision")
-        with open(profile_file, "wb") as f:
-            f.write(profile_bytes if isinstance(profile_bytes, bytes) else profile_bytes.encode())
-        print("✅ Tải Provisioning Profile thành công.")
-
-        # Đặt bundle ID hiệu lực vào app bundle.
-        #
-        # BUGFIX v13 [CRITICAL — nguyên nhân khiến cài đặt luôn thất bại dù ký
-        # "thành công"]: bản cũ gọi set_bundle_id(app_dir, f"{team_id}.{safe_bundle}")
-        # — TỰ Ý gắn thêm tiền tố Team ID vào CFBundleIdentifier. Đây SAI hoàn
-        # toàn: CFBundleIdentifier trong Info.plist KHÔNG bao giờ chứa Team ID;
-        # Team ID chỉ xuất hiện trong entitlement "application-identifier" của
-        # provisioning profile dưới dạng "TEAMID.<CFBundleIdentifier>" — do
-        # Apple tự ghép, không phải do tool này ghép vào Info.plist.
-        # Hệ quả: App ID đăng ký với Apple là "<team_id>.{effective_bundle}"
-        # (App ID = TeamID + bundle id gốc "com.SideStore.SideStore[-xxxxx]"),
-        # nhưng CFBundleIdentifier bị ghi thành "{team_id}.com.SideStore.SideStore[-xxxxx]"
-        # (có thêm TeamID lặp lại) → khi cài, installd so khớp entitlement
-        # "application-identifier" = "TEAMID.com.SideStore.SideStore..." của
-        # profile với CFBundleIdentifier thực tế của app và thấy KHÔNG khớp
-        # → cài đặt bị từ chối (hoặc app crash ngay khi mở vì code signing
-        # không hợp lệ), dù bước "Ký IPA bằng zsign" ở trên báo "thành công".
-        # Fix: chỉ dùng effective_bundle (bundle id thật, có thể đã thêm hậu
-        # tố ngẫu nhiên nếu bị trùng ở bước _resolve_app_id() — KHÔNG có Team
-        # ID) làm CFBundleIdentifier, đúng như App ID đã đăng ký với Apple.
-        set_bundle_id(app_dir, effective_bundle)
-
-        # ── Ký IPA bằng zsign ─────────────────────────────────────────────────
-        #
-        # BUGFIX v14 [CRITICAL]: code cũ gọi run_command(["zsign", ...]) — tức
-        # subprocess tìm một binary tên "zsign" trong PATH của tiến trình
-        # Android. Android KHÔNG có PATH kiểu Linux desktop và app không được
-        # phép exec() file tuỳ ý ngoài nativeLibraryDir(); "zsign" không tồn
-        # tại ở đâu cả trên máy thật (chỉ tồn tại trong Termux, môi trường
-        # gốc mà tool này được port từ đó) → subprocess raise
-        # FileNotFoundError: [Errno 2] No such file or directory: 'zsign'
-        # — đúng lỗi thấy trong log người dùng report ("zsign thất bại:
-        # [Errno 2] No such file or directory: 'zsign'").
-        #
-        # AppPaths.zsignPath() (Kotlin, app/.../bridge/AppPaths.kt) đã trỏ
-        # đúng tới binary zsign thật được đóng gói cùng APK
-        # (jniLibs/arm64-v8a/libzsign.so) — nhưng chưa từng được dùng ở đây.
-        # Đồng thời phải set LD_LIBRARY_PATH=AppPaths.nativeDepsDir() khi
-        # spawn, vì libzsign.so cần libssl.so.3/libcrypto.so.3/libc++_shared.so
-        # đã được AppPaths.nativeDepsDir() tự giải nén sẵn (xem chú thích chi
-        # tiết trong AppPaths.kt) — nếu không, linker không tìm thấy 3 thư
-        # viện này và zsign thoát ngay với "CANNOT LINK EXECUTABLE".
-        #
-        # BUGFIX v15 [CRITICAL]: sau khi v14 làm zsign thực sự chạy được, nó
-        # thoát ngay với "Invalid temp folder! /tmp" (exit 255). Nguyên nhân:
-        # zsign (src/zsign.cpp, hàm main) mặc định dùng ZFile::GetTempFolder()
-        # làm nơi giải nén IPA tạm thời và ghi ipa output tạm — trên
-        # Linux/Android hàm này trả cứng "/tmp" (src/common/fs.cpp) nếu không
-        # truyền cờ -t/--temp_folder. Android sandbox của mỗi app KHÔNG có
-        # thư mục /tmp nào cả (mỗi app chỉ thấy filesDir riêng của mình), nên
-        # zsign tự kiểm tra IsFolder("/tmp") thất bại và thoát ngay trước khi
-        # kịp đọc bất kỳ tham số ký nào khác. zsign CÓ hỗ trợ chỉ định thư mục
-        # tạm qua "-t <path>" — chỉ cần trỏ vào một thư mục ghi được bên trong
-        # sideload_work (đã tồn tại, đã ghi được vì cert.pem/key.pem ở trên
-        # cũng nằm trong đó) là đủ.
-        print("Đang ký IPA bằng zsign...")
-        signed_ipa = os.path.join(work_dir, "signed.ipa")
+        # ── Bước 4: ký bằng zsign ───────────────────────────────────────────
+        # Ký THƯ MỤC .app đã sửa (không phải IPA gốc), một -m cho mỗi bundle
+        # (app chính trước), KHÔNG -b (bundle id đã sửa bằng Python). zsign cần
+        # -t (Android không có /tmp) và LD_LIBRARY_PATH cho libssl/libcrypto.
+        print("[Bước 4/5] Ký IPA bằng zsign...")
+        import re as _re
+        safe_name = _re.sub(r"[^\w.\-]", "_", app_name).strip("._") or "app"
+        signed_ipa = os.path.join(work_dir, f"{safe_name}_signed.ipa")
         zsign_tmp_dir = os.path.join(work_dir, "zsign_tmp")
         os.makedirs(zsign_tmp_dir, exist_ok=True)
         zsign_bin = AppPaths.zsignPath()
-        zsign_env = {"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()}
-        # BUGFIX v12: run_command() trả về str (stdout) hoặc raise CalledProcessError,
-        # KHÔNG phải tuple (bool, str). Unpacking "ok_sign, sign_out = run_command(...)"
-        # gây ValueError ngay cả khi zsign thành công.
+        cmd = [zsign_bin, "-f", "-k", key_file, "-c", cert_file]
+        for _bp, _ident, prof in targets:
+            cmd += ["-m", prof]
+        cmd += ["-o", signed_ipa, "-z", "9", "-t", zsign_tmp_dir, app_dir]
         try:
-            run_command([
-                zsign_bin,
-                "-k", key_file,
-                "-c", cert_file,
-                "-m", profile_file,
-                "-o", signed_ipa,
-                "-z", "9",
-                "-t", zsign_tmp_dir,
-                ipa_path,
-            ], extra_env=zsign_env)
-            print("✅ Ký IPA thành công.")
+            run_command(cmd, extra_env={"LD_LIBRARY_PATH": AppPaths.nativeDepsDir()})
         except FileNotFoundError as e:
-            print(f"❌ zsign thất bại: không tìm thấy binary tại '{zsign_bin}' ({e}). "
-                  f"Kiểm tra APK có đúng ABI arm64-v8a và jniLibs/arm64-v8a/libzsign.so "
-                  f"có được đóng gói vào bản build này không.")
+            print(f"❌ Không chạy được zsign tại '{zsign_bin}' ({e}).")
             return False
         except Exception as e:
             print(f"❌ zsign thất bại: {e}")
             return False
-
-        # ── Cài đặt lên thiết bị qua USB ─────────────────────────────────────
-        # BUGFIX (video crash log): device_link không có hàm connect_and_pair() —
-        # hàm đúng là pair_device()/pair_with_device(), trả về một pair_record
-        # (dict) thay vì bool, và raise LockdownError khi thất bại. Đồng thời
-        # install_ipa(pair_record, remote_ipa_path) cần 2 tham số, không phải 1 —
-        # phải gọi afc_push_ipa() trước để "stage" đường dẫn IPA local.
-        print("Đang kết nối với thiết bị iOS qua USB...")
-        try:
-            pair_record = device_link.pair_device()
-        except device_link.LockdownError as e:
-            print(f"❌ Không kết nối được với thiết bị iOS: {e}")
+        if not os.path.isfile(signed_ipa):
+            print("❌ zsign không tạo ra file IPA đã ký.")
             return False
+        print(f"✅ Đã ký: {os.path.basename(signed_ipa)} ({os.path.getsize(signed_ipa) / 1048576:.2f} MB)")
 
-        print("Đang cài đặt IPA lên thiết bị...")
+        # ── Bước 5: cài qua USB (AFC + installation_proxy) ──────────────────
+        print("[Bước 5/5] Cài đặt lên iPhone...")
         try:
-            remote_ipa_path = device_link.afc_push_ipa(
-                pair_record, signed_ipa, os.path.basename(signed_ipa))
-            device_link.install_ipa(pair_record, remote_ipa_path)
+            remote = device_link.afc_push_ipa(pair_record, signed_ipa, os.path.basename(signed_ipa))
+            device_link.install_ipa(pair_record, remote)
         except device_link.LockdownError as e:
             print(f"❌ Cài đặt thất bại: {e}")
+            print(f"   File đã ký vẫn còn ở: {signed_ipa}")
             return False
-
-        print("✅ Cài đặt ứng dụng thành công!")
+        print("✅ Cài đặt ứng dụng thành công! (Lần đầu mở app: Cài đặt > Cài đặt chung > "
+              "Quản lý VPN & Thiết bị > tin cậy Apple ID của bạn.)")
         return True
 
     except Exception as e:
         import traceback
         print(f"❌ Lỗi không mong đợi trong do_sideload: {e}")
-        traceback.print_exc()   # → sys.stderr → _StderrBridge → NativeLog UI
+        traceback.print_exc()
         return False
 
 
@@ -638,28 +718,18 @@ def do_register_device(
             print("❌ Chưa có UDID để đăng ký — kết nối USB hoặc nhập UDID tay.")
             return False
 
-        print("Đang đăng nhập Apple ID...")
-        effective_anisette = anisette_url or config_manager.get_anisette_url()
-        auth = AppleAuth(anisette_url=effective_anisette or None)
-        session = auth.authenticate(apple_id, password)
-        if not session or not session.get("authenticated"):
-            print("❌ Đăng nhập Apple ID thất bại.")
+        udid = _normalize_udid(udid)
+        if not _looks_like_udid(udid):
+            print(f"❌ '{udid}' không phải UDID hợp lệ (40 ký tự hex, hoặc dạng 00008xxx-xxxxxxxxxxxxxxxx).")
             return False
-        print("✅ Đăng nhập thành công.")
-
-        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
-        teams = dev_api.list_teams()
-        if not teams:
-            print("❌ Không lấy được Development Team.")
+        _auth, dev_api, _team = _login(apple_id, password, anisette_url)
+        if not dev_api:
             return False
-        team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
-        dev_api.set_team(team_id)
-        print(f"Team: {team_id}")
 
         devices = dev_api.list_devices()
         existing = next(
             (d for d in devices
-             if (d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")) == udid),
+             if str(d.get("deviceNumber") or d.get("attributes", {}).get("udid", "")).lower() == udid.lower()),
             None,
         )
         if existing:
@@ -692,22 +762,9 @@ def do_revoke_certs(
     """Thu hồi certificate Development trên tài khoản Apple ID."""
     try:
         print("Đang đăng nhập & tra cứu chứng chỉ...")
-        effective_anisette = anisette_url or config_manager.get_anisette_url()
-        auth = AppleAuth(anisette_url=effective_anisette or None)
-        # BUGFIX v11: authenticate() — không phải sign_in()
-        session = auth.authenticate(apple_id, password)
-        if not session or not session.get("authenticated"):
-            print("❌ Đăng nhập Apple ID thất bại.")
+        _auth, dev_api, _team = _login(apple_id, password, anisette_url)
+        if not dev_api:
             return False
-
-        # BUGFIX v11: DeveloperAPI(auth, dsid, session_token) — không phải DeveloperAPI(session)
-        dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
-        teams = dev_api.list_teams()
-        if not teams:
-            print("❌ Không lấy được team.")
-            return False
-        team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
-        dev_api.set_team(team_id)
 
         certs = dev_api.list_certificates()
         if not certs:

@@ -183,6 +183,74 @@ def save_certificate_as_pem(cert_content_raw, output_path):
     raise Exception("Không thể nhận diện định dạng certContent trả về từ Apple.")
 
 
+def _rewrite_id_value(value, old_bundle_id, new_bundle_id):
+    """Ánh xạ 1 bundle id cũ sang bundle id mới, giữ nguyên phần hậu tố con.
+    Trả về (giá trị mới, có thay đổi hay không)."""
+    if not isinstance(value, str) or not value or not old_bundle_id:
+        return value, False
+    if value == old_bundle_id:
+        return new_bundle_id, True
+    if value.startswith(old_bundle_id + "."):
+        return new_bundle_id + value[len(old_bundle_id):], True
+    return value, False
+
+
+def _rewrite_plist_bundle_ids(plist_data, old_bundle_id, new_bundle_id, label):
+    """Đổi MỌI tham chiếu tới bundle id cũ trong 1 Info.plist, không chỉ
+    CFBundleIdentifier. Trả về list[(mô tả key, giá trị cũ, giá trị mới)].
+
+    [FIX] Code cũ chỉ ghi đè CFBundleIdentifier. Nhưng Info.plist còn có thể
+    chứa bundle id ở các key khác:
+      - WKCompanionAppBundleIdentifier          (watch app / appex trỏ về app chính)
+      - NSExtension -> NSExtensionAttributes -> WKAppBundleIdentifier (WatchKit ext)
+    Nếu các key này vẫn trỏ tới bundle id CŨ trong khi app đã đổi sang bundle id
+    mới thì iOS từ chối cài/launch ("bundle identifier ... does not match").
+    zsign có tự sửa các key này nhưng CHỈ khi được truyền cờ -b; ở đây ta đổi
+    bundle id bằng Python (để biết chính xác App ID nào phải đăng ký với Apple)
+    nên KHÔNG truyền -b cho zsign — tránh áp dụng 2 lần — do đó Python phải sửa đủ.
+    """
+    changes = []
+
+    def handle(d, key, where):
+        if not isinstance(d, dict) or key not in d:
+            return
+        new_val, changed = _rewrite_id_value(d.get(key), old_bundle_id, new_bundle_id)
+        if changed:
+            changes.append((where, d[key], new_val))
+            d[key] = new_val
+
+    handle(plist_data, "CFBundleIdentifier", f"{label} CFBundleIdentifier")
+    handle(plist_data, "WKCompanionAppBundleIdentifier",
+           f"{label} WKCompanionAppBundleIdentifier")
+
+    ns_ext = plist_data.get("NSExtension") if isinstance(plist_data, dict) else None
+    if isinstance(ns_ext, dict):
+        attrs = ns_ext.get("NSExtensionAttributes")
+        if isinstance(attrs, dict):
+            handle(attrs, "WKAppBundleIdentifier",
+                   f"{label} NSExtension/NSExtensionAttributes/WKAppBundleIdentifier")
+
+    return changes
+
+
+def set_extension_bundle_id(appex_path, new_bundle_id):
+    """Đổi bundle id cho MỘT .appex riêng lẻ.
+
+    Dùng khi bundle id của chính extension đó đã bị một tài khoản Apple khác
+    đăng ký mất (App ID là duy nhất TOÀN CẦU, kể cả App ID của extension).
+    Các key trỏ về app chính (vd WKCompanionAppBundleIdentifier) KHÔNG bị đổi
+    vì chúng không khớp bundle id cũ của extension."""
+    info_plist_path = os.path.join(appex_path, "Info.plist")
+    with open(info_plist_path, 'rb') as f:
+        plist_data = plistlib.load(f)
+    old_id = plist_data.get("CFBundleIdentifier", "")
+    for where, old_v, new_v in _rewrite_plist_bundle_ids(plist_data, old_id, new_bundle_id, "Info.plist"):
+        print(f"[IPA] Đã đổi {where}: {old_v} -> {new_v}")
+    with open(info_plist_path, 'wb') as f:
+        plistlib.dump(plist_data, f)
+    return new_bundle_id
+
+
 def set_bundle_id(app_bundle_path, new_bundle_id):
     """Ghi đè CFBundleIdentifier trong Info.plist của app (và mọi extension .appex
     bên trong PlugIns/ nếu có, giữ đúng tiền tố — iOS yêu cầu bundle ID của
@@ -191,19 +259,34 @@ def set_bundle_id(app_bundle_path, new_bundle_id):
     Cần dùng khi App ID 'tường minh' với bundle ID gốc của IPA đã bị MỘT TÀI
     KHOẢN FREE KHÁC đăng ký mất (rất hay gặp với app phổ biến như SideStore,
     vì App ID phải duy nhất TOÀN CẦU trong thời gian còn hiệu lực — không phải
-    chỉ duy nhất trong tài khoản của bạn)."""
+    chỉ duy nhất trong tài khoản của bạn).
+
+    PHẢI gọi hàm này TRƯỚC khi tải provisioning profile và TRƯỚC khi ký: profile
+    Apple trả về mang entitlement application-identifier = <TeamID>.<App ID vừa
+    đăng ký>, nên bundle id trong IPA phải khớp chính xác App ID đó thì iOS mới
+    nhận. Ký xong mới đổi bundle id là vô nghĩa.
+
+    Trả về dict: {"main": <bundle id app chính>, "old_main": <bundle id cũ>,
+                  "extensions": {<tên .appex>: <bundle id mới>}}
+    (code cũ trả về chuỗi bundle id; không chỗ nào trong tool dùng giá trị đó)"""
     info_plist_path = os.path.join(app_bundle_path, "Info.plist")
     with open(info_plist_path, 'rb') as f:
         plist_data = plistlib.load(f)
     old_bundle_id = plist_data.get("CFBundleIdentifier", "")
-    plist_data["CFBundleIdentifier"] = new_bundle_id
+    result = {"main": new_bundle_id, "old_main": old_bundle_id, "extensions": {}}
+
+    for where, old_v, new_v in _rewrite_plist_bundle_ids(
+            plist_data, old_bundle_id, new_bundle_id, "Info.plist"):
+        print(f"[IPA] Đã đổi {where}: {old_v} -> {new_v}")
+    if plist_data.get("CFBundleIdentifier") != new_bundle_id:
+        plist_data["CFBundleIdentifier"] = new_bundle_id
+        print(f"[IPA] Đã đặt CFBundleIdentifier = {new_bundle_id}")
     with open(info_plist_path, 'wb') as f:
         plistlib.dump(plist_data, f)
-    print(f"[IPA] Đã đổi CFBundleIdentifier: {old_bundle_id} -> {new_bundle_id}")
 
     plugins_dir = os.path.join(app_bundle_path, "PlugIns")
     if old_bundle_id and os.path.isdir(plugins_dir):
-        for item in os.listdir(plugins_dir):
+        for item in sorted(os.listdir(plugins_dir)):
             if not item.endswith(".appex"):
                 continue
             appex_plist_path = os.path.join(plugins_dir, item, "Info.plist")
@@ -212,17 +295,23 @@ def set_bundle_id(app_bundle_path, new_bundle_id):
             with open(appex_plist_path, 'rb') as f:
                 appex_plist = plistlib.load(f)
             appex_old_id = appex_plist.get("CFBundleIdentifier", "")
-            if appex_old_id.startswith(old_bundle_id):
-                appex_new_id = new_bundle_id + appex_old_id[len(old_bundle_id):]
-                appex_plist["CFBundleIdentifier"] = appex_new_id
+            shares_prefix = appex_old_id and (
+                appex_old_id == old_bundle_id
+                or appex_old_id.startswith(old_bundle_id + "."))
+            if shares_prefix:
+                for where, old_v, new_v in _rewrite_plist_bundle_ids(
+                        appex_plist, old_bundle_id, new_bundle_id, f"{item}/Info.plist"):
+                    print(f"[IPA] Đã đổi {where}: {old_v} -> {new_v}")
                 with open(appex_plist_path, 'wb') as f:
                     plistlib.dump(appex_plist, f)
-                print(f"[IPA] Đã đổi extension '{item}': {appex_old_id} -> {appex_new_id}")
+                result["extensions"][item] = appex_plist.get("CFBundleIdentifier")
             else:
                 print(f"[IPA] ⚠️  Extension '{item}' có CFBundleIdentifier '{appex_old_id}' "
-                      f"không bắt đầu bằng '{old_bundle_id}' — bỏ qua, kiểm tra thủ công nếu cần.")
+                      f"không bắt đầu bằng '{old_bundle_id}' — giữ nguyên; tool sẽ "
+                      f"đăng ký App ID riêng cho đúng bundle id đó.")
+                result["extensions"][item] = appex_old_id
 
-    return new_bundle_id
+    return result
 
 
 def create_zip_archive(source_dir, output_zip_path):

@@ -43,7 +43,7 @@ object UsbPermissionManager {
     @Volatile private var pendingReceiver: BroadcastReceiver? = null
 
     private fun publishUdid(device: UsbDevice) {
-        val serial = try { device.serialNumber } catch (_: Exception) { null }
+        val serial = UsbTransport.normalizeUdid(try { device.serialNumber } catch (_: Exception) { null })
         if (!serial.isNullOrBlank()) {
             try { AppConfig.lastUdid = serial } catch (_: Exception) {}
         }

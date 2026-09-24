@@ -44,6 +44,14 @@ OPENSSL_VERSION="3.2.1"
 
 NCPU=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
+# Dấu phiên bản build = hash của CHÍNH script này (đổi patch/phiên bản thư viện
+# → hash đổi). CI khôi phục cache bằng restore-keys (tiền tố), nên .native-deps
+# cũ của lần build trước có thể được khôi phục dù script đã đổi; nếu chỉ kiểm
+# tra "đã có libimobiledevice-1.0.a" thì sẽ bỏ qua build và link thư viện CŨ
+# (mất âm thầm các bản vá, ví dụ SSL_OP_LEGACY_SERVER_CONNECT). Stamp không
+# khớp → xoá và build lại từ đầu.
+BUILD_STAMP="${BUILD_STAMP:-$( (sha256sum "${BASH_SOURCE[0]}" 2>/dev/null || shasum -a 256 "${BASH_SOURCE[0]}") | cut -d' ' -f1)}"
+
 # Màu log
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[+] $*${NC}"; }
@@ -278,6 +286,19 @@ build_libimobiledevice() {
     # libimobiledevice 1.3.0 still redeclares the old enum in common/utils.h.
     sed -i '/^enum plist_format_t {/,/^};$/d' common/utils.h
     sed -i 's/enum plist_format_t format/plist_format_t format/g' common/utils.h common/utils.c
+    # OpenSSL 3.x + libimobiledevice 1.3.0: lockdownd của iOS KHÔNG hỗ trợ
+    # RFC 5746 (secure renegotiation). OpenSSL 3 mặc định từ chối server như
+    # vậy ("unsafe legacy renegotiation disabled") → StartSession/SSL luôn
+    # LOCKDOWN_E_SSL_ERROR → không mở được AFC/installation_proxy dù đã pair.
+    # libimobiledevice master đã sửa bằng SSL_OP_LEGACY_SERVER_CONNECT +
+    # SSL_OP_IGNORE_UNEXPECTED_EOF; backport đúng 2 option đó vào 1.3.0.
+    if ! grep -q 'SSL_OP_LEGACY_SERVER_CONNECT' src/idevice.c; then
+        awk '{print} /SSL_CTX_set_security_level\(ssl_ctx, 0\);/ && !done {getline; print; print "#if defined(SSL_OP_LEGACY_SERVER_CONNECT)"; print "\tSSL_CTX_set_options(ssl_ctx, SSL_OP_LEGACY_SERVER_CONNECT);"; print "#endif"; print "#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)"; print "\tSSL_CTX_set_options(ssl_ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);"; print "#endif"; done=1}' src/idevice.c > src/idevice.c.new
+        mv src/idevice.c.new src/idevice.c
+        grep -q 'SSL_OP_LEGACY_SERVER_CONNECT' src/idevice.c || \
+            error "Không patch được src/idevice.c (OpenSSL 3 legacy renegotiation)"
+        info "[${abi}] idevice.c: đã bật SSL_OP_LEGACY_SERVER_CONNECT cho OpenSSL 3"
+    fi
     # Patch: disable các binary tool (chỉ cần lib)
     # Keep common: libimobiledevice links its internal common utility library.
     # Keep common and public headers: libimobiledevice links its internal
@@ -304,14 +325,20 @@ build_abi() {
     info " Build ABI: ${abi}"
     info "════════════════════════════════════"
 
-    setup_toolchain "${abi}"
     local prefix="${NATIVE_DEPS_BASE}/${abi}"
 
-    # Kiểm tra đã build chưa
-    if [[ -f "${prefix}/lib/libimobiledevice-1.0.a" ]]; then
-        warn "[${abi}] libimobiledevice đã build — bỏ qua (xóa ${prefix}/lib/ để rebuild)"
+    # Chỉ bỏ qua khi đã build bằng ĐÚNG phiên bản script này (stamp khớp).
+    if [[ -f "${prefix}/lib/libimobiledevice-1.0.a" && -f "${prefix}/.build_stamp" \
+          && "$(cat "${prefix}/.build_stamp")" == "${BUILD_STAMP}" ]]; then
+        warn "[${abi}] native deps đã build với stamp ${BUILD_STAMP:0:12} — bỏ qua"
         return 0
     fi
+    if [[ -d "${prefix}" ]]; then
+        warn "[${abi}] .native-deps cũ (stamp khác/thiếu) — xoá và build lại để áp dụng patch mới"
+        rm -rf "${prefix}" "${BUILD_TMP_ROOT:?}/${abi}"
+    fi
+
+    setup_toolchain "${abi}"
 
     build_libusb          "${abi}" "${prefix}"
     build_openssl         "${abi}" "${prefix}"
@@ -330,6 +357,7 @@ build_abi() {
         fi
     done
     [[ "${ok}" -eq 1 ]] && info "[${abi}] ✅ Tất cả libs OK"
+    echo "${BUILD_STAMP}" > "${prefix}/.build_stamp"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────

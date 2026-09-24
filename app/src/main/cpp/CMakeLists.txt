@@ -65,14 +65,10 @@ add_library(sideloadnative SHARED
   usbmuxd_server.c
 )
 
-# libimobiledevice calls the normal libusbmuxd client API. On Android the
-# app's in-process non-root transport must service those calls using the USB
-# fd supplied by UsbDeviceConnection, so redirect the two entry points without
-# introducing duplicate symbols into the static archives.
-target_link_options(sideloadnative PRIVATE
-  "-Wl,--wrap=usbmuxd_get_device"
-  "-Wl,--wrap=usbmuxd_connect"
-)
+# v49: KHÔNG còn -Wl,--wrap=usbmuxd_get_device/usbmuxd_connect.
+# usbmuxd_server.c nói đúng giao thức usbmuxd upstream trên socket
+# "UNIX:<filesDir>/usbmuxd.sock", nên libusbmuxd/libimobiledevice được dùng
+# nguyên bản (ReadBUID/ReadPairRecord/SavePairRecord/Connect đi cùng một đường).
 
 target_include_directories(sideloadnative PRIVATE
   "${NATIVE_INC_DIR}"

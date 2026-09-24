@@ -29,6 +29,32 @@ env:
   ANDROID_PLATFORM: "34"
 
 jobs:
+  # Kiểm thử giao thức (không cần iPhone): usbmuxd_server.c + usb_fd_bridge.c
+  # chạy với libusbmuxd 2.0.2 + libimobiledevice 1.3.0 THẬT, nói chuyện với
+  # iPhone giả lập (tests/native-host/fake_iphone.py); cộng test luồng Python.
+  # Job riêng — không chặn job build APK.
+  protocol-tests:
+    name: "Protocol tests (usbmux + Python flow)"
+    runs-on: ubuntu-22.04
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "📥 Install host build tools"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y autoconf automake libtool libtool-bin pkg-config \
+            libssl-dev python3 curl git default-jdk-headless
+
+      - name: "🐍 Python: luồng ký & cài (App ID / extension / UDID)"
+        run: python3 tests/python/test_sideload_core.py
+
+      - name: "🏗️  Build libplist/libusbmuxd/libimobiledevice cho host"
+        run: HOSTDEPS="$RUNNER_TEMP/hostdeps" SRC="$RUNNER_TEMP/hostsrc" bash tests/native-host/build_host_deps.sh
+
+      - name: "🔌 usbmuxd nội bộ ↔ iPhone giả lập"
+        run: HOSTDEPS="$RUNNER_TEMP/hostdeps" bash tests/native-host/run.sh
+
   build:
     name: "Build APK"
     runs-on: ubuntu-22.04

@@ -1,909 +1,450 @@
 /*
- * usb_fd_bridge.c — Android USB fd → libusb handle bridge (Mode 1)
+ * usb_fd_bridge.c — fd USB của Android (UsbDeviceConnection) → libusb
  *
- * ════════════════════════════════════════════════════════════════════
- * KIẾN TRÚC HỌC TỪ termux-usbmuxd + termux-api (UsbAPI.java)
- * ════════════════════════════════════════════════════════════════════
+ * ════════════════════════════════════════════════════════════════════════
+ * VIẾT LẠI (v49) theo đúng cách termux-usb + usbmuxd upstream làm việc:
  *
- * termux-usbmuxd dùng: termux-usb -E -e "usbmuxd_proxy ..." /dev/bus/usb/XXX
+ *   termux-api UsbAPI.java:  usbManager.openDevice(dev).getFileDescriptor()
+ *   termux-usb -e usbmuxd:   fd → libusb_wrap_sys_device()
+ *   usbmuxd src/usb.c:       set_valid_configuration() → claim → bulk I/O
  *
- * UsbAPI.java open():
- *   connection = usbManager.openDevice(device)    // KHÔNG claim interface
- *   fd = connection.getFileDescriptor()
- *   openDevices.put(fd, connection)               // giữ connection alive
- *   return fd                                     // → TERMUX_USB_FD → libusb
+ * NGUYÊN NHÂN GỐC của log "libusb_claim_interface NOT_FOUND" ở bản cũ:
+ * iPhone có 4–6 USB configuration; Android để nó ở configuration 1 (chỉ có
+ * PTP/ảnh). Interface usbmux (class 0xFF / sub 0xFE / proto 2) chỉ có ở
+ * config 3/4 (hoặc 5/6 trên máy mới). Kotlin liệt kê interface của MỌI config
+ * nên tìm thấy iface=1, nhưng claim trên config 1 → ENOENT = NOT_FOUND. Bản cũ
+ * không bao giờ đổi configuration (upstream thì có: libusb_set_configuration),
+ * rồi chồng thêm "Android JNI mode", clear_halt, flush… mà không chạm tới gốc.
  *
- * Sau khi libusb nhận fd SẠCH (không có Android interface claim):
- *   libusb_wrap_sys_device(ctx, fd, &handle)      // libusb quản lý fd
- *   libusb_claim_interface(handle, iface)         // THÀNH CÔNG (không BUSY)
- *   Endpoint ở trạng thái sạch → version exchange OK
- *
- * ════════════════════════════════════════════════════════════════════
- * VẤN ĐỀ CŨ (trước fix này)
- * ════════════════════════════════════════════════════════════════════
- *
- * UsbTransport.open() cũ gọi claimInterface() trước → Android owns endpoints
- * → libusb gặp LIBUSB_ERROR_BUSY khi claim → LIBUSB_ERROR_PIPE trên transfers
- * → version exchange thất bại ngay cả sau nhiều retry + clear_halt
- *
- * ════════════════════════════════════════════════════════════════════
- * FIX v27 (tất cả fixes)
- * ════════════════════════════════════════════════════════════════════
- *
- *  1. discover_apple_endpoints(): xử lý cả LIBUSB_SUCCESS (fd sạch từ Kotlin)
- *     lẫn LIBUSB_ERROR_BUSY (fd đã claim từ Android) — cả hai đều OK
- *
- *  2. usb_bridge_init_from_fd(): sau discover, proactive libusb_clear_halt()
- *     trên cả ep_out và ep_in với delay 100ms mỗi endpoint
- *
- *  3. usb_bridge_clear_endpoints_halt(): public function, gọi từ usbmuxd_server.c
- *     trước version exchange retry
- *
- *  4. usb_bridge_flush_in(): sau PIPE, TIẾP TỤC drain thay vì break ngay
- *
- *  5. bulk_write/bulk_read: retry từ 3 → 5 lần, delay từ 50ms → 80ms
+ * Các điểm khác so với bản cũ:
+ *   - libusb_init_context(NO_DEVICE_DISCOVERY): app Android không được liệt
+ *     kê /dev/bus/usb; chỉ dùng fd được cấp (đúng khuyến nghị của libusb).
+ *   - Đọc bulk-IN nguyên một transfer vào bộ đệm lớn (16 KiB như upstream);
+ *     bản cũ đọc 8/16 byte header trước → LIBUSB_ERROR_OVERFLOW, mất dữ liệu.
+ *   - Gửi ZLP khi độ dài gói chia hết wMaxPacketSize (upstream usb_send()) —
+ *     thiếu ZLP thì iPhone chờ mãi phần còn lại của gói.
+ *   - Không clear_halt/flush vô cớ trước mỗi lần gửi (reset data toggle).
+ *   - Luồng Java được attach MỘT lần cho mỗi luồng native (chế độ dự phòng
+ *     Android), không attach/detach mỗi transfer.
+ * ════════════════════════════════════════════════════════════════════════
  */
 #include "usb_fd_bridge.h"
 #include "android_usbmuxd_fix.h"
+
 #include <libusb.h>
+#include <jni.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifdef __ANDROID__
 #include <android/log.h>
-#include <jni.h>
-#include <pthread.h>
+#define ALOG(prio, ...) __android_log_print(prio, "usb_fd_bridge", __VA_ARGS__)
+#define PRIO_I ANDROID_LOG_INFO
+#define PRIO_E ANDROID_LOG_ERROR
+#else
+#define ALOG(prio, ...) do { fprintf(stderr, "[usb_fd_bridge] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define PRIO_I 4
+#define PRIO_E 6
+#endif
 
-/*
- * FIX v36 (Critical): Forward LOGI/LOGE to UI log viewer.
- *
- * Trước đây, usb_fd_bridge.c chỉ gọi __android_log_print() → log chỉ xuất
- * hiện trong logcat của Android, KHÔNG hiển thị trong UI log viewer của app.
- *
- * Hậu quả: khi bulk_write() return -1, log trong UI chỉ thấy
- *   "usb_send_version: usb_write() returned -1"
- * mà KHÔNG thấy log chi tiết từ usb_bridge_bulk_write() như:
- *   "bulk_write: PIPE ep=0x04 attempt 1/5 — clear_halt retry"
- *   "bulk_write: OVERFLOW ep=0x04 attempt 1/5 — try clear_halt + long delay"
- *   "bulk_write: ACCESS DENIED ep=0x04 err=-3 — thiếu quyền USB Host"
- *
- * → Người dùng/không debug được error code thực sự của libusb.
- *
- * Fix: thêm android_usbmuxd_fix_logf() vào macro LOGI/LOGE để forward
- * log vào UI log viewer qua callback đã được set trong nativeInit().
- * (Giống cách usbmuxd_server.c đã làm.)
- */
-#define TAG "usb_fd_bridge"
-#define LOGI(...) do { \
-    __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__); \
-    android_usbmuxd_fix_logf(__VA_ARGS__); \
-} while (0)
-#define LOGE(...) do { \
-    __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__); \
-    android_usbmuxd_fix_logf(__VA_ARGS__); \
-} while (0)
+#define LOGI(...) do { ALOG(PRIO_I, __VA_ARGS__); android_usbmuxd_fix_logf(__VA_ARGS__); } while (0)
+#define LOGE(...) do { ALOG(PRIO_E, __VA_ARGS__); android_usbmuxd_fix_logf(__VA_ARGS__); } while (0)
 
-/* Apple AMDI interface */
 #define APPLE_IF_CLASS     0xFF
 #define APPLE_IF_SUBCLASS  0xFE
 #define APPLE_IF_PROTO     0x02
 
-/* ── Global state ──────────────────────────────────────────────────────── */
-static libusb_context       *g_ctx        = NULL;
-static libusb_device_handle *g_handle     = NULL;
-static uint8_t               g_ep_in      = 0;
-static uint8_t               g_ep_out     = 0;
-static int                   g_iface_num  = -1;
-/* Chỉ true khi chính libusb claim thành công interface. Với fd từ
- * UsbDeviceConnection/termux-usb, Android có thể giữ ownership hoặc libusb
- * có thể trả NOT_SUPPORTED; trong cả hai trường hợp không được release
- * interface khi đóng handle. */
-static int                   g_iface_claimed = 0;
-static int                   g_initialized = 0;
+static libusb_context       *g_ctx     = NULL;
+static libusb_device_handle *g_handle  = NULL;
+static uint8_t  g_ep_in  = 0;
+static uint8_t  g_ep_out = 0;
+static int      g_iface_num = -1;
+static int      g_iface_claimed = 0;
+static int      g_initialized = 0;
+static int      g_maxpkt = 512;
+static int      g_config = -1;
+static char     g_serial[128];
 
-/*
- * FIX v38: Android JNI transport mode — fallback khi libusb_claim_interface()
- * trả NOT_FOUND. Khi g_use_android = 1, usb_bridge_bulk_write/read sẽ gọi
- * NativeBridge.onNativeBulkWrite/Read qua JNI thay vì libusb_bulk_transfer.
- */
-static int                   g_use_android = 0;
-static JavaVM               *g_jvm         = NULL;
-static jobject               g_bridge_ref  = NULL;
-static jmethodID             g_mid_bulk_write = NULL;
-static jmethodID             g_mid_bulk_read  = NULL;
-static jclass                g_nb_class    = NULL;
-static pthread_mutex_t       g_jni_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Chế độ dự phòng: bulk I/O đi qua UsbDeviceConnection.bulkTransfer() (Java) */
+static int       g_use_android = 0;
+static JavaVM   *g_jvm = NULL;
+static jobject   g_bridge_ref = NULL;
+static jclass    g_nb_class = NULL;
+static jmethodID g_mid_bulk_write = NULL;
+static jmethodID g_mid_bulk_read = NULL;
+static pthread_mutex_t g_jni_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t   g_env_key;
+static pthread_once_t  g_env_once = PTHREAD_ONCE_INIT;
 
-/*
- * usb_bridge_set_jvm — được gọi từ JNI_OnLoad để cache JavaVM pointer.
- * Tham số void* để tránh require jni.h trong header; cast sang JavaVM* ở đây.
- */
-void usb_bridge_set_jvm(void *vm) {
-    g_jvm = (JavaVM *)vm;
+static int g_read_err_logged = 0;
+
+/* ── JNI: attach một lần cho mỗi luồng, detach khi luồng kết thúc ─────────── */
+static void env_detach(void *unused) {
+    (void)unused;
+    if (g_jvm) (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+static void env_key_create(void) { pthread_key_create(&g_env_key, env_detach); }
+
+static JNIEnv *get_env(void) {
+    if (!g_jvm) return NULL;
+    JNIEnv *env = NULL;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_OK) return env;
+    pthread_once(&g_env_once, env_key_create);
+    /* NDK khai báo JNIEnv**, JDK khai báo void** — void* hợp lệ cho cả hai */
+    if ((*g_jvm)->AttachCurrentThread(g_jvm, (void *)&env, NULL) != JNI_OK) return NULL;
+    pthread_setspecific(g_env_key, (void *)1);
+    return env;
 }
 
-/*
- * usb_bridge_set_bridge_ref — cache global ref to NativeBridge instance
- * và pre-resolve method IDs để tránh FindClass mỗi lần.
- * Tham số void* để tránh require jni.h trong header; cast sang jobject ở đây.
- */
+void usb_bridge_set_jvm(void *vm) { g_jvm = (JavaVM *)vm; }
+
 void usb_bridge_set_bridge_ref(void *bridge_obj) {
     pthread_mutex_lock(&g_jni_mutex);
-    JNIEnv *env = NULL;
-    bool detach = false;
-    if (!g_jvm) {
-        pthread_mutex_unlock(&g_jni_mutex);
-        return;
-    }
-    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
-        detach = true;
-    }
-
-    if (g_bridge_ref) {
-        (*env)->DeleteGlobalRef(env, g_bridge_ref);
-        g_bridge_ref = NULL;
-    }
-    if (g_nb_class) {
-        (*env)->DeleteGlobalRef(env, g_nb_class);
-        g_nb_class = NULL;
-    }
-    g_mid_bulk_write = NULL;
-    g_mid_bulk_read  = NULL;
-
+    JNIEnv *env = get_env();
+    if (!env) { pthread_mutex_unlock(&g_jni_mutex); return; }
+    if (g_bridge_ref) { (*env)->DeleteGlobalRef(env, g_bridge_ref); g_bridge_ref = NULL; }
+    if (g_nb_class)   { (*env)->DeleteGlobalRef(env, g_nb_class);   g_nb_class = NULL; }
+    g_mid_bulk_write = g_mid_bulk_read = NULL;
     jobject bridge = (jobject)bridge_obj;
     if (bridge) {
         g_bridge_ref = (*env)->NewGlobalRef(env, bridge);
-        jclass local_cls = (*env)->GetObjectClass(env, bridge);
-        if (local_cls) {
-            g_nb_class = (jclass)(*env)->NewGlobalRef(env, local_cls);
-            (*env)->DeleteLocalRef(env, local_cls);
-
-            g_mid_bulk_write = (*env)->GetStaticMethodID(env, g_nb_class,
-                "onNativeBulkWrite", "([BI)I");
-            g_mid_bulk_read = (*env)->GetStaticMethodID(env, g_nb_class,
-                "onNativeBulkRead", "([BI)I");
-
-            LOGI("usb_bridge_set_bridge_ref: NativeBridge ref cached. "
-                 "bulk_write=%p bulk_read=%p",
-                 (void*)g_mid_bulk_write, (void*)g_mid_bulk_read);
+        jclass cls = (*env)->GetObjectClass(env, bridge);
+        if (cls) {
+            g_nb_class = (jclass)(*env)->NewGlobalRef(env, cls);
+            (*env)->DeleteLocalRef(env, cls);
+            g_mid_bulk_write = (*env)->GetStaticMethodID(env, g_nb_class, "onNativeBulkWrite", "([BI)I");
+            g_mid_bulk_read  = (*env)->GetStaticMethodID(env, g_nb_class, "onNativeBulkRead", "([BI)I");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         }
     }
-
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
     pthread_mutex_unlock(&g_jni_mutex);
 }
 
 bool usb_bridge_set_android_mode(void) {
-    if (!g_jvm) {
-        LOGE("usb_bridge_set_android_mode: g_jvm NULL — chưa gọi usb_bridge_set_jvm()");
-        return false;
-    }
-    if (!g_mid_bulk_write || !g_mid_bulk_read) {
-        LOGE("usb_bridge_set_android_mode: method IDs NULL — chưa gọi usb_bridge_set_bridge_ref()");
+    if (!g_jvm || !g_mid_bulk_write || !g_mid_bulk_read) {
+        LOGE("[usb] Không bật được chế độ bulkTransfer Android (JNI chưa sẵn sàng)");
         return false;
     }
     g_use_android = 1;
-    LOGI("usb_bridge_set_android_mode: ✅ Android JNI transport mode ENABLED");
-    LOGI("usb_bridge_set_android_mode: bulk_write/read sẽ route qua NativeBridge.onNativeBulkWrite/Read");
+    LOGI("[usb] Dùng UsbDeviceConnection.bulkTransfer() (libusb không claim được interface)");
     return true;
 }
+bool usb_bridge_using_android_mode(void) { return g_use_android != 0; }
+bool usb_bridge_iface_claimed(void)      { return g_iface_claimed != 0; }
+uint8_t usb_bridge_ep_in(void)  { return g_ep_in; }
+uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
+int usb_bridge_max_packet_size(void) { return g_maxpkt; }
+int usb_bridge_active_config(void)   { return g_config; }
+int usb_bridge_interface(void)       { return g_iface_num; }
+const char *usb_bridge_serial(void)  { return g_serial[0] ? g_serial : NULL; }
 
-bool usb_bridge_using_android_mode(void) {
-    return g_use_android != 0;
-}
-
-bool usb_bridge_iface_claimed(void) {
-    return g_iface_claimed != 0;
-}
-
-/*
- * call_android_bulk_write — gọi NativeBridge.onNativeBulkWrite(buf, timeout)
- */
 static int call_android_bulk_write(const void *buf, int len, unsigned int timeout_ms) {
-    if (!g_jvm || !g_mid_bulk_write) return -1;
-
-    JNIEnv *env = NULL;
-    bool detach = false;
-    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
-        detach = true;
-    }
-
-    jbyteArray jarr = (*env)->NewByteArray(env, len);
-    if (!jarr) {
-        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-        return -1;
-    }
-    (*env)->SetByteArrayRegion(env, jarr, 0, len, (const jbyte *)buf);
-
-    jint result = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_write,
-                                              jarr, (jint)timeout_ms);
-    jthrowable exc = (*env)->ExceptionOccurred(env);
-    if (exc) {
-        (*env)->ExceptionClear(env);
-        LOGE("call_android_bulk_write: Java exception");
-        result = -1;
-    }
-
-    (*env)->DeleteLocalRef(env, jarr);
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-    return (int)result;
+    JNIEnv *env = get_env();
+    if (!env || !g_mid_bulk_write || !g_nb_class) return -1;
+    jbyteArray arr = (*env)->NewByteArray(env, len);
+    if (!arr) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); return -1; }
+    (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)buf);
+    jint r = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_write, arr, (jint)timeout_ms);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
+    (*env)->DeleteLocalRef(env, arr);
+    return (int)r;
 }
 
-/*
- * call_android_bulk_read — gọi NativeBridge.onNativeBulkRead(buf, timeout)
- */
 static int call_android_bulk_read(void *buf, int len, unsigned int timeout_ms) {
-    if (!g_jvm || !g_mid_bulk_read) return -1;
-
-    JNIEnv *env = NULL;
-    bool detach = false;
-    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-        (*g_jvm)->AttachCurrentThread(g_jvm, (void **)&env, NULL);
-        detach = true;
-    }
-
-    jbyteArray jarr = (*env)->NewByteArray(env, len);
-    if (!jarr) {
-        if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-        return -1;
-    }
-
-    jint result = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_read,
-                                              jarr, (jint)timeout_ms);
-    jthrowable exc = (*env)->ExceptionOccurred(env);
-    if (exc) {
-        (*env)->ExceptionClear(env);
-        LOGE("call_android_bulk_read: Java exception");
-        result = -1;
-    } else if (result > 0) {
-        (*env)->GetByteArrayRegion(env, jarr, 0, result, (jbyte *)buf);
-    }
-
-    (*env)->DeleteLocalRef(env, jarr);
-    if (detach) (*g_jvm)->DetachCurrentThread(g_jvm);
-    return (int)result;
+    JNIEnv *env = get_env();
+    if (!env || !g_mid_bulk_read || !g_nb_class) return -1;
+    jbyteArray arr = (*env)->NewByteArray(env, len);
+    if (!arr) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); return -1; }
+    jint r = (*env)->CallStaticIntMethod(env, g_nb_class, g_mid_bulk_read, arr, (jint)timeout_ms);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
+    else if (r > 0) (*env)->GetByteArrayRegion(env, arr, 0, r, (jbyte *)buf);
+    (*env)->DeleteLocalRef(env, arr);
+    return (int)r;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * discover_apple_endpoints
- * ════════════════════════════════════════════════════════════════════════ */
-static bool discover_apple_endpoints(void) {
-    struct libusb_config_descriptor *cfg = NULL;
-    libusb_device *dev = libusb_get_device(g_handle);
-    if (!dev) return false;
+/* ── Chọn configuration + interface usbmux (usb.c::set_valid_configuration) ── */
+struct mux_iface {
+    int cfg_value;
+    int iface;
+    uint8_t ep_in, ep_out;
+    int maxpkt;
+};
 
-    if (libusb_get_active_config_descriptor(dev, &cfg) != 0) {
-        LOGE("discover: libusb_get_active_config_descriptor thất bại");
-        return false;
+static int find_mux_iface_in_config(const struct libusb_config_descriptor *cfg, struct mux_iface *out) {
+    for (int i = 0; i < cfg->bNumInterfaces; i++) {
+        if (cfg->interface[i].num_altsetting < 1) continue;
+        const struct libusb_interface_descriptor *alt = &cfg->interface[i].altsetting[0];
+        if (alt->bInterfaceClass != APPLE_IF_CLASS || alt->bInterfaceSubClass != APPLE_IF_SUBCLASS ||
+            alt->bInterfaceProtocol != APPLE_IF_PROTO)
+            continue;
+        uint8_t in = 0, outp = 0;
+        int mp = 0;
+        for (int e = 0; e < alt->bNumEndpoints; e++) {
+            const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
+            if ((ep->bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_BULK) continue;
+            if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) { if (!in) in = ep->bEndpointAddress; }
+            else if (!outp) { outp = ep->bEndpointAddress; mp = ep->wMaxPacketSize & 0x7ff; }
+        }
+        if (in && outp) {
+            out->cfg_value = cfg->bConfigurationValue;
+            out->iface = alt->bInterfaceNumber;
+            out->ep_in = in;
+            out->ep_out = outp;
+            out->maxpkt = mp > 0 ? mp : 512;
+            return 1;
+        }
     }
+    return 0;
+}
 
-    bool found = false;
-    for (int i = 0; i < (int)cfg->bNumInterfaces && !found; i++) {
-        const struct libusb_interface *iface = &cfg->interface[i];
-        for (int s = 0; s < iface->num_altsetting && !found; s++) {
-            const struct libusb_interface_descriptor *alt = &iface->altsetting[s];
-
-            bool is_amdi = (alt->bInterfaceClass    == APPLE_IF_CLASS &&
-                            alt->bInterfaceSubClass == APPLE_IF_SUBCLASS &&
-                            alt->bInterfaceProtocol == APPLE_IF_PROTO);
-            if (!is_amdi) continue;
-
-            LOGI("discover: Apple AMDI interface #%d altsetting=%d",
-                 alt->bInterfaceNumber, alt->bAlternateSetting);
-
-            uint8_t ep_in = 0, ep_out = 0;
-            for (int e = 0; e < (int)alt->bNumEndpoints; e++) {
-                const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
-                if ((ep->bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_BULK) continue;
-                if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) {
-                    if (!ep_in) ep_in = ep->bEndpointAddress;
-                } else {
-                    if (!ep_out) ep_out = ep->bEndpointAddress;
-                }
-            }
-
-            if (ep_in && ep_out) {
-                /*
-                 * FIX v27: Xử lý cả hai trường hợp claim interface.
-                 *
-                 * TRƯỜNG HỢP A (termux-usbmuxd pattern — fd sạch từ Kotlin):
-                 *   UsbTransport.open() không gọi claimInterface().
-                 *   libusb_claim_interface() ở đây trả LIBUSB_SUCCESS.
-                 *   Endpoint hoàn toàn sạch → version exchange dễ thành công.
-                 *
-                 * TRƯỜNG HỢP B (Android pre-claim — fd đã claim):
-                 *   UsbTransport.open() đã gọi claimInterface() trước.
-                 *   libusb_claim_interface() trả LIBUSB_ERROR_BUSY.
-                 *   Vẫn hoạt động vì libusb chia sẻ fd với Android.
-                 *   Nhưng endpoint có thể STALL — cần clear_halt tích cực.
-                 *
-                 * KHÔNG gọi libusb_detach_kernel_driver() — không áp dụng
-                 * trên Android (không có kernel driver kiểu Linux desktop).
-                 */
-                int r = libusb_claim_interface(g_handle, alt->bInterfaceNumber);
-                if (r == 0) {
-                    g_iface_claimed = 1;
-                    LOGI("discover: ✅ interface %d claimed successfully (fd sạch — termux-api pattern)",
-                         alt->bInterfaceNumber);
-                } else if (r == LIBUSB_ERROR_BUSY) {
-                    LOGI("discover: interface %d BUSY (Android pre-claimed) — chia sẻ fd, tiếp tục",
-                         alt->bInterfaceNumber);
-                } else if (r == LIBUSB_ERROR_NOT_SUPPORTED) {
-                    LOGI("discover: interface %d NOT_SUPPORTED — tiếp tục (bình thường trên Android)",
-                         alt->bInterfaceNumber);
-                } else {
-                    LOGE("discover: libusb_claim_interface(%d) err=%d (%s) — tiếp tục",
-                         alt->bInterfaceNumber, r, libusb_error_name(r));
-                }
-                g_ep_in     = ep_in;
-                g_ep_out    = ep_out;
-                g_iface_num = alt->bInterfaceNumber;
-                found = true;
-                LOGI("discover: ep_in=0x%02x ep_out=0x%02x iface=%d",
-                     g_ep_in, g_ep_out, g_iface_num);
-            }
+static void detach_drivers_of_config(libusb_device *dev, int cfg_value) {
+    struct libusb_config_descriptor *cfg = NULL;
+    if (cfg_value <= 0 || libusb_get_config_descriptor_by_value(dev, (uint8_t)cfg_value, &cfg) != 0) return;
+    for (int i = 0; i < cfg->bNumInterfaces; i++) {
+        if (cfg->interface[i].num_altsetting < 1) continue;
+        int n = cfg->interface[i].altsetting[0].bInterfaceNumber;
+        if (libusb_kernel_driver_active(g_handle, n) == 1) {
+            int r = libusb_detach_kernel_driver(g_handle, n);
+            LOGI("[usb] Gỡ kernel driver khỏi interface %d → %s", n, libusb_error_name(r));
         }
     }
     libusb_free_config_descriptor(cfg);
+}
+
+static void normalize_serial(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = 0;
+    if (n == 24 && strchr(s, '-') == NULL) {        /* UDID kiểu mới: 8-16 */
+        memmove(s + 9, s + 8, 17);
+        s[8] = '-';
+    }
+}
+
+static void read_serial(libusb_device *dev) {
+    struct libusb_device_descriptor dd;
+    g_serial[0] = 0;
+    if (libusb_get_device_descriptor(dev, &dd) != 0 || !dd.iSerialNumber) return;
+    unsigned char buf[128];
+    int r = libusb_get_string_descriptor_ascii(g_handle, dd.iSerialNumber, buf, sizeof(buf) - 1);
+    if (r > 0) {
+        buf[r] = 0;
+        snprintf(g_serial, sizeof(g_serial), "%s", (const char *)buf);
+        normalize_serial(g_serial);
+    }
+}
+
+bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id, int ep_in, int ep_out, int iface_num) {
+    (void)vendor_id;
+    if (g_initialized) usb_bridge_close();
+    g_use_android = 0;
+    g_iface_claimed = 0;
+    g_iface_num = -1;
+    g_config = -1;
+    g_maxpkt = 512;
+    g_read_err_logged = 0;
+
+    int r;
+#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010A)
+    struct libusb_init_option opts[1];
+    memset(opts, 0, sizeof(opts));
+    opts[0].option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY;
+    r = libusb_init_context(&g_ctx, opts, 1);
+#else
+    r = libusb_init(&g_ctx);
+#endif
+    if (r != 0) {
+        LOGE("[usb] libusb_init lỗi %s", libusb_error_name(r));
+        g_ctx = NULL;
+        return false;
+    }
+    libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
+
+    r = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_handle);
+    if (r != 0) {
+        LOGE("[usb] libusb_wrap_sys_device(fd=%d) lỗi %s — fd không hợp lệ hoặc thiếu quyền USB",
+             fd, libusb_error_name(r));
+        libusb_exit(g_ctx);
+        g_ctx = NULL;
+        g_handle = NULL;
+        return false;
+    }
+    libusb_device *dev = libusb_get_device(g_handle);
+    struct libusb_device_descriptor dd;
+    memset(&dd, 0, sizeof(dd));
+    libusb_get_device_descriptor(dev, &dd);
+
+    int cur = -1;
+    if (libusb_get_configuration(g_handle, &cur) != 0) cur = -1;
+
+    /* Như upstream: duyệt từ configuration CAO nhất xuống, lấy cái đầu tiên có
+     * interface usbmux. */
+    struct mux_iface mi;
+    memset(&mi, 0, sizeof(mi));
+    int found = 0;
+    for (int idx = (int)dd.bNumConfigurations - 1; idx >= 0 && !found; idx--) {
+        struct libusb_config_descriptor *cfg = NULL;
+        if (libusb_get_config_descriptor(dev, (uint8_t)idx, &cfg) != 0 || !cfg) continue;
+        found = find_mux_iface_in_config(cfg, &mi);
+        libusb_free_config_descriptor(cfg);
+    }
+    LOGI("[usb] iPhone pid=0x%04x: %d configuration, đang dùng config %d%s",
+         product_id, dd.bNumConfigurations, cur,
+         found ? "" : " — KHÔNG thấy interface usbmux trong descriptor");
 
     if (!found) {
-        LOGE("discover: không tìm thấy Apple AMDI — dùng endpoint mặc định");
-        g_ep_in  = 0x85;
-        g_ep_out = 0x04;
-        found = true;
-    }
-    return found;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_init_from_fd
- * ════════════════════════════════════════════════════════════════════════ */
-bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
-    (void)vendor_id;
-
-    if (g_initialized) {
-        LOGI("usb_bridge_init: đã init — reset trước");
-        usb_bridge_close();
-    }
-
-    int r = libusb_init(&g_ctx);
-    if (r != 0) {
-        LOGE("libusb_init() err=%d (%s)", r, libusb_error_name(r));
-        return false;
-    }
-
-    libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-
-    r = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_handle);
-    if (r != 0) {
-        LOGE("libusb_wrap_sys_device(fd=%d, pid=0x%04x) err=%d (%s)",
-             fd, product_id, r, libusb_error_name(r));
-        libusb_exit(g_ctx);
-        g_ctx = NULL;
-        return false;
-    }
-
-    LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
-
-    /* FIX ROOT CAUSE #3: KHÔNG gọi libusb_reset_device(). */
-    LOGI("usb_bridge_init: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3 — gây re-enum)");
-
-    if (!discover_apple_endpoints()) {
-        LOGE("discover_apple_endpoints() thất bại");
-        libusb_close(g_handle);
-        libusb_exit(g_ctx);
-        g_handle = NULL;
-        g_ctx    = NULL;
-        return false;
-    }
-
-    LOGI("usb_bridge_init: giữ endpoint nguyên trạng; clear_halt chỉ khi transfer PIPE");
-
-    g_initialized = 1;
-    LOGI("usb_bridge_init: ✅ sẵn sàng — ep_in=0x%02x ep_out=0x%02x",
-         g_ep_in, g_ep_out);
-    return true;
-}
-
-/*
- * ════════════════════════════════════════════════════════════════════════
- * usb_bridge_init_from_fd2 — FIX v37
- *
- * Tương tự usb_bridge_init_from_fd() nhưng nhận endpoint addresses +
- * interface number trực tiếp từ Kotlin (đã discover qua UsbInterface API).
- *
- * Lý do (xem log user):
- *   discover_apple_endpoints() fail với Android fd vì
- *   libusb_get_active_config_descriptor() không trả descriptor đầy đủ
- *   cho wrapped sys device → fallback endpoint mặc định (0x85/0x04)
- *   NHƯNG libusb_claim_interface() KHÔNG được gọi → bulk_transfer
- *   trả LIBUSB_ERROR_IO, clear_halt trả LIBUSB_ERROR_NOT_FOUND.
- *
- * Giải pháp: Kotlin đã có endpoint addresses + interface number từ
- * UsbTransport.findUsbmuxIface(). Truyền thẳng xuống native.
- *   1. libusb_wrap_sys_device(fd)
- *   2. Nếu ep_in/ep_out/iface_num được cung cấp (≠ 0/-1) → DÙNG TRỰC TIẾP
- *      và gọi libusb_claim_interface(iface_num)
- *   3. Nếu không được cung cấp → fallback gọi discover_apple_endpoints()
- *      như cũ
- *   4. clear_halt() trên cả 2 endpoints
- * ════════════════════════════════════════════════════════════════════════
- */
-bool usb_bridge_init_from_fd2(int fd, int vendor_id, int product_id,
-                              int ep_in, int ep_out, int iface_num) {
-    (void)vendor_id;
-
-    if (g_initialized) {
-        LOGI("usb_bridge_init2: đã init — reset trước");
-        usb_bridge_close();
-    }
-
-    int r = libusb_init(&g_ctx);
-    if (r != 0) {
-        LOGE("libusb_init() err=%d (%s)", r, libusb_error_name(r));
-        return false;
-    }
-
-    libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-
-    r = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_handle);
-    if (r != 0) {
-        LOGE("libusb_wrap_sys_device(fd=%d, pid=0x%04x) err=%d (%s)",
-             fd, product_id, r, libusb_error_name(r));
-        libusb_exit(g_ctx);
-        g_ctx = NULL;
-        return false;
-    }
-
-    LOGI("libusb_wrap_sys_device OK: fd=%d pid=0x%04x", fd, product_id);
-    LOGI("usb_bridge_init2: bỏ qua libusb_reset_device() (FIX ROOT CAUSE #3)");
-
-    /*
-     * FIX v37: Nếu caller cung cấp endpoint addresses + interface number,
-     * dùng trực tiếp thay vì discover. Đây là path chính trên Android.
-     */
-    bool have_endpoints = (ep_in != 0 && ep_out != 0 && iface_num >= 0);
-    if (have_endpoints) {
-        LOGI("usb_bridge_init2: dùng endpoint từ Kotlin: "
-             "ep_in=0x%02x ep_out=0x%02x iface=%d",
-             (uint8_t)ep_in, (uint8_t)ep_out, iface_num);
-
-        g_ep_in     = (uint8_t)ep_in;
-        g_ep_out    = (uint8_t)ep_out;
-        g_iface_num = iface_num;
-
-        /*
-         * CLAIM INTERFACE — bắt buộc cho bulk_transfer hoạt động.
-         *
-         * FIX v48: Phân loại rõ ràng hơn:
-         *   - LIBUSB_SUCCESS (0): fd sạch, libusb claim OK → dùng libusb path
-         *   - LIBUSB_ERROR_BUSY (-6): Android đã claim → share fd, libusb bulk
-         *     transfer CÓ THỂ hoạt động (tùy OEM)
-         *   - LIBUSB_ERROR_NOT_FOUND (-5): descriptor access fail trên wrapped fd
-         *     → libusb_bulk_transfer sẽ THẤT BẠI → cần Android JNI fallback
-         *   - LIBUSB_ERROR_NOT_SUPPORTED (-12): Android kernel không hỗ trợ claim
-         *     qua wrapped fd → bulk_transfer có thể hoạt động
-         *
-         * Lưu ý: Khi g_iface_claimed = 0, usb_bridge_bulk_write/read sẽ
-         * thử libusb_bulk_transfer → có thể trả IO/PIPE error. JNI layer
-         * (NativeBridge.onNativeBulkWrite/Read) sẽ detect và chuyển sang
-         * Android JNI transport mode.
-         */
-        int cr = libusb_claim_interface(g_handle, iface_num);
-        if (cr == 0) {
-            g_iface_claimed = 1;
-            LOGI("usb_bridge_init2: ✅ interface %d claimed successfully (fd sạch — libusb path)",
-                 iface_num);
-        } else if (cr == LIBUSB_ERROR_BUSY) {
-            /*
-             * Android USB service đã claim interface.
-             * libusb vẫn CÓ THỂ hoạt động qua shared fd, nhưng cần
-             *格外 cẩn thận — KHÔNG gọi libusb_release_interface khi close.
-             */
-            LOGI("usb_bridge_init2: ⚠️ interface %d BUSY (Android pre-claimed) — "
-                 "share fd, libusb bulk transfer có thể hoạt động",
-                 iface_num);
-            g_iface_claimed = 0;
-        } else if (cr == LIBUSB_ERROR_NOT_FOUND) {
-            /*
-             * FIX v37/v48: NOT_FOUND = descriptor access fail trên wrapped fd.
-             * libusb_bulk_transfer SẼ THẤT BẠI với IO/PIPE error.
-             * JNI layer sẽ detect và switch sang Android JNI transport mode.
-             */
-            LOGI("usb_bridge_init2: ⚠️ interface %d NOT_FOUND — "
-                 "libusb bulk transfer sẽ fail, JNI fallback sẽ activate",
-                 iface_num);
-            g_iface_claimed = 0;
-        } else if (cr == LIBUSB_ERROR_NOT_SUPPORTED) {
-            LOGI("usb_bridge_init2: ⚠️ interface %d NOT_SUPPORTED — "
-                 "thử bulk_transfer, JNI fallback nếu fail",
-                 iface_num);
-            g_iface_claimed = 0;
+        if (ep_in && ep_out && iface_num >= 0) {
+            mi.cfg_value = cur;
+            mi.iface = iface_num;
+            mi.ep_in = (uint8_t)ep_in;
+            mi.ep_out = (uint8_t)ep_out;
+            mi.maxpkt = 512;
+            found = 1;
+            LOGI("[usb] Dùng endpoint do Kotlin cung cấp: iface=%d in=0x%02x out=0x%02x", iface_num, ep_in, ep_out);
         } else {
-            LOGE("usb_bridge_init2: libusb_claim_interface(%d) err=%d (%s) — "
-                 "thử bulk_transfer, JNI fallback nếu fail",
-                 iface_num, cr, libusb_error_name(cr));
-            g_iface_claimed = 0;
-        }
-
-        /*
-         * FIX v48: Clear halt trên cả 2 endpoints SAU KHI claim.
-         * Delay tăng từ 80ms → 120ms cho iOS 17+ (USB stack chậm hơn).
-         *
-         * Quan trọng: clear_halt có thể trả NOT_FOUND nếu interface
-         * chưa được claim bởi libusb (g_iface_claimed=0). Đây là behavior
-         *expected — JNI fallback sẽ handle.
-         */
-        if (g_ep_out) {
-            int hr = libusb_clear_halt(g_handle, g_ep_out);
-            LOGI("usb_bridge_init2: clear_halt ep_out=0x%02x → %d (%s)",
-                 g_ep_out, hr, libusb_error_name(hr));
-            usleep(120 * 1000);
-        }
-        if (g_ep_in) {
-            int hr = libusb_clear_halt(g_handle, g_ep_in);
-            LOGI("usb_bridge_init2: clear_halt ep_in=0x%02x → %d (%s)",
-                 g_ep_in, hr, libusb_error_name(hr));
-            usleep(120 * 1000);
-        }
-    } else {
-        /* Caller không cung cấp endpoints — fallback discovery */
-        LOGI("usb_bridge_init2: caller không cung cấp endpoints — fallback discover_apple_endpoints()");
-        if (!discover_apple_endpoints()) {
-            LOGE("usb_bridge_init2: discover_apple_endpoints() thất bại");
-            libusb_close(g_handle);
-            libusb_exit(g_ctx);
-            g_handle = NULL;
-            g_ctx    = NULL;
+            LOGE("[usb] Không tìm được interface usbmux (class 0xFF/0xFE/2). Thiết bị không phải iPhone/iPad?");
+            libusb_close(g_handle); g_handle = NULL;
+            libusb_exit(g_ctx); g_ctx = NULL;
             return false;
         }
     }
 
-    LOGI("usb_bridge_init2: ✅ sẵn sàng — ep_in=0x%02x ep_out=0x%02x iface=%d claimed=%d",
-         g_ep_in, g_ep_out, g_iface_num, g_iface_claimed);
+    if (mi.cfg_value > 0 && cur != mi.cfg_value) {
+        detach_drivers_of_config(dev, cur);
+        detach_drivers_of_config(dev, mi.cfg_value);
+        r = libusb_set_configuration(g_handle, mi.cfg_value);
+        if (r == 0) {
+            LOGI("[usb] ✅ Đổi USB configuration %d → %d (interface usbmux nằm ở config %d)",
+                 cur, mi.cfg_value, mi.cfg_value);
+            cur = mi.cfg_value;
+        } else {
+            LOGE("[usb] libusb_set_configuration(%d) lỗi %s — sẽ thử claim trực tiếp / dự phòng Android",
+                 mi.cfg_value, libusb_error_name(r));
+            if (r == LIBUSB_ERROR_BUSY)
+                LOGE("[usb] 💡 Một app khác đang giữ iPhone (Files/Ảnh/MTP). Đóng app đó, rút cáp cắm lại.");
+            int c2 = -1;
+            if (libusb_get_configuration(g_handle, &c2) == 0) cur = c2;
+        }
+    }
+    g_config = cur;
+    g_iface_num = mi.iface;
+    g_ep_in = mi.ep_in;
+    g_ep_out = mi.ep_out;
+    g_maxpkt = mi.maxpkt > 0 ? mi.maxpkt : 512;
 
+    r = libusb_claim_interface(g_handle, g_iface_num);
+    if (r == LIBUSB_ERROR_BUSY) {
+        int d = libusb_detach_kernel_driver(g_handle, g_iface_num);
+        LOGI("[usb] Interface %d đang bận → detach kernel driver: %s", g_iface_num, libusb_error_name(d));
+        r = libusb_claim_interface(g_handle, g_iface_num);
+    }
+    if (r == 0) {
+        g_iface_claimed = 1;
+        LOGI("[usb] ✅ Claim interface %d (config %d) — ep_in=0x%02x ep_out=0x%02x maxpkt=%d",
+             g_iface_num, g_config, g_ep_in, g_ep_out, g_maxpkt);
+    } else {
+        LOGE("[usb] libusb_claim_interface(%d) lỗi %s (config hiện tại %d) — chuyển sang "
+             "UsbDeviceConnection.bulkTransfer()", g_iface_num, libusb_error_name(r), g_config);
+    }
+    read_serial(dev);
+    if (g_serial[0]) LOGI("[usb] Serial USB (UDID): %s", g_serial);
     g_initialized = 1;
     return true;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_clear_endpoints_halt (public)
- * ════════════════════════════════════════════════════════════════════════ */
+bool usb_bridge_init_from_fd(int fd, int vendor_id, int product_id) {
+    return usb_bridge_init_from_fd2(fd, vendor_id, product_id, 0, 0, -1);
+}
+
 bool usb_bridge_clear_endpoints_halt(void) {
-    /*
-     * FIX v38: Trong Android JNI transport mode, Android UsbDeviceConnection
-     * quản lý endpoint state. Hàm này không cần làm gì — return true để caller
-     * không bị block.
-     */
-    if (g_use_android) {
-        LOGI("clear_halt: skip (Android mode — UsbDeviceConnection quản lý endpoints)");
-        return true;
-    }
-
+    if (g_use_android) return true;
     if (!g_handle) return false;
-    bool any_ok = false;
-
-    if (g_ep_out) {
-        int r = libusb_clear_halt(g_handle, g_ep_out);
-        LOGI("clear_halt ep_out=0x%02x → %d", g_ep_out, r);
-        if (r == 0 || r == LIBUSB_ERROR_NOT_FOUND) any_ok = true;
-        usleep(80 * 1000);
-    }
-    if (g_ep_in) {
-        int r = libusb_clear_halt(g_handle, g_ep_in);
-        LOGI("clear_halt ep_in=0x%02x → %d", g_ep_in, r);
-        if (r == 0 || r == LIBUSB_ERROR_NOT_FOUND) any_ok = true;
-        usleep(80 * 1000);
-    }
-    return any_ok;
+    if (g_ep_out) libusb_clear_halt(g_handle, g_ep_out);
+    if (g_ep_in) libusb_clear_halt(g_handle, g_ep_in);
+    return true;
 }
 
-uint8_t usb_bridge_ep_in(void)  { return g_ep_in;  }
-uint8_t usb_bridge_ep_out(void) { return g_ep_out; }
-
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_bulk_write — 5 retry, 80ms delay
- *
- * FIX v35: Log error code CỤ THỂ cho mọi path lỗi (không chỉ PIPE).
- * Trước đây chỉ log "PIPE ep=..." và return -1 cho các error khác mà
- * không nói rõ là NOT_FOUND/NO_DEVICE/ACCESS/etc → khó debug.
- *
- * Các lỗi phổ biến trên Android:
- *   LIBUSB_ERROR_NOT_FOUND (-5): handle đã bị close do UsbDeviceConnection
- *     bị Android reclaim. Cần re-open.
- *   LIBUSB_ERROR_NO_DEVICE (-4): device đã detach.
- *   LIBUSB_ERROR_ACCESS (-3): thiếu quyền USB.
- *   LIBUSB_ERROR_BUSY (-6): interface bị process khác hold.
- *   LIBUSB_ERROR_OVERFLOW (-8): packet lớn hơn endpoint max packet size.
- *   LIBUSB_ERROR_PIPE (-9): endpoint STALL — clear_halt và retry.
- *   LIBUSB_ERROR_TIMEOUT (-7): timeout.
- * ════════════════════════════════════════════════════════════════════════ */
+/* Ghi trọn một gói mux; tự gửi ZLP khi len % wMaxPacketSize == 0 (usb_send của
+ * upstream). Trả về len khi thành công, <0 khi lỗi. */
 int usb_bridge_bulk_write(const void *buf, int len, unsigned int timeout) {
-    /*
-     * FIX v38: Nếu đang ở Android JNI transport mode, route qua JNI callbacks
-     * thay vì libusb_bulk_transfer. Điều này xảy ra khi libusb_claim_interface()
-     * đã fail với NOT_FOUND — libusb_bulk_transfer cũng sẽ fail với IO.
-     *
-     * FIX v41: Log return value để debug xem packet thực sự được gửi đi không.
-     */
-    if (g_use_android) {
-        int n = call_android_bulk_write(buf, len, timeout ? timeout : 5000);
-        if (n > 0) {
-            LOGI("bulk_write (android): sent %d/%d bytes", n, len);
-        } else if (n == 0) {
-            LOGE("bulk_write (android): sent 0 bytes (timeout?)");
-        } else {
-            LOGE("bulk_write (android): call_android_bulk_write returned %d", n);
+    if (len <= 0) return 0;
+    if (g_use_android) return call_android_bulk_write(buf, len, timeout ? timeout : 5000);
+    if (!g_handle || !g_ep_out) return -1;
+    int off = 0, pipe_retry = 0;
+    while (off < len) {
+        int t = 0;
+        int r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char *)buf + off, len - off, &t,
+                                     timeout ? timeout : 5000);
+        if (t > 0) off += t;
+        if (r == 0) {
+            if (off < len && t == 0) return -1;
+            continue;
         }
-        return n;
-    }
-
-    if (!g_handle || !g_ep_out) {
-        LOGE("bulk_write: bad state — handle=%p ep_out=0x%02x", (void*)g_handle, g_ep_out);
+        if (r == LIBUSB_ERROR_PIPE && pipe_retry++ < 2) { libusb_clear_halt(g_handle, g_ep_out); continue; }
+        if (r == LIBUSB_ERROR_TIMEOUT && t > 0) continue;
+        LOGE("[usb] bulk OUT 0x%02x lỗi %s (%d/%d byte)", g_ep_out, libusb_error_name(r), off, len);
         return -1;
     }
-    int last_err = 0;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        int transferred = 0;
-        int r = libusb_bulk_transfer(g_handle, g_ep_out,
-                                      (unsigned char *)buf, len,
-                                      &transferred, timeout ? timeout : 5000);
-        if (r == 0) return transferred;
-        if (r == LIBUSB_ERROR_TIMEOUT) {
-            LOGI("bulk_write: TIMEOUT ep=0x%02x attempt %d/5 — transferred=%d/%d",
-                 g_ep_out, attempt+1, transferred, len);
-            /* TIMEOUT không retry ngay — tăng timeout cho lần sau */
-            continue;
-        }
-        if (r == LIBUSB_ERROR_PIPE) {
-            LOGI("bulk_write: PIPE ep=0x%02x attempt %d/5 — clear_halt retry",
-                 g_ep_out, attempt+1);
-            libusb_clear_halt(g_handle, g_ep_out);
-            usleep(80 * 1000);
-            continue;
-        }
-        if (r == LIBUSB_ERROR_OVERFLOW) {
-            /*
-             * FIX v35 (Critical): OVERFLOW thường xảy ra khi Android UsbDeviceConnection
-             * đã claim interface và libusb chia sẻ fd. Khi đó libusb không gửi được
-             * packet đúng kích thước. Clear_halt không giúp — cần raw USB reset
-             * qua control transfer CLEAR_FEATURE(ENDPOINT_HALT) để reset endpoint
-             * toggle state. Thử clear_halt + delay dài hơn.
-             */
-            LOGI("bulk_write: OVERFLOW ep=0x%02x attempt %d/5 — try clear_halt + long delay",
-                 g_ep_out, attempt+1);
-            libusb_clear_halt(g_handle, g_ep_out);
-            usleep(200 * 1000);  /* delay dài hơn cho OVERFLOW */
-            continue;
-        }
-        if (r == LIBUSB_ERROR_NOT_FOUND || r == LIBUSB_ERROR_NO_DEVICE) {
-            /*
-             * FIX v35: Handle bị mất — không retry được, return ngay.
-             * Caller sẽ thấy error này và trigger USB re-open.
-             */
-            LOGE("bulk_write: %s ep=0x%02x err=%d — handle mất, không retry",
-                 libusb_error_name(r), g_ep_out, r);
-            return -1;
-        }
-        if (r == LIBUSB_ERROR_BUSY) {
-            LOGI("bulk_write: BUSY ep=0x%02x attempt %d/5 — chờ 100ms và retry",
-                 g_ep_out, attempt+1);
-            usleep(100 * 1000);
-            continue;
-        }
-        if (r == LIBUSB_ERROR_ACCESS) {
-            LOGE("bulk_write: ACCESS DENIED ep=0x%02x err=%d — thiếu quyền USB Host",
-                 g_ep_out, r);
-            return -1;
-        }
-        /* Lỗi khác — log + retry */
-        LOGE("bulk_write: ep=0x%02x err=%d (%s) attempt %d/5 — retry",
-             g_ep_out, r, libusb_error_name(r), attempt+1);
-        last_err = r;
-        usleep(80 * 1000);
+    if (g_maxpkt > 0 && (len % g_maxpkt) == 0) {
+        int t = 0;
+        int r = libusb_bulk_transfer(g_handle, g_ep_out, (unsigned char *)buf, 0, &t, 1000);
+        if (r != 0) LOGE("[usb] Gửi ZLP lỗi %s", libusb_error_name(r));
     }
-    LOGE("bulk_write: thất bại sau 5 lần thử, ep=0x%02x, last_err=%d (%s)",
-         g_ep_out, last_err, libusb_error_name(last_err));
+    return len;
+}
+
+/* Đọc MỘT transfer (≤ len). 0 = timeout/ZLP. *completed = 0 nếu transfer bị
+ * cắt do timeout (còn phần sau). <0 = lỗi. */
+int usb_bridge_bulk_read_ex(void *buf, int len, unsigned int timeout, int *completed) {
+    if (completed) *completed = 1;
+    if (g_use_android) {
+        int n = call_android_bulk_read(buf, len, timeout ? timeout : 1000);
+        return n;
+    }
+    if (!g_handle || !g_ep_in) return -1;
+    int t = 0;
+    int r = libusb_bulk_transfer(g_handle, g_ep_in, (unsigned char *)buf, len, &t, timeout ? timeout : 1000);
+    if (r == 0) return t;
+    if (r == LIBUSB_ERROR_TIMEOUT) {
+        if (t > 0) { if (completed) *completed = 0; return t; }
+        return 0;
+    }
+    if (r == LIBUSB_ERROR_INTERRUPTED) return t > 0 ? t : 0;
+    if (r == LIBUSB_ERROR_OVERFLOW && t > 0) return t;
+    if (r == LIBUSB_ERROR_PIPE) libusb_clear_halt(g_handle, g_ep_in);
+    if (g_read_err_logged++ < 5)
+        LOGE("[usb] bulk IN 0x%02x lỗi %s", g_ep_in, libusb_error_name(r));
     return -1;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_bulk_read — 5 retry, 80ms delay
- *
- * FIX v35: Log error code CỤ THỂ cho mọi path lỗi (không chỉ PIPE).
- * ════════════════════════════════════════════════════════════════════════ */
 int usb_bridge_bulk_read(void *buf, int len, unsigned int timeout) {
-    /*
-     * FIX v38: Route qua Android JNI transport nếu đã enable.
-     *
-     * FIX v41: Thêm log khi Android bulk_read trả data — cần để debug
-     * xem có phải loopback (TX packet bị echo vào RX) hay không.
-     */
-    if (g_use_android) {
-        int n = call_android_bulk_read(buf, len, timeout ? timeout : 10000);
-        if (n > 0) {
-            /* Log data nhận được để debug loopback */
-            char hex[32 * 3 + 8];
-            int off = 0;
-            int show = n < 32 ? n : 32;
-            for (int i = 0; i < show; i++) {
-                int written = snprintf(hex + off, sizeof(hex) - off,
-                                        "%02x ", ((const uint8_t *)buf)[i]);
-                if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
-                off += written;
-            }
-            LOGI("bulk_read (android): got %d bytes (requested %d): %s%s",
-                 n, len, hex, n > 32 ? "..." : "");
-        } else if (n == 0) {
-            LOGI("bulk_read (android): timeout, 0 bytes");
-        } else {
-            LOGE("bulk_read (android): call_android_bulk_read returned %d", n);
-        }
-        return n;
-    }
-
-    if (!g_handle || !g_ep_in) {
-        LOGE("bulk_read: bad state — handle=%p ep_in=0x%02x", (void*)g_handle, g_ep_in);
-        return -1;
-    }
-    int last_err = 0;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        int transferred = 0;
-        int r = libusb_bulk_transfer(g_handle, g_ep_in,
-                                      (unsigned char *)buf, len,
-                                      &transferred, timeout ? timeout : 10000);
-        if (r == 0) return transferred;
-        if (r == LIBUSB_ERROR_TIMEOUT) {
-            /* TIMEOUT = không có data — return 0 (caller sẽ xử lý) */
-            return 0;
-        }
-        if (r == LIBUSB_ERROR_PIPE) {
-            LOGI("bulk_read: PIPE ep=0x%02x attempt %d/5 — clear_halt retry",
-                 g_ep_in, attempt+1);
-            libusb_clear_halt(g_handle, g_ep_in);
-            usleep(80 * 1000);
-            continue;
-        }
-        if (r == LIBUSB_ERROR_OVERFLOW) {
-            LOGI("bulk_read: OVERFLOW ep=0x%02x attempt %d/5 — buffer quá nhỏ? clear_halt và retry",
-                 g_ep_in, attempt+1);
-            libusb_clear_halt(g_handle, g_ep_in);
-            usleep(200 * 1000);
-            continue;
-        }
-        if (r == LIBUSB_ERROR_NOT_FOUND || r == LIBUSB_ERROR_NO_DEVICE) {
-            LOGE("bulk_read: %s ep=0x%02x err=%d — handle mất, không retry",
-                 libusb_error_name(r), g_ep_in, r);
-            return -1;
-        }
-        if (r == LIBUSB_ERROR_BUSY) {
-            LOGI("bulk_read: BUSY ep=0x%02x attempt %d/5 — chờ 100ms và retry",
-                 g_ep_in, attempt+1);
-            usleep(100 * 1000);
-            continue;
-        }
-        if (r == LIBUSB_ERROR_ACCESS) {
-            LOGE("bulk_read: ACCESS DENIED ep=0x%02x err=%d — thiếu quyền USB Host",
-                 g_ep_in, r);
-            return -1;
-        }
-        LOGE("bulk_read: ep=0x%02x err=%d (%s) attempt %d/5 — retry",
-             g_ep_in, r, libusb_error_name(r), attempt+1);
-        last_err = r;
-        usleep(80 * 1000);
-    }
-    LOGE("bulk_read: thất bại sau 5 lần thử, ep=0x%02x, last_err=%d (%s)",
-         g_ep_in, last_err, libusb_error_name(last_err));
-    return -1;
+    return usb_bridge_bulk_read_ex(buf, len, timeout, NULL);
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_flush_in — drain stale data, tiếp tục sau PIPE
- *
- * FIX v41: Khi g_use_android = 1, dùng call_android_bulk_read thay vì
- * libusb_bulk_transfer để respect Android JNI transport mode.
- *
- * FIX v41 (Critical): Hex dump drained bytes để debug loopback issue.
- * Trong log v40 user, flush_in drained 20 bytes = EXACTLY VERSION packet
- * mà chúng ta vừa gửi → có thể là TX packet bị looped back vào RX queue
- * do Android USB HAL hoặc USB controller quirk. Hex dump sẽ xác nhận.
- * ════════════════════════════════════════════════════════════════════════ */
 void usb_bridge_flush_in(int max_packets, int timeout_ms) {
-    if (g_use_android) {
-        /* Android mode — dùng call_android_bulk_read */
-        uint8_t *buf = malloc(65536);
-        if (!buf) return;
-        int drained = 0;
-        for (int i = 0; i < max_packets; i++) {
-            int n = call_android_bulk_read(buf, 65536, (unsigned int)timeout_ms);
-            if (n < 0) break;
-            if (n == 0) break;  /* timeout */
-            drained += n;
-            LOGI("flush_in: drained %d bytes (packet %d)", n, i+1);
-            /* FIX v41: Hex dump first 32 bytes để xem có phải loopback không */
-            if (n > 0 && i == 0) {
-                char hex[32 * 3 + 8];
-                int off = 0;
-                int show = n < 32 ? n : 32;
-                for (int j = 0; j < show; j++) {
-                    int written = snprintf(hex + off, sizeof(hex) - off, "%02x ", buf[j]);
-                    if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
-                    off += written;
-                }
-                LOGI("flush_in: hex dump (first %d bytes): %s%s",
-                     show, hex, n > 32 ? "..." : "");
-            }
-        }
-        free(buf);
-        LOGI("flush_in: tổng %d bytes drained (Android mode)", drained);
-        return;
-    }
-
-    if (!g_handle || !g_ep_in) return;
-
-    uint8_t *buf = malloc(65536);
+    uint8_t *buf = malloc(16384);
     if (!buf) return;
-
-    int drained = 0;
-    int pipe_count = 0;
     for (int i = 0; i < max_packets; i++) {
-        int transferred = 0;
-        int r = libusb_bulk_transfer(g_handle, g_ep_in,
-                                      buf, 65536, &transferred,
-                                      (unsigned int)timeout_ms);
-        if (r == LIBUSB_ERROR_TIMEOUT) break;
-        if (r == LIBUSB_ERROR_PIPE) {
-            libusb_clear_halt(g_handle, g_ep_in);
-            usleep(50 * 1000);
-            if (++pipe_count >= 3) break;
-            continue;
-        }
-        if (r != 0) break;
-        if (transferred > 0) {
-            drained += transferred;
-            pipe_count = 0;
-            LOGI("flush_in: drained %d bytes (packet %d)", transferred, i+1);
-            /* FIX v41: Hex dump first packet để debug */
-            if (i == 0) {
-                char hex[32 * 3 + 8];
-                int off = 0;
-                int show = transferred < 32 ? transferred : 32;
-                for (int j = 0; j < show; j++) {
-                    int written = snprintf(hex + off, sizeof(hex) - off, "%02x ", buf[j]);
-                    if (written < 0 || (size_t)written >= sizeof(hex) - off) break;
-                    off += written;
-                }
-                LOGI("flush_in: hex dump (first %d bytes): %s%s",
-                     show, hex, transferred > 32 ? "..." : "");
-            }
-        } else {
-            break;
-        }
+        int n = usb_bridge_bulk_read(buf, 16384, (unsigned)timeout_ms);
+        if (n <= 0) break;
     }
     free(buf);
-    LOGI("flush_in: tổng %d bytes drained", drained);
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * usb_bridge_close
- * ════════════════════════════════════════════════════════════════════════ */
 void usb_bridge_close(void) {
     if (g_handle) {
-        if (g_iface_claimed && g_iface_num >= 0) {
-            libusb_release_interface(g_handle, g_iface_num);
-        }
-        g_iface_num = -1;
-        g_iface_claimed = 0;
-        libusb_close(g_handle);
+        if (g_iface_claimed && g_iface_num >= 0) libusb_release_interface(g_handle, g_iface_num);
+        libusb_close(g_handle);      /* fd do Android sở hữu: libusb không đóng fd đã wrap */
         g_handle = NULL;
     }
-    if (g_ctx) {
-        libusb_exit(g_ctx);
-        g_ctx = NULL;
-    }
-    g_ep_in       = 0;
-    g_ep_out      = 0;
+    if (g_ctx) { libusb_exit(g_ctx); g_ctx = NULL; }
+    g_iface_claimed = 0;
+    g_iface_num = -1;
+    g_ep_in = g_ep_out = 0;
     g_initialized = 0;
-    LOGI("usb_bridge_close: done");
+    g_use_android = 0;
+    g_config = -1;
 }

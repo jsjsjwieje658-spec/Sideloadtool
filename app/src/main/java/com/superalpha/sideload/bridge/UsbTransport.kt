@@ -121,8 +121,19 @@ object UsbTransport {
     fun getFileDescriptor(): Int = connection?.fileDescriptor ?: -1
     fun getVendorId():  Int = currentDevice?.vendorId  ?: 0
     fun getProductId(): Int = currentDevice?.productId ?: 0
-    /** FIX UDID: Lấy UDID thật từ Android UsbDevice.serialNumber */
-    fun getSerialNumber(): String? = currentDevice?.serialNumber
+    /** UDID từ iSerialNumber (cần quyền USB). iPhone XS trở lên báo 24 ký tự
+     *  không có '-', còn UDID thật (lockdown, Apple Developer) là 8-16 → chèn
+     *  '-' giống usbmuxd upstream, nếu không đăng ký thiết bị với Apple sẽ sai. */
+    fun getSerialNumber(): String? = normalizeUdid(
+        try { currentDevice?.serialNumber } catch (_: SecurityException) { null }
+    )
+
+    @JvmStatic
+    fun normalizeUdid(raw: String?): String? {
+        val s = raw?.trim()?.replace(" ", "") ?: return null
+        if (s.isEmpty()) return null
+        return if (s.length == 24 && !s.contains('-')) s.substring(0, 8) + "-" + s.substring(8) else s
+    }
 
     /*
      * FIX v37: Expose endpoint addresses + interface number cho native layer.
@@ -156,7 +167,10 @@ object UsbTransport {
     )
 
     private fun findUsbmuxIface(device: UsbDevice): FoundIface? {
-        for (ci in 0 until device.configurationCount) {
+        // v49: như usbmuxd upstream (set_valid_configuration) — duyệt từ
+        // configuration CAO nhất xuống. iPhone: config 1 = chỉ PTP (Android hay
+        // để ở đây), 3/4 (5/6 trên máy mới) mới có interface usbmux.
+        for (ci in device.configurationCount - 1 downTo 0) {
             val cfg = device.getConfiguration(ci)
             for (ii in 0 until cfg.interfaceCount) {
                 val iface = cfg.getInterface(ii)
@@ -290,18 +304,22 @@ object UsbTransport {
             uiLogE("prepareForBulkTransfers: usbmux iface not found"); return false
         }
         try {
-            conn.setConfiguration(found.config)
-            uiLog("prepareForBulkTransfers: setConfiguration(${found.config.id}) OK")
+            val ok = conn.setConfiguration(found.config)
+            if (ok) uiLog("prepareForBulkTransfers: setConfiguration(${found.config.id}) OK")
+            else uiLogE("prepareForBulkTransfers: setConfiguration(${found.config.id}) trả false (có thể đã đúng config)")
         } catch (e: Exception) {
             uiLogE("prepareForBulkTransfers: setConfiguration exception (non-fatal): $e")
         }
+        usbInterface = found.iface
+        endpointIn = found.epIn
+        endpointOut = found.epOut
 
         // Claim với retry (8 lần, exponential backoff)
         var claimed = false
         val delays = longArrayOf(0, 150, 300, 500, 800, 1200, 1800, 2500)
         for (i in 0 until 8) {
             if (i > 0) Thread.sleep(delays.getOrElse(i) { 2500L })
-            if (conn.claimInterface(iface, true)) { claimed = true; break }
+            if (conn.claimInterface(found.iface, true)) { claimed = true; break }
             uiLogE("prepareForBulkTransfers: claimInterface retry $i")
         }
 
@@ -310,7 +328,7 @@ object UsbTransport {
             return false
         }
 
-        try { conn.setInterface(iface) } catch (_: Exception) {}
+        try { conn.setInterface(found.iface) } catch (_: Exception) {}
         interfaceClaimed = true
 
         // Clear endpoint halts sau khi claim
@@ -363,37 +381,29 @@ object UsbTransport {
 
     @JvmStatic
     fun nativeBulkWrite(data: ByteArray, timeoutMs: Int): Int {
-        val ep = endpointOut ?: run {
-            uiLogE("nativeBulkWrite: endpointOut NULL")
-            return -1
+        val ep = endpointOut ?: run { uiLogE("nativeBulkWrite: endpointOut NULL"); return -1 }
+        val c  = connection ?: run { uiLogE("nativeBulkWrite: connection NULL"); return -1 }
+        if (!interfaceClaimed) { uiLogE("nativeBulkWrite: interface chưa claim"); return -1 }
+        // v49: Android < 9 (API 28) giới hạn MỖI bulkTransfer 16384 byte; gói mux
+        // có thể tới 48 KiB. Chia khối 16 KiB (bội số wMaxPacketSize → thiết bị
+        // vẫn thấy một transfer liền), ZLP ở cuối nếu cần. Không log từng gói
+        // (hàng nghìn gói khi chép IPA sẽ làm treo UI).
+        var off = 0
+        while (off < data.size) {
+            val n = minOf(16384, data.size - off)
+            val r = c.bulkTransfer(ep, data, off, n, timeoutMs)
+            if (r <= 0) {
+                uiLogE("nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
+                       "len=$n (đã gửi $off/${data.size}) → $r")
+                return -1
+            }
+            off += r
         }
-        val c  = connection ?: run {
-            uiLogE("nativeBulkWrite: connection NULL")
-            return -1
-        }
-        if (!interfaceClaimed) {
-            uiLogE("nativeBulkWrite: interface chưa claim")
-            return -1
-        }
-        val t0 = System.currentTimeMillis()
-        val result = c.bulkTransfer(ep, data, data.size, timeoutMs)
-        val dt = System.currentTimeMillis() - t0
-        if (result < 0) {
-            uiLogE("nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                       "len=${data.size} timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
-            return result
-        }
-        uiLog("nativeBulkWrite: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                   "len=${data.size} → $result bytes (dt=${dt}ms)")
-
         val wMaxPacketSize = ep.maxPacketSize
         if (wMaxPacketSize > 0 && data.size % wMaxPacketSize == 0) {
-            uiLog("nativeBulkWrite: gửi ZLP (len=${data.size} % wMaxPacketSize=$wMaxPacketSize == 0)")
-            val zlpResult = c.bulkTransfer(ep, ByteArray(0), 0, 1000)
-            uiLog("nativeBulkWrite: ZLP result=$zlpResult")
+            c.bulkTransfer(ep, ByteArray(0), 0, 1000)
         }
-
-        return result
+        return data.size
     }
 
     /*
@@ -422,71 +432,36 @@ object UsbTransport {
     @JvmStatic
     @Synchronized
     fun nativeBulkRead(buf: ByteArray, timeoutMs: Int): Int {
-        val ep = endpointIn ?: run {
-            uiLogE("nativeBulkRead: endpointIn NULL")
-            return -1
-        }
-        val c  = connection ?: run {
-            uiLogE("nativeBulkRead: connection NULL")
-            return -1
-        }
-        if (!interfaceClaimed) {
-            uiLogE("nativeBulkRead: interface chưa claim")
-            return -1
-        }
+        val ep = endpointIn ?: run { uiLogE("nativeBulkRead: endpointIn NULL"); return -1 }
+        val c  = connection ?: run { uiLogE("nativeBulkRead: connection NULL"); return -1 }
+        if (!interfaceClaimed) { uiLogE("nativeBulkRead: interface chưa claim"); return -1 }
 
-        /*
-         * Bước 1: Nếu có pending data từ lần đọc trước, trả về ngay.
-         * Ví dụ: caller muốn 8 byte header, nhưng lần trước iPhone gửi
-         * 20 byte → ta đã buffer 12 byte còn lại → trả về 8 byte ngay.
-         */
         if (pendingLen > 0) {
-            val copy = if (pendingLen < buf.size) pendingLen else buf.size
+            val copy = minOf(pendingLen, buf.size)
             System.arraycopy(pendingBuf, pendingOff, buf, 0, copy)
             pendingOff += copy
             pendingLen -= copy
             if (pendingLen == 0) pendingOff = 0
-            uiLog("nativeBulkRead: returned $copy bytes from pending buffer (${pendingLen} bytes còn lại)")
             return copy
         }
-
-        /*
-         * Bước 2: Không có pending data — đọc mới từ USB với buffer 16KB.
-         * Quan trọng: dùng pendingBuf (16KB) làm buffer đọc, KHÔNG dùng
-         * buf của caller (có thể chỉ 8 byte). Tránh STALL endpoint.
-         */
+        // Luôn đọc vào bộ đệm 16 KiB (USB_MRU của usbmuxd) để không bao giờ
+        // tràn (EOVERFLOW) khi transfer của iPhone dài hơn bộ đệm của caller.
         val t0 = System.currentTimeMillis()
         val result = c.bulkTransfer(ep, pendingBuf, USB_MRU, timeoutMs)
-        val dt = System.currentTimeMillis() - t0
         if (result < 0) {
-            uiLogE("nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} " +
-                       "len=$USB_MRU timeout=${timeoutMs}ms → $result (dt=${dt}ms)")
+            // bulkTransfer trả -1 cả khi TIMEOUT — không phải lỗi; chỉ báo lỗi
+            // khi trả về sớm hơn nhiều so với timeout (thiết bị rút/khoá USB).
+            val dt = System.currentTimeMillis() - t0
+            if (dt + 50 >= timeoutMs) return 0
+            uiLogE("nativeBulkRead: bulkTransfer ep=0x${ep.address.toString(16)} → $result sau ${dt}ms")
             return result
         }
-        if (result == 0) {
-            uiLog("nativeBulkRead: timeout, 0 bytes (dt=${dt}ms)")
-            return 0
-        }
-
-        /* FIX v42/v43: Hex dump first 32 bytes để xác nhận là iPhone response */
-        val hex = StringBuilder()
-        val show = if (result < 32) result else 32
-        for (i in 0 until show) {
-            hex.append(String.format("%02x ", pendingBuf[i]))
-        }
-        uiLog("nativeBulkRead: got $result bytes (dt=${dt}ms): $hex${if (result > 32) "..." else ""}")
-
-        /*
-         * Bước 3: Copy vào buf của caller. Nếu caller cần ít hơn result,
-         * phần dư được giữ lại trong pendingBuf/pendingOff/pendingLen.
-         */
-        val copy = if (result < buf.size) result else buf.size
+        if (result == 0) return 0
+        val copy = minOf(result, buf.size)
         System.arraycopy(pendingBuf, 0, buf, 0, copy)
         if (result > copy) {
-            /* Data dư — buffer lại cho lần sau */
             pendingOff = copy
             pendingLen = result - copy
-            uiLog("nativeBulkRead: copied $copy to caller, buffered ${pendingLen} bytes for next read")
         }
         return copy
     }
