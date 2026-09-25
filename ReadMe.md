@@ -18,8 +18,9 @@ ngay trong một chiếc điện thoại Android.
   viết lại từ giao thức gốc của `libimobiledevice`/`usbmuxd` (đã kiểm chứng
   trên iPhone thật, iOS 16+).
 - **Tự ghép nối + tự đăng ký UDID** — cắm cáp là dùng, không cần thao tác riêng.
-- **Tự thu hồi certificate** khi tài khoản bị Apple chặn tạo cert mới vì đã đủ
-  giới hạn 2 certificate (ưu tiên thu hồi cert do tool tạo).
+- **Tự thu hồi certificate** ngay khi tạo cert mới thất bại — không cần đủ
+  giới hạn 2 cert mới kích hoạt (ưu tiên thu hồi cert do tool tạo, thu hồi
+  xong tự tạo lại).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).

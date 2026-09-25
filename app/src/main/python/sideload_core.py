@@ -530,8 +530,12 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
 # limit không tạo được cert".
 #
 # Chiến lược (an toàn theo docstring revoke_certificate trong developer_api.py):
-#   1. CHỈ kích hoạt khi tạo cert thất bại VÀ tài khoản đang có ≥ 2 cert
-#      (đúng điều kiện giới hạn) — tránh thu hồi vô ích khi lỗi là mạng.
+#   1. v55 (yêu cầu người dùng 2026-09-25): KHÔNG còn ngưỡng "phải có ≥ 2
+#      certificate" — chỉ cần tạo cert THẤT BẠI là thu hồi ngay những cert
+#      đang có (1 cert cũng thu hồi; 0 cert thì không có gì để thu hồi).
+#      Lý do thực tế: số cert trả về từ API có thể không phản ánh đúng trạng
+#      thái giới hạn của Apple (cert đang chờ hết hạn, đếm lệch...), ngưỡng
+#      ≥ 2 khiến một số máy vẫn kẹt "Không tạo được certificate".
 #   2. Ưu tiên thu hồi certificate do CHÍNH TOOL NÀY tạo (machine name bắt đầu
 #      bằng 'ios-sideload-tool' / 'sideload-') — không đụng cert của Xcode
 #      nếu có thể (Xcode sẽ mất quyền ký tới khi đăng nhập lại).
@@ -551,12 +555,10 @@ def _auto_revoke_certs_for_limit(dev_api, state) -> int:
     Trả về số certificate đã thu hồi thành công (0 = không thu hồi gì,
     caller đừng thử tạo lại)."""
     certs = dev_api.list_certificates()
-    if len(certs) < 2:
-        # Giới hạn là 2 cert — chưa có 2 cert thì lỗi tạo cert không phải do
-        # limit (mạng/session/...), thu hồi cũng không giúp gì.
-        if getattr(dev_api, "last_error", None):
-            print(f"[cert] Lỗi tạo certificate: {dev_api.last_error}")
-        print("[cert] Tài khoản chưa có 2 certificate — lỗi tạo cert không phải do giới hạn.")
+    if getattr(dev_api, "last_error", None):
+        print(f"[cert] Lỗi tạo certificate: {dev_api.last_error}")
+    if not certs:
+        print("[cert] Tài khoản không có certificate nào — không có gì để thu hồi.")
         return 0
 
     tool_certs = [
@@ -565,11 +567,11 @@ def _auto_revoke_certs_for_limit(dev_api, state) -> int:
     ]
     if tool_certs:
         targets = tool_certs
-        print(f"[cert] ⚠️  Tài khoản đã đủ giới hạn 2 certificate — tự động thu hồi "
+        print(f"[cert] ⚠️  Tạo certificate thất bại — tự động thu hồi "
               f"{len(tool_certs)} certificate do tool này tạo...")
     else:
         targets = certs
-        print(f"[cert] ⚠️  Tài khoản đã đủ giới hạn 2 certificate, không có cert nào của tool — "
+        print(f"[cert] ⚠️  Tạo certificate thất bại, không có cert nào của tool — "
               f"thu hồi tất cả {len(certs)} certificate (tool sẽ tự tạo cert mới khi ký)...")
 
     revoked = 0

@@ -381,13 +381,37 @@ FakeDevAPI.cert_fail_first = False
 FakeDevAPI.certs = []
 FakeDevAPI.revoked = []
 
-print("=== CASE H: tạo cert lỗi nhưng KHÔNG đủ 2 cert → không thu hồi gì ===")
+print("=== CASE H: tạo cert lỗi + 0 cert → không có gì để thu hồi, báo thất bại ===")
 reset_run()
 FakeDevAPI.cert_fail_first = True   # fail lần đầu, không có cert nào để thu hồi
 ok = core.do_sideload(ipa, "user@example.com", "pw")
 check(ok is False, "do_sideload báo thất bại")
 check(FakeDevAPI.revoked == [], f"không thu hồi cert nào: {FakeDevAPI.revoked}")
 FakeDevAPI.cert_fail_first = False
+
+print("=== CASE H2 (v55): tạo cert lỗi + CHỈ 1 cert vẫn tự thu hồi rồi tạo lại ===")
+reset_run()
+FakeDevAPI.cert_fail_first = True   # create fail lần đầu
+FakeDevAPI.certs = [
+    {"id": "C-ONLY", "attributes": {"name": "ios-sideload-tool", "status": "ACTIVE"}},
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "do_sideload thành công sau khi thu hồi cert duy nhất")
+check(FakeDevAPI.revoked == ["C-ONLY"], f"đã thu hồi cert duy nhất: {FakeDevAPI.revoked}")
+FakeDevAPI.certs = []
+FakeDevAPI.revoked = []
+
+print("=== CASE H3 (v55): 1 cert KHÔNG phải của tool vẫn bị thu hồi (fallback tất cả) ===")
+reset_run()
+FakeDevAPI.cert_fail_first = True
+FakeDevAPI.certs = [
+    {"id": "C-XC", "attributes": {"name": "Xcode: Macbook", "status": "ACTIVE"}},
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "do_sideload thành công sau khi thu hồi cert không phải của tool")
+check(FakeDevAPI.revoked == ["C-XC"], f"fallback thu hồi tất cả: {FakeDevAPI.revoked}")
+FakeDevAPI.certs = []
+FakeDevAPI.revoked = []
 
 print("=== CASE I: do_login (màn đăng nhập lần đầu) ===")
 check(core.do_login("user@example.com", "pw") is True, "do_login thành công với tài khoản hợp lệ")
