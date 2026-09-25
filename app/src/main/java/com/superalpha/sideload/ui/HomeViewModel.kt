@@ -54,6 +54,18 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _savedAppleId     = MutableStateFlow(AppConfig.appleId)
     val savedAppleId: StateFlow<String> = _savedAppleId
 
+    /** v51: mật khẩu đã lưu (người dùng yêu cầu lưu để khỏi nhập lại). */
+    private val _savedPassword = MutableStateFlow(AppConfig.applePassword)
+    val savedPassword: StateFlow<String> = _savedPassword
+
+    /**
+     * v51: cổng đăng nhập — false khi chưa có Apple ID + mật khẩu đã lưu
+     * (lần đầu cài app, hoặc sau khi Đăng xuất). MainActivity dựa vào đây
+     * để hiện LoginScreen thay vì app chính.
+     */
+    private val _signedIn = MutableStateFlow(AppConfig.hasAppleAccount())
+    val signedIn: StateFlow<Boolean> = _signedIn
+
     private val _savedAnisetteUrl = MutableStateFlow(AppConfig.anisetteUrl)
     val savedAnisetteUrl: StateFlow<String> = _savedAnisetteUrl
 
@@ -89,6 +101,50 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     fun saveAppleId(v: String)     { _savedAppleId.value = v; AppConfig.appleId = v }
     fun saveAnisetteUrl(v: String) { _savedAnisetteUrl.value = v; AppConfig.anisetteUrl = v }
     fun dismissTrust()             = NativeBridge.dismissTrust()
+
+    // ── v51: Đăng nhập / Đăng xuất Apple ID ───────────────────────────────────
+
+    /**
+     * Đăng nhập lần đầu (LoginScreen): XÁC THỰC với Apple qua Python
+     * (do_login — 2FA hiện dialog nếu Apple hỏi). Thành công → lưu thông tin
+     * và vào app chính.
+     */
+    fun signIn(appleId: String, password: String, onResult: (Boolean) -> Unit = {}) {
+        if (_busy.value) return
+        _busy.value = true
+        _busyText.value = "Đang đăng nhập Apple ID…"
+        viewModelScope.launch {
+            val outcome = PythonBridge.login(
+                appleId.trim(), password, _savedAnisetteUrl.value.ifBlank { null }
+            )
+            if (outcome.success) {
+                saveCredentials(appleId, password)
+            } else {
+                NativeLog.emit("❌ Đăng nhập không thành công — xem nhật ký phía dưới.")
+            }
+            _busy.value = false
+            _busyText.value = ""
+            onResult(outcome.success)
+        }
+    }
+
+    /** Lưu thông tin đăng nhập KHÔNG xác thực (dùng khi mạng/Anisette lỗi). */
+    fun saveCredentials(appleId: String, password: String) {
+        AppConfig.appleId = appleId.trim()
+        AppConfig.applePassword = password
+        _savedAppleId.value = appleId.trim()
+        _savedPassword.value = password
+        _signedIn.value = AppConfig.hasAppleAccount()
+    }
+
+    /** Đăng xuất (SettingsScreen) — lần vào app tiếp theo phải đăng nhập lại. */
+    fun signOut() {
+        AppConfig.clearAppleAccount()
+        _savedAppleId.value = ""
+        _savedPassword.value = ""
+        _signedIn.value = false
+        NativeLog.emit("[app] Đã đăng xuất Apple ID — cần đăng nhập lại để tiếp tục dùng app.")
+    }
 
     // ── USB vừa được cấp quyền và mở thành công ──────────────────────────────
     /** Gọi từ MainActivity / nút "Kết nối". connect() tự setUsbFd(). */

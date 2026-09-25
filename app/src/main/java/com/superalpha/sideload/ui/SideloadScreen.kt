@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -31,7 +32,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -41,7 +41,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.superalpha.sideload.bridge.NativeLog
@@ -89,16 +88,8 @@ fun SideloadScreen(viewModel: HomeViewModel) {
     var ipaPath by remember { mutableStateOf<String?>(null) }
     var ipaName by remember { mutableStateOf<String?>(null) }
     var ipaSizeMb by remember { mutableStateOf(0.0) }
-    var appleId by remember { mutableStateOf("") }
-    var appleIdPrefilled by remember { mutableStateOf(false) }
-    var password by remember { mutableStateOf("") }
-
-    LaunchedEffect(savedAppleId) {
-        if (!appleIdPrefilled && savedAppleId.isNotBlank()) {
-            if (appleId.isBlank()) appleId = savedAppleId
-            appleIdPrefilled = true
-        }
-    }
+    // v51: Apple ID + mật khẩu đã lưu từ màn đăng nhập — không nhập lại ở đây
+    val savedPassword by viewModel.savedPassword.collectAsState()
 
     val pickIpaLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -215,22 +206,39 @@ fun SideloadScreen(viewModel: HomeViewModel) {
 
         Spacer(Modifier.height(14.dp))
 
-        // ── Tài khoản Apple ────────────────────────────────────────────────
+        // ── Tài khoản Apple (đã lưu từ màn đăng nhập — v51) ─────────────────
         SectionCard(title = "Tài khoản Apple", icon = Icons.Filled.AccountCircle) {
-            AppTextField(
-                value = appleId,
-                onValueChange = { appleId = it },
-                label = "Apple ID (email)",
-                keyboardType = KeyboardType.Email
-            )
-            Spacer(Modifier.height(10.dp))
-            AppTextField(
-                value = password,
-                onValueChange = { password = it },
-                label = "Mật khẩu Apple ID",
-                password = true,
-                supportingText = "Chỉ dùng ngay trong phiên — app không lưu mật khẩu."
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(
+                            MaterialTheme.colorScheme.surfaceContainerHighest,
+                            RoundedCornerShape(19.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.AccountCircle,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        savedAppleId.ifBlank { "—" },
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "Đã lưu trên máy — đổi tài khoản trong tab Cài đặt",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = BrandTextDim
+                    )
+                }
+                StatusDot(BrandAccent)
+            }
         }
 
         Spacer(Modifier.height(16.dp))
@@ -244,7 +252,7 @@ fun SideloadScreen(viewModel: HomeViewModel) {
                 scope.launch {
                     NativeLog.log("Bắt đầu quá trình ký & cài đặt...")
                     val outcome = PythonBridge.sideload(
-                        path, appleId, password, null,
+                        path, savedAppleId, savedPassword, null,
                         savedAnisetteUrl.ifBlank { null }
                     )
                     if (!outcome.success && outcome.message.isNotBlank()) {
@@ -255,9 +263,7 @@ fun SideloadScreen(viewModel: HomeViewModel) {
             },
             enabled = !busy
                 && status.usbConnected
-                && ipaPath != null
-                && appleId.isNotBlank()
-                && password.isNotBlank(),
+                && ipaPath != null,
             busy = busy,
             busyText = busyText.ifBlank { "Đang xử lý…" }
         )

@@ -141,6 +141,34 @@ object PythonBridge {
     }
 
     /**
+     * v51: Xác thực Apple ID cho màn đăng nhập lần đầu.
+     * Gọi sideload_core.do_login() — đăng nhập SRP đầy đủ (2FA nếu Apple hỏi
+     * sẽ hiện qua UiPrompt dialog), lấy Development Team để chắc chắn tài
+     * khoản thực sự dùng được.
+     */
+    suspend fun login(
+        appleId: String,
+        password: String,
+        anisetteUrl: String?
+    ): Outcome = withContext(Dispatchers.IO) {
+        try {
+            NativeLog.emit("[python] Đang xác thực Apple ID...")
+            val core = pythonModule("sideload_core")
+            val effectiveAnisetteUrl = anisetteUrl?.takeIf { it.isNotBlank() } ?: ""
+            val ok = core.callAttr(
+                "do_login",
+                appleId,
+                password,
+                effectiveAnisetteUrl
+            ).toBoolean()
+            Outcome(ok, if (ok) "Đăng nhập Apple ID thành công." else "Đăng nhập thất bại — xem nhật ký.")
+        } catch (e: Exception) {
+            emitException("[python] ❌ login lỗi:", e)
+            Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
+        }
+    }
+
+    /**
      * Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python.
      */
     suspend fun listAnisetteServers(): List<AnisetteServer> = withContext(Dispatchers.IO) {

@@ -10,10 +10,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -39,7 +40,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.superalpha.sideload.bridge.AppPaths
@@ -59,18 +59,10 @@ import com.superalpha.sideload.ui.theme.screenBackgroundBrush
 fun SettingsScreen(viewModel: HomeViewModel) {
     val context = LocalContext.current
     val savedAppleId by viewModel.savedAppleId.collectAsState()
+    val busy by viewModel.busy.collectAsState()
     val savedAnisetteUrl by viewModel.savedAnisetteUrl.collectAsState()
     val servers by viewModel.anisetteServers.collectAsState()
     val serversLoading by viewModel.anisetteServersLoading.collectAsState()
-
-    var appleIdField by remember { mutableStateOf("") }
-    var appleIdInitialized by remember { mutableStateOf(false) }
-    LaunchedEffect(savedAppleId) {
-        if (!appleIdInitialized) {
-            appleIdField = savedAppleId
-            appleIdInitialized = true
-        }
-    }
 
     var menuExpanded by remember { mutableStateOf(false) }
     var showCustomField by remember { mutableStateOf(false) }
@@ -103,27 +95,73 @@ fun SettingsScreen(viewModel: HomeViewModel) {
 
         Spacer(Modifier.height(14.dp))
 
-        // ── Apple ID ────────────────────────────────────────────────────────
-        SectionCard(title = "Apple ID", icon = Icons.Filled.AccountCircle) {
-            AppTextField(
-                value = appleIdField,
-                onValueChange = { appleIdField = it },
-                label = "Apple ID (email)",
-                keyboardType = KeyboardType.Email
-            )
-            Spacer(Modifier.height(10.dp))
+        // ── Tài khoản Apple (v51: đã lưu từ màn đăng nhập, Đăng xuất ở đây) ──
+        var confirmSignOut by remember { mutableStateOf(false) }
+
+        SectionCard(title = "Tài khoản Apple", icon = Icons.Filled.AccountCircle) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(
+                            MaterialTheme.colorScheme.surfaceContainerHighest,
+                            RoundedCornerShape(19.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.AccountCircle,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        savedAppleId.ifBlank { "Chưa đăng nhập" },
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "Apple ID + mật khẩu đã lưu riêng tư trên máy — mọi lần ký & cài " +
+                            "đặt dùng luôn, không cần nhập lại.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = BrandTextDim
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
             OutlinedButton(
-                onClick = { viewModel.saveAppleId(appleIdField.trim()) },
+                onClick = { confirmSignOut = true },
+                enabled = !busy,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp)
-            ) { Text("Lưu Apple ID") }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                "Chỉ Apple ID (email) được lưu để tự điền ở màn Cài IPA / Thu hồi chứng chỉ. " +
-                    "Mật khẩu KHÔNG được lưu — bạn nhập mỗi lần đăng nhập.",
-                style = MaterialTheme.typography.bodySmall,
-                color = BrandTextDim
-            )
+            ) {
+                Text("Đăng xuất Apple ID", color = MaterialTheme.colorScheme.error)
+            }
+
+            if (confirmSignOut) {
+                AlertDialog(
+                    onDismissRequest = { confirmSignOut = false },
+                    title = { Text("Đăng xuất Apple ID?") },
+                    text = {
+                        Text(
+                            "App sẽ xoá Apple ID và mật khẩu đã lưu trên máy. Lần mở app " +
+                                "tiếp theo bạn cần đăng nhập lại mới vào được app chính.\n\n" +
+                                "Ghép nối với iPhone và cài đặt đã có trên máy được giữ nguyên."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            confirmSignOut = false
+                            viewModel.signOut()
+                        }) { Text("Đăng xuất", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmSignOut = false }) { Text("Huỷ") }
+                    }
+                )
+            }
         }
 
         Spacer(Modifier.height(14.dp))

@@ -523,6 +523,71 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# v51: Tự động thu hồi certificate khi tài khoản bị Apple chặn tạo cert mới
+# vì đã đủ giới hạn (tài khoản miễn phí: tối đa 2 certificate iOS Development
+# cùng lúc). Yêu cầu người dùng 2026-09-25: "tự động thu hồi cert nếu bị lỗi
+# limit không tạo được cert".
+#
+# Chiến lược (an toàn theo docstring revoke_certificate trong developer_api.py):
+#   1. CHỈ kích hoạt khi tạo cert thất bại VÀ tài khoản đang có ≥ 2 cert
+#      (đúng điều kiện giới hạn) — tránh thu hồi vô ích khi lỗi là mạng.
+#   2. Ưu tiên thu hồi certificate do CHÍNH TOOL NÀY tạo (machine name bắt đầu
+#      bằng 'ios-sideload-tool' / 'sideload-') — không đụng cert của Xcode
+#      nếu có thể (Xcode sẽ mất quyền ký tới khi đăng nhập lại).
+#   3. Nếu không có cert nào của tool → thu hồi TẤT CẢ (người dùng đang
+#      sideload trên Android, cert trên tài khoản gần như chắc chắn cũng do
+#      tool sideload tạo và luôn tạo lại được khi cần).
+#   4. Chờ 3 giây sau khi thu hồi ("chờ ~2-3 giây trước khi tạo cert mới để
+#      Apple xử lý xong") — caller chịu trách nhiệm thử tạo lại MỘT lần.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_TOOL_CERT_PREFIXES = ("ios-sideload-tool", "sideload-")
+
+
+def _auto_revoke_certs_for_limit(dev_api, state) -> int:
+    """Thu hồi certificate để giải phóng chỗ khi bị Apple chặn tạo cert mới.
+
+    Trả về số certificate đã thu hồi thành công (0 = không thu hồi gì,
+    caller đừng thử tạo lại)."""
+    certs = dev_api.list_certificates()
+    if len(certs) < 2:
+        # Giới hạn là 2 cert — chưa có 2 cert thì lỗi tạo cert không phải do
+        # limit (mạng/session/...), thu hồi cũng không giúp gì.
+        if getattr(dev_api, "last_error", None):
+            print(f"[cert] Lỗi tạo certificate: {dev_api.last_error}")
+        print("[cert] Tài khoản chưa có 2 certificate — lỗi tạo cert không phải do giới hạn.")
+        return 0
+
+    tool_certs = [
+        c for c in certs
+        if str(c.get("attributes", {}).get("name", "") or "").lower().startswith(_TOOL_CERT_PREFIXES)
+    ]
+    if tool_certs:
+        targets = tool_certs
+        print(f"[cert] ⚠️  Tài khoản đã đủ giới hạn 2 certificate — tự động thu hồi "
+              f"{len(tool_certs)} certificate do tool này tạo...")
+    else:
+        targets = certs
+        print(f"[cert] ⚠️  Tài khoản đã đủ giới hạn 2 certificate, không có cert nào của tool — "
+              f"thu hồi tất cả {len(certs)} certificate (tool sẽ tự tạo cert mới khi ký)...")
+
+    revoked = 0
+    for cert in targets:
+        cert_id = cert.get("id")
+        name = cert.get("attributes", {}).get("name", "?")
+        ok = dev_api.revoke_certificate(cert_id)
+        print(f"[cert]   → {'✅ Đã thu hồi' if ok else '❌ Thu hồi thất bại'}: {name} (id={cert_id})")
+        if ok:
+            revoked += 1
+            if state.get("certificate_id") and str(state.get("certificate_id")) == str(cert_id):
+                _clear_cert_from_state(state)
+    if revoked:
+        print(f"[cert] Đã giải phóng {revoked}/{len(targets)} chỗ — chờ 3 giây cho Apple xử lý...")
+        time.sleep(3)
+    return revoked
+
+
 def do_sideload(
     ipa_path: str,
     apple_id: str,
@@ -599,6 +664,12 @@ def do_sideload(
         if not reuse:
             print("Đang tạo certificate mới...")
             cert_data = dev_api.create_certificate()
+            if not cert_data:
+                # v51: khả năng cao tài khoản đã đủ giới hạn 2 certificate —
+                # tự động thu hồi cert cũ rồi thử lại MỘT lần.
+                if _auto_revoke_certs_for_limit(dev_api, state) > 0:
+                    print("Thử tạo certificate lại sau khi thu hồi...")
+                    cert_data = dev_api.create_certificate()
             if not cert_data:
                 print("❌ Không tạo được certificate. Nếu tài khoản đã đủ số certificate, vào mục"
                       " \"Thu hồi chứng chỉ\" để revoke cái cũ rồi chạy lại.")
@@ -813,6 +884,25 @@ def do_revoke_certs(
     except Exception as e:
         import traceback
         print(f"❌ Lỗi trong do_revoke_certs: {e}")
+        traceback.print_exc()
+        return False
+
+
+def do_login(apple_id: str, password: str, anisette_url: str = "") -> bool:
+    """v51: Xác thực Apple ID cho màn đăng nhập lần đầu của app.
+
+    Trả True khi đăng nhập SRP thành công VÀ lấy được Development Team
+    (tức là tài khoản thực sự dùng được). Nếu Apple hỏi 2FA, mã được nhập
+    qua UiPrompt dialog như mọi luồng khác."""
+    try:
+        _auth, dev_api, _team = _login(apple_id, password, anisette_url)
+        if dev_api is None:
+            return False
+        print("✅ Tài khoản Apple ID sẵn sàng dùng.")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"❌ Lỗi đăng nhập: {e}")
         traceback.print_exc()
         return False
 

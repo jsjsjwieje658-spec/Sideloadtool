@@ -156,3 +156,27 @@ Nếu vẫn lỗi, gửi các dòng `[usb]`, `[usbmux]`, `[lockdown]`/`[pair]`, 
 | 25 | **Bước 5/5 thất bại ngay byte đầu**: `afc_file_write` trả `AFC_E_MUX_ERROR (30)`. Nguyên nhân: `AFC_CHUNK` cũ = **1 MB** một lần gọi. libusbmuxd 2.0.2 để socket O_NONBLOCK và `usbmuxd_send()` chỉ làm MỘT syscall `send()` không loop — gói 1 MB bị ghi **đền gói ~200 KB** (buffer socket unix); iPhone nhận gói AFC cụt theo `entire_length` → chờ mãn phần còn lại → không reply → `afc_receive_data()` timeout → lỗi 30. Lỗi có từ v49 (lần đầu test cài thật trên máy — các lần trước chỉ tới connect/pair/UDID với gói nhỏ). | `AFC_CHUNK` = **32 KB**. Mỗi `afc_file_write()` đã chờ reply của chính nó (libimobiledevice 1.3.0) nên socket luôn drain sạch giữa 2 lần ghi — 32 KB vừa buffer mọi máy, 26 MB ≈ 850 vòng ≈ 2–4 s. Tầng usbmuxd/USB giữ nguyên (`usb_bridge_bulk_write` vốn loop + ZLP). |
 
 *2026-09-25 (v50.1)*
+
+
+---
+
+# SideloadTool Patch v51 — Tự thu hồi cert khi hết chỗ + đăng nhập Apple ID lần đầu
+
+*2026-09-25*
+
+## 12. Thay đổi
+
+| # | Vấn đề | Sửa |
+|---|---|---|
+| 26 | Khi tài khoản Apple ID đã đủ **2 certificate Development** (giới hạn miễn phí), Bước 2/5 của luồng sideload fail: `❌ Không tạo được certificate...` — người dùng phải vào tab "Thu hồi chứng chỉ" revoke tay rồi chạy lại từ đầu. | **Tự động thu hồi**: khi tạo cert thất bại VÀ tài khoản đang có ≥ 2 cert → tự revoke (ưu tiên cert do tool tạo — machine name `ios-sideload-tool*`; nếu không có cert nào của tool thì revoke tất cả), chờ 3 s cho Apple xử lý, rồi **tạo lại MỘT lần**. Không đủ 2 cert thì không revoke gì (lỗi là do mạng/session). |
+| 27 | Mỗi lần ký IPA / thu hồi cert đều phải gõ lại Apple ID + mật khẩu; không có khái niệm "tài khoản" trong app. | **Cổng đăng nhập**: lần đầu mở app (hoặc sau khi Đăng xuất) hiện màn `LoginScreen` — nhập Apple ID + mật khẩu MỘT LẦN, app xác thực với Apple (`do_login`, 2FA hiện dialog nếu cần) rồi lưu riêng tư trên máy (`allowBackup=false` — không bao giờ rời thiết bị). Các màn Cài IPA / Thu hồi cert dùng luôn thông tin đã lưu (hiện tên tài khoản, không còn ô nhập). **Tab Cài đặt** thêm nút **"Đăng xuất Apple ID"** (có hộp thoại xác nhận) — sau khi đăng xuất, lần mở app tiếp theo phải đăng nhập lại. Có nút "Lưu mà không xác thực" cho trường hợp mạng/Anisette chập chờn. |
+
+## 13. Ghi chú
+
+1. Mật khẩu Apple ID được lưu **plaintext trong storage riêng tư của app** (người dùng
+   yêu cầu tường minh). Không root thì không app nào đọc được; `allowBackup=false` nên
+   không vào backup cloud. Muốn xoá: Đăng xuất trong Cài đặt (hoặc gỡ app).
+2. Đăng xuất KHÔNG xoá pair record iPhone (ghi trong `filesDir/lockdown/`) — cắm lại
+   không phải bấm Tin cậy lại.
+3. Nâng cấp từ v50/v50.1: cài đè trực tiếp (cùng chữ ký); lần đầu mở v51 sẽ hiện màn
+   đăng nhập (v50 chưa lưu mật khẩu).

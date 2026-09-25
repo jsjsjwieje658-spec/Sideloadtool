@@ -23,8 +23,8 @@ android {
         applicationId = "com.superalpha.sideload"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.3.0-v50"
+        versionCode = 8
+        versionName = "1.4.0-v51"
 
         // FIX: Thêm x86_64 cho emulator và arm64-v8a cho thiết bị thật
         ndk {

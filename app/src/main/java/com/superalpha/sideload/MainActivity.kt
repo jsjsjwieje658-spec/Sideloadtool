@@ -9,11 +9,14 @@ import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import com.superalpha.sideload.bridge.AppPaths
 import com.superalpha.sideload.bridge.NativeLog
 import com.superalpha.sideload.bridge.UsbPermissionManager
 import com.superalpha.sideload.ui.AppNavHost
+import com.superalpha.sideload.ui.LoginScreen
 import com.superalpha.sideload.ui.HomeViewModel
 import com.superalpha.sideload.ui.PromptDialogHost
 import com.superalpha.sideload.ui.theme.SuperAlphaTheme
@@ -47,7 +50,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             SuperAlphaTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppNavHost(viewModel = viewModel)
+                    /*
+                     * v51: Cổng đăng nhập — chưa có Apple ID + mật khẩu đã lưu
+                     * (lần đầu cài app, hoặc sau khi Đăng xuất) thì hiện
+                     * LoginScreen thay vì app chính. PromptDialogHost vẫn nằm
+                     * trên cùng → hộp thoại 2FA hoạt động cả trong màn đăng nhập.
+                     */
+                    val signedIn by viewModel.signedIn.collectAsState()
+                    if (signedIn) {
+                        AppNavHost(viewModel = viewModel)
+                    } else {
+                        LoginScreen(viewModel = viewModel)
+                    }
                     PromptDialogHost()
                 }
             }

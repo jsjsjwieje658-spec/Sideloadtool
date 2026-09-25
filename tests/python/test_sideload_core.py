@@ -192,10 +192,24 @@ class FakeDevAPI:
         self.devices.append(d)
         return d
 
+    # v51: hỗ trợ test tự động thu hồi cert khi hết chỗ
+    certs = []            # các certificate đang có trên "tài khoản"
+    cert_fail_first = False   # create_certificate() thất bại 1 lần đầu rồi OK
+    revoked = []           # các id đã revoke
+
     def list_certificates(self):
-        return []
+        return list(self.certs)
+
+    def revoke_certificate(self, certificate_id):
+        self.revoked.append(certificate_id)
+        self.certs = [c for c in self.certs if c.get("id") != certificate_id]
+        return True
 
     def create_certificate(self):
+        if self.cert_fail_first:
+            self.cert_fail_first = False
+            self.last_error = {"resultCode": -1, "userString": "403 Forbidden (limit)"}
+            return None
         return {"certificateId": "CERT1", "certContent": b"\x30\x82\x01\x00fake-der",
                 "_private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMII\n-----END RSA PRIVATE KEY-----\n"}
 
@@ -352,6 +366,40 @@ DeviceNative.connect_ok = False
 ok = core.do_sideload(ipa, "user@example.com", "pw")
 DeviceNative.connect_ok = True
 check(ok is False and not FakeDevAPI.instances, "dừng trước khi đăng nhập Apple / tạo App ID")
+
+print("=== CASE G: hết chỗ certificate → tự động thu hồi cert của tool rồi tạo lại ===")
+reset_run()
+FakeDevAPI.cert_fail_first = True
+FakeDevAPI.certs = [
+    {"id": "C-TOOL", "attributes": {"name": "ios-sideload-tool", "status": "ACTIVE"}},
+    {"id": "C-XCODE", "attributes": {"name": "Xcode: Macbook", "status": "ACTIVE"}},
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "do_sideload vẫn thành công sau khi tự thu hồi cert")
+check(FakeDevAPI.revoked == ["C-TOOL"], f"chỉ thu hồi cert của tool: {FakeDevAPI.revoked}")
+FakeDevAPI.cert_fail_first = False
+FakeDevAPI.certs = []
+FakeDevAPI.revoked = []
+
+print("=== CASE H: tạo cert lỗi nhưng KHÔNG đủ 2 cert → không thu hồi gì ===")
+reset_run()
+FakeDevAPI.cert_fail_first = True   # fail lần đầu, không có cert nào để thu hồi
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is False, "do_sideload báo thất bại")
+check(FakeDevAPI.revoked == [], f"không thu hồi cert nào: {FakeDevAPI.revoked}")
+FakeDevAPI.cert_fail_first = False
+
+print("=== CASE I: do_login (màn đăng nhập lần đầu) ===")
+check(core.do_login("user@example.com", "pw") is True, "do_login thành công với tài khoản hợp lệ")
+FakeAppleAuth.result = {"authenticated": False}
+check(core.do_login("user@example.com", "sai-mat-khau") is False, "do_login thất bại khi Apple từ chối")
+FakeAppleAuth.result = {"authenticated": True, "dsid": "123", "session_token": "tok"}
+try:
+    core.do_login("user@example.com", "pw")
+    no_crash = True
+except Exception:
+    no_crash = False
+check(no_crash, "do_login không crash với tài khoản lỗi đột xuất")
 
 print("=== CASE F: UDID ===")
 check(core._normalize_udid("00008030001A35E80C41802E") == UDID, "UDID 24 ký tự được chèn '-'")
