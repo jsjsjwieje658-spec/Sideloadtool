@@ -43,8 +43,14 @@ object LogBuffer {
         val lastIndex: Long get() = nextIndex - 1
     }
 
-    private const val MAX_LINES = 2000
-    private const val FLUSH_INTERVAL_MS = 100L
+    /*
+     * v53: 2000→1000 dòng, 100ms→250ms. Snapshot là bản copy list nguyên vẹn
+     * mỗi lần xả — 10 lần/giây × 2000 phần tử tạo rác đáng kể → GC pause
+     * ~0.1s ngẫu nhiên ("freeze nhấp nháy") trên máy RAM yếu. 1000 dòng vẫn
+     * dư cho toàn bộ một phiên sideload; 4 lần/giây vẫn mượt mắt khi đọc log.
+     */
+    private const val MAX_LINES = 1000
+    private const val FLUSH_INTERVAL_MS = 250L
 
     private val lock = Any()
     private val pending = ArrayDeque<String>()

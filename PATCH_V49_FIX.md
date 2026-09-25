@@ -198,3 +198,23 @@ Nếu vẫn lỗi, gửi các dòng `[usb]`, `[usbmux]`, `[lockdown]`/`[pair]`, 
 *Ghi chú: nếu bạn vẫn thấy "hơi lag khi dùng" — kiểm tra lại đang cài artifact
 `superalpha-sideload-release` (R8) chứ không phải `-debug`; bản debug của
 Compose chậm hơn rõ rệt.*
+
+
+---
+
+# SideloadTool Patch v53 — Diệt nốt giật khung hình khi đang dùng app
+
+*2026-09-25*
+
+## 15. Thay đổi
+
+| # | Vấn đề | Sửa |
+|---|---|---|
+| 30 | **"Dật dật" đều đặn từng giây khi dùng app**: DeviceStatus poll tạo `Snapshot` MỚI mỗi giây (tham chiếu mới → StateFlow phát → TOÀN BỘ màn chính recompose 1 lần/giây) dù không có gì thay đổi. | Chỉ phát snapshot khi **giá trị thật sự đổi** (data-class equals). Idle = **0 recompose/giây** (trước: 1/giây). Poll vẫn 1 giây/lần trên thread nền. |
+| 31 | **Giật bền bỉ trong lúc app bận (đang ký/đang cài)**: `CircularProgressIndicator` trong nút hành động là animation **vô hạn chạy 60 fps** suốt 1–2 phút ký app — nguồn đói frame lớn nhất trên máy yếu. | Thay bằng icon đồng hồ cát **static** + chữ trạng thái (busyText) — cùng thông tin, 0 frame tiêu tốn. Bỏ nốt spinner "Đang tải danh sách server" ở Cài đặt (thay bằng text). |
+| 32 | **Freeze ~0.1 s ngẫu nhiên (đặc biệt khi log chạy dồn dập)**: LogBuffer xả snapshot 10 lần/giây, mỗi lần copy list 2000 phần tử → rác GC lớn → GC pause đúng kiểu "đứng hình nhấp nháy". | Xả **4 lần/giây** (250 ms) + ring buffer **1000 dòng** (vẫn dư cho cả một phiên sideload) — lượng rác giảm ~80%. |
+| 33 | Brush gradient (nền màn, banner, nút) tạo **đối tượng mới mỗi lần recomposition** → rác + modifier bị coi là đổi. | Brush là bất biến → tạo **một lần** ở top-level, các hàm trả lại instance chung. |
+
+*Đã kiểm chứng tầng native không phải nguồn giật: thread đọc USB dùng blocking read
+timeout 500 ms (không busy-spin), core thread dùng `poll()`, các JNI getter đọc thẳng
+biến toàn cục không mutex.*

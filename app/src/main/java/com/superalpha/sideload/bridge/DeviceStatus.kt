@@ -53,7 +53,7 @@ object DeviceStatus {
         scope!!.launch {
             while (isActive) {
                 val bridge = try { DeviceNative.getBridge() } catch (_: Exception) { null }
-                _snapshot.value = Snapshot(
+                val next = Snapshot(
                     usbConnected = UsbTransport.isConnected(),
                     nativeState = if (bridge != null) {
                         try { bridge.connectionState() } catch (_: Exception) { 0 }
@@ -63,6 +63,14 @@ object DeviceStatus {
                     } else false,
                     udid = AppConfig.lastUdid,
                 )
+                /*
+                 * v53: CHỈ phát khi giá trị thật sự đổi. Trước đây mỗi giây
+                 * tạo Snapshot mới (tham chiếu mới) → StateFlow phát → toàn
+                 * bộ màn chính recompose 1 lần/giây ngay cả khi chẳng có gì
+                 * thay đổi — đúng nhịp "dật dật" từng giây khi dùng app.
+                 * Data class equals so sánh theo giá trị → idle = 0 recompose.
+                 */
+                if (next != _snapshot.value) _snapshot.value = next
                 delay(1_000)
             }
         }

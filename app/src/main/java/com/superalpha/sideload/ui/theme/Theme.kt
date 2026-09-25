@@ -95,16 +95,24 @@ private val AppShapes = Shapes(
 /** Giữ lại cho tương thích (LogConsole cũ dùng); phiên bản mới dùng kiểu nội bộ riêng. */
 val MonoTextStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
 
-/* ── Brush dùng chung (chỉ là draw, không tạo recomposition) ─────────────── */
-
-fun screenBackgroundBrush(): Brush =
+/* ── Brush dùng chung ────────────────────────────────────────────────────────
+ * v53: mỗi lần gọi hàm cũ tạo MỘT ĐỐI TƯỢNG Brush mới → rác + modifier bị
+ * coi là đổi ở mỗi recomposition. Brush là đối tượng bất biến, an toàn dùng
+ * chung toàn app → tạo MỘT LẦN ở top-level, hàm chỉ trả lại instance đó.
+ */
+private val ScreenBgBrush by lazy {
     Brush.verticalGradient(listOf(Color(0xFF101823), BrandBackground))
-
-fun heroBrush(): Brush =
+}
+private val HeroBrush by lazy {
     Brush.horizontalGradient(listOf(Color(0xFF1B2C3D), Color(0xFF121A23)))
-
-fun primaryButtonBrush(): Brush =
+}
+private val PrimaryBtnBrush by lazy {
     Brush.horizontalGradient(listOf(BrandPrimary, BrandPrimaryDeep))
+}
+
+fun screenBackgroundBrush(): Brush = ScreenBgBrush
+fun heroBrush(): Brush = HeroBrush
+fun primaryButtonBrush(): Brush = PrimaryBtnBrush
 
 @Composable
 fun SuperAlphaTheme(content: @Composable () -> Unit) {

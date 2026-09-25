@@ -20,7 +20,6 @@ import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -238,10 +237,8 @@ fun SettingsScreen(viewModel: HomeViewModel) {
                 )
                 if (serversLoading) {
                     Spacer(Modifier.width(8.dp))
-                    CircularProgressIndicator(
-                        modifier = Modifier.height(16.dp).width(16.dp),
-                        strokeWidth = 2.dp
-                    )
+                    // v53: text tĩnh thay spinner — không animation nền
+                    Text("Đang tải…", style = MaterialTheme.typography.labelMedium, color = BrandTextDim)
                 } else {
                     TextButton(
                         onClick = { viewModel.reloadAnisetteServers() },

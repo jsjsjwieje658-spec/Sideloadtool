@@ -20,7 +20,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -201,10 +202,18 @@ fun PrimaryButton(
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (busy) {
-            CircularProgressIndicator(
+            /*
+             * v53: KHÔNG dùng CircularProgressIndicator ở đây — spinner vô hạn
+             * là animation chạy LIÊN TỤC mỗi frame trong suốt quá trình ký
+             * (1-2 phút) → trên máy yếu nó chính là nguồn giật khung hình
+             * bền bỉ nhất. Icon đồng hồ cát static + busyText cho cùng thông
+             * tin mà không tốn một frame nào.
+             */
+            Icon(
+                Icons.Filled.HourglassTop,
+                contentDescription = null,
                 modifier = Modifier.size(18.dp),
-                strokeWidth = 2.dp,
-                color = MaterialTheme.colorScheme.onPrimary
+                tint = MaterialTheme.colorScheme.onPrimary
             )
             Spacer(Modifier.width(10.dp))
         }
