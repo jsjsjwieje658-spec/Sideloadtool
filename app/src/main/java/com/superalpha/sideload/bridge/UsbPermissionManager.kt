@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicLong
  * FIX v21 (Bug 3 — callback không trả UsbDevice về caller):
  *
  * Trước đây: callback onResult là (Boolean, String) → Unit.
- * Caller (MainActivity, PairingScreen) không nhận được UsbDevice sau khi
+ * Caller (MainActivity, các màn UI) không nhận được UsbDevice sau khi
  * quyền được cấp → không thể gọi viewModel.onUsbDeviceGranted(device, mgr)
  * → setUsbFd() không bao giờ được gọi → nativeConnect() luôn thất bại.
  *

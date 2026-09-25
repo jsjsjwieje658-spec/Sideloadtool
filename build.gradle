@@ -1,4 +1,10 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
+//
+// QUAN TRỌNG: khi build.gradle (Groovy) và build.gradle.kts cùng tồn tại trong
+// một thư mục, Gradle DÙNG BẢN GROOVY và bỏ qua .kts một cách im lặng. Hai file
+// build.gradle.kts / settings.gradle.kts (khai báo AGP 8.6.1 + Chaquopy 17 —
+// không hề được dùng) đã bị xoá để tránh nhầm lẫn. File này + settings.gradle
+// là cấu hình thật: AGP 8.5.2 · Kotlin 1.9.24 · Chaquopy 16.0.0.
 plugins {
     id 'com.android.application'        version '8.5.2' apply false
     id 'com.android.library'            version '8.5.2' apply false

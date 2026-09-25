@@ -53,18 +53,8 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
-        <!-- Cần cho tab "Ghép nối": chia sẻ/lưu file pairing .plist (nằm dưới
-             app-private storage) ra ngoài qua Intent.ACTION_SEND, vì Android
-             10+ chặn truy cập trực tiếp file:// URI từ app khác. -->
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
+        <!-- v50: đã xoá FileProvider — nó chỉ tồn tại để tab "Ghép nối" (đã
+             bỏ) chia sẻ file pairing .plist ra ngoài. Không còn caller nào. -->
 
     </application>
 </manifest>

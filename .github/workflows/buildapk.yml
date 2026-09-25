@@ -154,10 +154,37 @@ jobs:
       # Phase 3: Build Gradle APK (CMake links source-built dependencies)
       # ══════════════════════════════════════════════════════════════════════
 
-      - name: "🏗️  Build Debug APK"
+      - name: "🔐 Chuẩn bị keystore ký release (nếu có secret)"
+        id: signing
         run: |
-          echo "🚀 Building APK from upstream source-built libraries..."
-          gradle :app:assembleDebug --stacktrace
+          # v50: decode keystore từ GitHub Secrets để bản release có chữ ký
+          # ỔN ĐỊNH giữa các lần build → cài đè không phải gỡ app. Thiếu
+          # secret → bỏ qua, gradle tự fallback về debug keystore.
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.RELEASE_KEYSTORE_B64 }}" | base64 -d > /tmp/release-upload.keystore
+            if keytool -list -keystore /tmp/release-upload.keystore \
+                 -storepass "${{ secrets.RELEASE_KEYSTORE_STORE_PASSWORD }}" >/dev/null 2>&1; then
+              echo "file=/tmp/release-upload.keystore" >> "$GITHUB_OUTPUT"
+              echo "✅ Release keystore hợp lệ"
+            else
+              echo "⚠️ Keystore/Password không hợp lệ — fallback debug signing"
+            fi
+          else
+            echo "⚠️ Chưa cấu hình RELEASE_KEYSTORE_* secrets — fallback debug signing"
+          fi
+
+      - name: "🏗️  Build APK (debug + release)"
+        env:
+          RELEASE_KEYSTORE_FILE: ${{ steps.signing.outputs.file }}
+          RELEASE_KEYSTORE_STORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_STORE_PASSWORD }}
+          RELEASE_KEYSTORE_ALIAS: ${{ secrets.RELEASE_KEYSTORE_ALIAS }}
+          RELEASE_KEYSTORE_KEY_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_KEY_PASSWORD }}
+        run: |
+          echo "🚀 Building APKs from upstream source-built libraries..."
+          # v50: build thêm bản RELEASE (R8 minify) — Compose release nhanh hơn
+          # rõ rệt so với debug và APK nhỏ hơn nhiều. Bản debug vẫn được build
+          # làm fallback (nếu R8/R8-keep-rule có vấn đề gì đó).
+          gradle :app:assembleDebug :app:assembleRelease --stacktrace
 
       # ══════════════════════════════════════════════════════════════════════
       # Phase 4: Verify APK
@@ -165,35 +192,46 @@ jobs:
 
       - name: "📋 Verify APK contents"
         run: |
-          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
-          
-          if [ ! -f "$APK" ]; then
-            echo "❌ APK not found!"
-            exit 1
-          fi
-          
-          echo "=== APK Information ==="
-          echo "📦 File: $(basename "$APK")"
-          echo "💾 Size: $(du -h "$APK" | cut -f1)"
-          echo "🔐 SHA256: $(sha256sum "$APK" | cut -d' ' -f1)"
-          
+          set -e
+          for VARIANT in debug release; do
+            APK=$(find "app/build/outputs/apk/$VARIANT" -name "*.apk" | head -1)
+
+            if [ ! -f "$APK" ]; then
+              echo "❌ $VARIANT APK not found!"
+              exit 1
+            fi
+
+            echo "=== $VARIANT APK Information ==="
+            echo "📦 File: $(basename "$APK")"
+            echo "💾 Size: $(du -h "$APK" | cut -f1)"
+            echo "🔐 SHA256: $(sha256sum "$APK" | cut -d' ' -f1)"
+
+            echo ""
+            if unzip -l "$APK" | grep -q "lib/arm64-v8a/libsideloadnative.so"; then
+              echo "✅ [$VARIANT] libsideloadnative.so linked successfully"
+            else
+              echo "❌ [$VARIANT] libsideloadnative.so NOT found!"
+              exit 1
+            fi
+          done
+
           echo ""
-          echo "=== Native Libraries in APK ==="
-          unzip -l "$APK" | grep "\.so$" | awk '{print $NF}'
-          
-          echo ""
-          if unzip -l "$APK" | grep -q "lib/arm64-v8a/libsideloadnative.so"; then
-            echo "✅ libsideloadnative.so linked successfully"
-          else
-            echo "❌ libsideloadnative.so NOT found!"
-            exit 1
-          fi
+          echo "=== Native Libraries in release APK ==="
+          unzip -l app/build/outputs/apk/release/*.apk | grep "\.so$" | awk '{print $NF}'
 
       # ══════════════════════════════════════════════════════════════════════
-      # Phase 5: Upload ONLY final APK
+      # Phase 5: Upload final APKs
       # ══════════════════════════════════════════════════════════════════════
 
-      - name: "⬆️  Upload APK"
+      - name: "⬆️  Upload APK (release — khuyến nghị)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: superalpha-sideload-release
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: "⬆️  Upload APK (debug — dự phòng)"
         uses: actions/upload-artifact@v4
         with:
           name: superalpha-sideload-debug
@@ -203,15 +241,14 @@ jobs:
 
       - name: "✅ Build completed"
         run: |
-          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
           echo ""
           echo "╔════════════════════════════════════════════════════╗"
           echo "║       ✅ BUILD COMPLETED SUCCESSFULLY ✅           ║"
           echo "╚════════════════════════════════════════════════════╝"
           echo ""
-          echo "📦 APK ready: $(basename "$APK")"
-          echo "💾 Size: $(du -h "$APK" | cut -f1)"
+          echo "📦 APK ready:"
+          echo "   release: $(du -h app/build/outputs/apk/release/app-release.apk | cut -f1) (khuyến nghị — mượt hơn)"
+          echo "   debug:   $(du -h app/build/outputs/apk/debug/app-debug.apk | cut -f1) (dự phòng)"
           echo ""
           echo "🚀 Install on Android:"
-          echo "   adb install $(basename "$APK")"
-          echo ""
+          echo "   adb install app-release.apk"

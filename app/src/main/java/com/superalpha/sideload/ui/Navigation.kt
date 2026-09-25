@@ -12,13 +12,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.Fingerprint
-import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PhoneIphone
+import androidx.compose.material.icons.filled.RocketLaunch
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -33,6 +32,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -42,35 +42,33 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.superalpha.sideload.bridge.NativeBridge
 
-private sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    object Sideload : Screen("sideload", "Cài IPA", Icons.Filled.CloudUpload)
-    object Pairing : Screen("pairing", "Ghép nối", Icons.Filled.Link)
-    object RegisterDevice : Screen("register_device", "Đăng ký UDID", Icons.Filled.Fingerprint)
-    object Revoke : Screen("revoke", "Thu hồi cert", Icons.Filled.PhoneAndroid)
+/*
+ * ════════════════════════════════════════════════════════════════════════
+ *  v50 — Navigation (thiết kế lại).
+ *
+ *  BỎ 2 tab theo yêu cầu: "Ghép nối" và "Đăng ký UDID". Cả hai việc đó
+ *  đều diễn ra NGẦM trong luồng "Cài IPA" (do_sideload Bước 0/5: connect →
+ *  pair → đăng ký UDID), còn trạng thái tương ứng hiển thị ngay trên thẻ
+ *  iPhone ở màn chính (DeviceCard).
+ *
+ *  Còn 3 tab: Cài IPA · Thu hồi cert · Cài đặt.
+ *
+ *  Giữ các fix cũ: banner Trust toàn cục (v28) và bỏ animation chuyển tab
+ *  (EnterTransition.None) để đổi tab tức thì.
+ * ════════════════════════════════════════════════════════════════════════
+ */
+
+private sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
+    object Sideload : Screen("sideload", "Cài IPA", Icons.Filled.RocketLaunch)
+    object Revoke : Screen("revoke", "Thu hồi cert", Icons.Filled.Key)
     object Settings : Screen("settings", "Cài đặt", Icons.Filled.Settings)
 }
 
-// BUGFIX v15: thêm tab "Đăng ký UDID" — trước đây đăng ký UDID chỉ có
-// thể xảy ra ngầm bên trong luồng "Cài IPA" (SideloadScreen), không có cách
-// nào đăng ký UDID độc lập với việc ký/cài một IPA cụ thể.
-//
-// [MỚI] thêm tab "Ghép nối" — cho phép tạo pairing file và ghép nối với
-// iPhone độc lập với luồng Cài IPA (theo yêu cầu người dùng), đồng thời giúp
-// kiểm tra riêng bước bắt tay usbmux/Trust khi gặp lỗi kết nối.
-private val screens = listOf(Screen.Sideload, Screen.Pairing, Screen.RegisterDevice, Screen.Revoke, Screen.Settings)
+private val screens = listOf(Screen.Sideload, Screen.Revoke, Screen.Settings)
 
 /**
- * FIX v28: TrustBanner — Hiển thị toàn màn hình khi iPhone yêu cầu Trust.
- *
- * VẤN ĐỀ CŨ: C code gọi NativeBridge.onTrustRequired() → set _trustRequired
- * StateFlow, nhưng KHÔNG CÓ composable nào observe flow này để hiện UI.
- * Kết quả: người dùng không biết phải bấm Trust trên iPhone → wait loop
- * trong nativePair() timeout sau 20 lần × 2 giây = 40 giây → thất bại.
- *
- * FIX: Banner này mount ở cấp AppNavHost (phía trên NavHost, dưới bottomBar)
- * → hiện ở MỌI tab, không chỉ PairingScreen. Người dùng thấy ngay dù đang
- * ở bất kỳ màn hình nào. Banner animate slideIn từ trên, tự dismiss khi
- * NativeBridge.dismissTrust() được gọi (sau khi Trust được xác nhận).
+ * Banner toàn màn hình khi iPhone yêu cầu Trust — mount ở topBar nên hiện
+ * ở MỌI tab (fix v28), tự ẩn khi NativeBridge.dismissTrust() được gọi.
  */
 @Composable
 private fun TrustBanner(viewModel: HomeViewModel) {
@@ -84,24 +82,24 @@ private fun TrustBanner(viewModel: HomeViewModel) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFFE65100))  /* Deep orange — chú ý cao */
-                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .background(Color(0xFF7A3E00))
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Filled.PhoneIphone,
-                    contentDescription = null,
-                    tint = Color.White
-                )
+            Row(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Filled.PhoneIphone, contentDescription = null, tint = Color.White)
                 Spacer(Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        "Xác nhận 'Tin cậy' trên iPhone!",
+                        "Xác nhận \"Tin cậy\" trên iPhone!",
                         color = Color.White,
                         style = MaterialTheme.typography.titleSmall
                     )
                     Text(
-                        "Mở khoá iPhone → bấm 'Tin cậy Máy tính này' → nhập mã PIN",
+                        "Mở khoá iPhone → bấm \"Tin cậy Máy tính này\" → nhập mã PIN",
                         color = Color.White.copy(alpha = 0.9f),
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -120,12 +118,13 @@ fun AppNavHost(viewModel: HomeViewModel) {
     val navController = rememberNavController()
 
     Scaffold(
-        topBar = {
-            /* FIX v28: Trust banner dưới top — hiện ở MỌI tab, không chỉ Pairing */
-            TrustBanner(viewModel)
-        },
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = { TrustBanner(viewModel) },
         bottomBar = {
-            NavigationBar {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surface,
+                tonalElevation = 0.dp
+            ) {
                 val navBackStackEntry by navController.currentBackStackEntryAsState()
                 val currentDestination = navBackStackEntry?.destination
                 screens.forEach { screen ->
@@ -149,19 +148,13 @@ fun AppNavHost(viewModel: HomeViewModel) {
             navController = navController,
             startDestination = Screen.Sideload.route,
             modifier = Modifier.padding(innerPadding),
-            // Bỏ hoàn toàn animation chuyển màn khi đổi tab dưới cùng: đây là
-            // điều hướng ngang cấp (3 tab chính), không phải push/pop kiểu
-            // "đi sâu vào màn hình con", nên animation trượt mặc định của
-            // Compose Navigation chỉ tạo cảm giác trễ mà không có giá trị điều
-            // hướng nào — chuyển tab giờ đổi nội dung ngay lập tức.
+            // Đổi tab là điều hướng ngang cấp — đổi nội dung ngay, không trượt.
             enterTransition = { EnterTransition.None },
             exitTransition = { ExitTransition.None },
             popEnterTransition = { EnterTransition.None },
             popExitTransition = { ExitTransition.None }
         ) {
             composable(Screen.Sideload.route) { SideloadScreen(viewModel) }
-            composable(Screen.Pairing.route) { PairingScreen(viewModel) }
-            composable(Screen.RegisterDevice.route) { RegisterDeviceScreen(viewModel) }
             composable(Screen.Revoke.route) { RevokeCertsScreen(viewModel) }
             composable(Screen.Settings.route) { SettingsScreen(viewModel) }
         }

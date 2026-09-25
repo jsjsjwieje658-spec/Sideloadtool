@@ -1,5 +1,6 @@
 package com.superalpha.sideload.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -7,14 +8,24 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -26,17 +37,27 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.superalpha.sideload.bridge.AppPaths
+import com.superalpha.sideload.ui.theme.BrandTextDim
+import com.superalpha.sideload.ui.theme.screenBackgroundBrush
 
-/**
- * Cài đặt: Apple ID đã lưu (KHÔNG lưu mật khẩu — xem lý do trong
- * config_manager.get_apple_id ở phía Python), server Anisette (tự động dò từ
- * servers.sidestore.io, hoặc chọn tay một server cụ thể / nhập URL riêng), và
- * thông tin đường dẫn + cảnh báo rủi ro USB như bản trước.
+/*
+ * ════════════════════════════════════════════════════════════════════════
+ *  v50 — SettingsScreen (thiết kế lại): gom thành 3 thẻ rõ ràng
+ *    1. Apple ID (chỉ lưu email để tự điền — không lưu mật khẩu)
+ *    2. Server Anisette (tự dò từ servers.sidestore.io / chọn tay / tuỳ chỉnh)
+ *    3. Thông tin ứng dụng (phiên bản, đường dẫn, lưu ý)
+ *  Bố cục cũ dùng Divider (deprecated) + dàn chữ dày — bỏ hết.
+ * ════════════════════════════════════════════════════════════════════════
  */
 @Composable
 fun SettingsScreen(viewModel: HomeViewModel) {
+    val context = LocalContext.current
     val savedAppleId by viewModel.savedAppleId.collectAsState()
     val savedAnisetteUrl by viewModel.savedAnisetteUrl.collectAsState()
     val servers by viewModel.anisetteServers.collectAsState()
@@ -57,132 +78,172 @@ fun SettingsScreen(viewModel: HomeViewModel) {
 
     LaunchedEffect(Unit) { viewModel.loadAnisetteServersIfNeeded() }
 
-    // remember: AppPaths.filesDir()/zsignPath() chỉ ghép chuỗi từ Context, không
-    // đổi trong suốt đời sống Activity — không cần gọi lại mỗi lần recomposition.
     val filesDir = remember { AppPaths.filesDir() }
     val zsignPath = remember { AppPaths.zsignPath() }
+    val versionName = remember {
+        try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+        } catch (_: Exception) { "?" }
+    }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Cài đặt", style = MaterialTheme.typography.titleLarge)
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(screenBackgroundBrush())
+            .verticalScroll(rememberScrollState())
+            .imePadding()
+            .padding(horizontal = 16.dp)
+    ) {
         Spacer(Modifier.height(16.dp))
-
-        Text("Apple ID", style = MaterialTheme.typography.labelLarge)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Chỉ Apple ID (email) được lưu lại để tự điền ở tab Sideload/Thu hồi " +
-                "certificate — KHÔNG lưu mật khẩu vì lý do bảo mật, bạn vẫn cần nhập " +
-                "mật khẩu mỗi lần đăng nhập.",
-            style = MaterialTheme.typography.bodySmall
+        ScreenHeader(
+            icon = Icons.Filled.Settings,
+            title = "Cài đặt",
+            subtitle = "Tài khoản, server Anisette và thông tin ứng dụng"
         )
-        Spacer(Modifier.height(8.dp))
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
+
+        Spacer(Modifier.height(14.dp))
+
+        // ── Apple ID ────────────────────────────────────────────────────────
+        SectionCard(title = "Apple ID", icon = Icons.Filled.AccountCircle) {
+            AppTextField(
                 value = appleIdField,
                 onValueChange = { appleIdField = it },
-                label = { Text("Apple ID") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
+                label = "Apple ID (email)",
+                keyboardType = KeyboardType.Email
             )
-            TextButton(onClick = { viewModel.saveAppleId(appleIdField.trim()) }) { Text("Lưu") }
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = { viewModel.saveAppleId(appleIdField.trim()) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) { Text("Lưu Apple ID") }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Chỉ Apple ID (email) được lưu để tự điền ở màn Cài IPA / Thu hồi chứng chỉ. " +
+                    "Mật khẩu KHÔNG được lưu — bạn nhập mỗi lần đăng nhập.",
+                style = MaterialTheme.typography.bodySmall,
+                color = BrandTextDim
+            )
         }
 
-        Spacer(Modifier.height(20.dp))
-        Divider()
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(14.dp))
 
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("Server Anisette", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
-            if (serversLoading) {
-                CircularProgressIndicator(modifier = Modifier.height(16.dp), strokeWidth = 2.dp)
-            } else {
-                TextButton(onClick = { viewModel.reloadAnisetteServers() }) { Text("Tải lại danh sách") }
-            }
-        }
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Server Anisette cấp thông tin xác thực thiết bị cần cho đăng nhập Apple " +
-                "ID/2FA. Danh sách lấy trực tiếp từ servers.sidestore.io — chọn \"Tự " +
-                "động\" để app tự tìm server đang phản hồi tốt nhất, hoặc chọn tay một " +
-                "server cụ thể nếu server tự động không ổn định.",
-            style = MaterialTheme.typography.bodySmall
-        )
-        Spacer(Modifier.height(8.dp))
-
-        Box {
-            val currentLabel = when {
-                savedAnisetteUrl.isBlank() -> "Tự động (khuyến nghị)"
-                else -> servers.firstOrNull { it.address == savedAnisetteUrl }
-                    ?.let { "${it.name}  ·  ${it.address}" }
-                    ?: "Tuỳ chỉnh: $savedAnisetteUrl"
-            }
-            OutlinedButton(onClick = { menuExpanded = true }, modifier = Modifier.fillMaxWidth()) {
-                Text(currentLabel, modifier = Modifier.weight(1f))
-            }
-            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                DropdownMenuItem(
-                    text = { Text("Tự động (khuyến nghị)") },
-                    onClick = {
-                        menuExpanded = false
-                        showCustomField = false
-                        viewModel.saveAnisetteUrl("")
-                    }
-                )
-                servers.forEach { server ->
+        // ── Server Anisette ─────────────────────────────────────────────────
+        SectionCard(title = "Server Anisette", icon = Icons.Filled.Dns) {
+            Box {
+                val currentLabel = when {
+                    savedAnisetteUrl.isBlank() -> "Tự động (khuyến nghị)"
+                    else -> servers.firstOrNull { it.address == savedAnisetteUrl }
+                        ?.let { "${it.name} · ${it.address}" }
+                        ?: "Tuỳ chỉnh: $savedAnisetteUrl"
+                }
+                OutlinedButton(
+                    onClick = { menuExpanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(currentLabel, modifier = Modifier.weight(1f), maxLines = 1)
+                }
+                DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                     DropdownMenuItem(
-                        text = { Text("${server.name}  ·  ${server.address}") },
+                        text = { Text("Tự động (khuyến nghị)") },
                         onClick = {
                             menuExpanded = false
                             showCustomField = false
-                            viewModel.saveAnisetteUrl(server.address)
+                            viewModel.saveAnisetteUrl("")
+                        }
+                    )
+                    servers.forEach { server ->
+                        DropdownMenuItem(
+                            text = { Text("${server.name} · ${server.address}") },
+                            onClick = {
+                                menuExpanded = false
+                                showCustomField = false
+                                viewModel.saveAnisetteUrl(server.address)
+                            }
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text("Tuỳ chỉnh URL khác...") },
+                        onClick = {
+                            menuExpanded = false
+                            showCustomField = true
+                            customUrlField = savedAnisetteUrl
                         }
                     )
                 }
-                DropdownMenuItem(
-                    text = { Text("Tuỳ chỉnh URL khác...") },
-                    onClick = {
-                        menuExpanded = false
-                        showCustomField = true
-                        customUrlField = savedAnisetteUrl
-                    }
-                )
             }
-        }
 
-        if (showCustomField) {
-            Spacer(Modifier.height(8.dp))
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = customUrlField,
-                    onValueChange = { customUrlField = it },
-                    label = { Text("URL server Anisette tuỳ chỉnh") },
-                    singleLine = true,
+            if (showCustomField) {
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    AppTextField(
+                        value = customUrlField,
+                        onValueChange = { customUrlField = it },
+                        label = "URL server Anisette",
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = { viewModel.saveAnisetteUrl(customUrlField.trim()) }) {
+                        Text("Lưu")
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Server Anisette cấp dữ liệu xác thực thiết bị cho đăng nhập Apple ID/2FA.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = BrandTextDim,
                     modifier = Modifier.weight(1f)
                 )
-                TextButton(onClick = { viewModel.saveAnisetteUrl(customUrlField.trim()) }) { Text("Lưu") }
+                if (serversLoading) {
+                    Spacer(Modifier.width(8.dp))
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(16.dp).width(16.dp),
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    TextButton(
+                        onClick = { viewModel.reloadAnisetteServers() },
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp)
+                    ) { Text("Tải lại") }
+                }
             }
         }
 
-        Spacer(Modifier.height(20.dp))
-        Divider()
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(14.dp))
 
-        Text("Thông tin & Cảnh báo", style = MaterialTheme.typography.titleLarge)
-        Spacer(Modifier.height(12.dp))
+        // ── Thông tin ứng dụng ──────────────────────────────────────────────
+        SectionCard(title = "Thông tin ứng dụng", icon = Icons.Filled.Info) {
+            InfoRow("Phiên bản", versionName)
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Thư mục dữ liệu", filesDir)
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Đường dẫn zsign", zsignPath)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Ứng dụng kết nối trực tiếp với iPhone qua USB Host API của Android " +
+                    "(không cần Termux, không cần root). Lớp usbmux/lockdown được triển khai " +
+                    "lại từ giao thức gốc của libimobiledevice và đã kiểm chứng trên máy thật. " +
+                    "Sau khi cài app lần đầu, nhớ tin cậy Apple ID trong Cài đặt iPhone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = BrandTextDim
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Column {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = BrandTextDim)
         Text(
-            "Ứng dụng này kết nối trực tiếp tới iPhone qua cổng USB bằng USB Host API " +
-                "của Android (không cần Termux, không cần root). Lớp giao tiếp usbmux " +
-                "(mux_usb.py) là phần tự triển khai lại từ giao thức gốc của libimobiledevice " +
-                "và CHƯA được kiểm chứng trên phần cứng thật — hãy xem README.md, mục " +
-                "\"Rủi ro đã biết\" trước khi dùng với thiết bị quan trọng.",
-            style = MaterialTheme.typography.bodyMedium
+            value,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp)
         )
-        Spacer(Modifier.height(16.dp))
-        Divider()
-        Spacer(Modifier.height(16.dp))
-        Text("Thư mục dữ liệu ứng dụng:", style = MaterialTheme.typography.labelLarge)
-        Text(filesDir, style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(8.dp))
-        Text("Đường dẫn zsign:", style = MaterialTheme.typography.labelLarge)
-        Text(zsignPath, style = MaterialTheme.typography.bodySmall)
     }
 }

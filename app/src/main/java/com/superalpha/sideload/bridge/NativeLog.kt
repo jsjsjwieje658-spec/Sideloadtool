@@ -21,6 +21,10 @@ object NativeLog {
     @JvmStatic
     fun emit(line: String) {
         Log.i(TAG, line)
+        // v50: LogBuffer gộp dòng theo lô (100 ms) trước khi tới UI — xem chú
+        // thích đầu LogBuffer.kt. SharedFlow giữ lại cho các listener khác
+        // (nếu có); HomeViewModel không còn collect từng dòng như trước.
+        LogBuffer.append(line)
         _lines.tryEmit(line)
     }
 

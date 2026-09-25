@@ -123,3 +123,28 @@ Nếu vẫn lỗi, gửi các dòng `[usb]`, `[usbmux]`, `[lockdown]`/`[pair]`, 
    (CMakeLists chỉ build 4 file), giữ lại để tham khảo.
 
 *Patch v49 — 2026-09-24*
+
+---
+
+# SideloadTool Patch v50 — Làm lại UI (đẹp + mượt) và bỏ 2 tab thừa
+
+*2026-09-25*
+
+## 9. Thay đổi
+
+| # | Vấn đề | Sửa |
+|---|---|---|
+| 22 | **UI lag trên máy thật**: (a) mỗi dòng log → `List.copy + takeLast(500)` + phát StateFlow → recompose toàn màn; (b) `LazyColumn` không key → mọi dòng đang thấy compose lại cho MỖI dòng log mới; (c) `animateScrollToItem()` chạy liên tục khi log dồn; (d) copy file IPA (có thể vài trăm MB) ngay trên main thread trong callback chọn file; (e) APK debug (Compose debug không tối ưu, không R8). | (a) `LogBuffer`: ring buffer 2000 dòng, gộp xuất snapshot **1 lần/100 ms**; (b) `key = chỉ số toàn cục` cho từng dòng; (c) `scrollToItem` không animation + chỉ auto-cuộn khi người dùng đang ở cuối (cuộn lên đọc → hiện nút "Cuộn xuống cuối"); (d) copy trên `Dispatchers.IO`; (e) **bản release R8 minify** (keep rule cho `com.superalpha.sideload.**` + `com.chaquo.python.**` vì Python/JNI gọi Kotlin theo tên class). |
+| 23 | 2 tab thừa **"Ghép nối"** + **"Đăng ký UDID"**: cả hai việc đều đã diễn ra NGẦM trong luồng "Cài IPA" (`do_sideload` Bước 0/5: connect → pair → đăng ký UDID). | Xoá `PairingScreen.kt`, `RegisterDeviceScreen.kt`, mục nav tương ứng; xoá `FileProvider` + `xml/file_paths.xml` (chỉ dùng cho tab Ghép nối). Thay bằng **thẻ trạng thái iPhone** ngay trên màn chính (`DeviceCard`): cáp USB / chờ Trust (kèm hướng dẫn bấm Tin cậy) / sẵn sàng — poll trạng thái 1 giây/lần. |
+| 24 | Giao diện cũ: chữ dày đặc, không phân nhóm, `Divider` deprecated, màu Material3 mặc định (không container màu riêng). | Thiết kế lại toàn bộ: theme dark "Super Alpha" đủ bộ màu M3, thẻ bo góc + viền mảnh, banner đầu màn, nút chính gradient vàng, console log màu theo mức độ (lỗi đỏ/cảnh báo cam/thành công mint/tiến trình xanh), thanh phân đoạn cho chọn chứng chỉ thu hồi. 3 tab còn lại: **Cài IPA · Thu hồi cert · Cài đặt**. |
+
+## 10. Lưu ý khi nâng cấp lên v50
+
+1. **Cài artifact `superalpha-sideload-release`** (khuyến nghị — mượt hơn). Còn
+   `superalpha-sideload-debug` để dự phòng.
+2. Bản release ký bằng **debug keystore của CI runner** — chữ ký khác bản debug
+   cũ → phải **gỡ app cũ một lần** rồi cài bản mới. Gỡ app làm mất pair record
+   (nằm trong dữ liệu app) → khi kết nối iPhone lần đầu phải bấm **"Tin cậy"**
+   lại một lần. Máy đã từng đăng ký UDID vào team Apple thì không cần làm lại.
+3. Luồng sử dụng mới: cắm cáp → thẻ iPhone hiện "sẵn sàng" → chọn IPA → nhập
+   Apple ID + mật khẩu → "Ký & Cài đặt". Mọi bước ghép nối/đăng ký UDID tự chạy.

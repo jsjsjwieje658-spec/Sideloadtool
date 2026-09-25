@@ -23,8 +23,8 @@ android {
         applicationId = "com.superalpha.sideload"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.2.0-v47"
+        versionCode = 7
+        versionName = "1.3.0-v50"
 
         // FIX: Thêm x86_64 cho emulator và arm64-v8a cho thiết bị thật
         ndk {
@@ -52,13 +52,59 @@ android {
 
     ndkVersion = "25.2.9519653"
 
+    signingConfigs {
+        /*
+         * v50 — Keystore ký bản release, decode từ GitHub Secrets
+         * (RELEASE_KEYSTORE_FILE là đường dẫn file đã giải base64).
+         * Giữ chữ ký ổn định giữa các lần build CI để cài đè không phải
+         * gỡ app. Khi thiếu biến môi trường → config rỗng và buildTypes
+         * fallback về debug keystore.
+         */
+        create("releaseUpload") {
+            val ksFile = System.getenv("RELEASE_KEYSTORE_FILE")
+            if (!ksFile.isNullOrBlank() && File(ksFile).isFile) {
+                storeFile = File(ksFile)
+                storePassword = System.getenv("RELEASE_KEYSTORE_STORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("RELEASE_KEYSTORE_ALIAS") ?: ""
+                keyPassword = System.getenv("RELEASE_KEYSTORE_KEY_PASSWORD") ?: ""
+            }
+        }
+    }
+
     buildTypes {
+        /*
+         * v50 — Bật R8 (minify + resource shrink) cho bản release.
+         *
+         * Trước đây app chỉ build debug (Compose debug + không minify → chậm,
+         * nặng — một phần nguyên nhân UI "lag lag" trên máy thật). Bản release
+         * Compose nhanh hơn rõ rệt và APK nhỏ hơn đáng kể.
+         *
+         * Ký: tạm dùng debug keystore (AGP sinh ~/.android/debug.keystore nếu
+         * chưa có) — CI không có keystore bí mật riêng. LƯU Ý: cài đè bản
+         * debug cũ bằng bản release (chữ ký khác nhau) sẽ phải gỡ app cũ MỘT
+         * LẦN — mất pair record, phải bấm "Tin cậy" lại trên iPhone.
+         *
+         * ProGuard rules (app/proguard-rules.pro) giữ toàn bộ class trong
+         * com.superalpha.sideload.** (Python/Chaquopy và JNI gọi qua tên class
+         * — R8 không thấy các reference này khi phân tích tĩnh) và
+         * com.chaquo.python.**.
+         */
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Có keystore từ secret (CI) → ký bản upload ổn định chữ ký;
+            // không có → fallback debug keystore (vẫn cài được, chỉ phải gỡ
+            // app cũ mỗi lần đổi nguồn APK).
+            val ksFile = System.getenv("RELEASE_KEYSTORE_FILE")
+            signingConfig = if (!ksFile.isNullOrBlank() && File(ksFile).isFile) {
+                signingConfigs.getByName("releaseUpload")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
         debug {
             isDebuggable = true
