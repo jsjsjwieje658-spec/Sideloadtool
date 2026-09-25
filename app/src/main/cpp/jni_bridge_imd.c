@@ -916,22 +916,27 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
             break;
         }
 
-        /* Tạo thư mục cha nếu rel_path có dạng "a/b/file" (bỏ qua lỗi đã tồn tại) */
-        char dirs[512];
-        snprintf(dirs, sizeof(dirs), "/%s", rel);
-        for (char *p = dirs + 1; *p; p++) {
+        /*
+         * iLoader place_file(): gốc AFC sau VendDocuments là DATA CONTAINER
+         * của app — file phải ghi vào /Documents/<rel_path>, không phải "/"
+         * (v56 ghi nhầm ở gốc → afc_file_open bị từ chối). Luôn tạo sẵn
+         * /Documents + các thư mục cha, bỏ qua lỗi "đã tồn tại".
+         */
+        char remote[512];
+        snprintf(remote, sizeof(remote), "/Documents/%s", rel);
+        for (char *p = remote + 1; *p; p++) {
             if (*p == '/') {
                 *p = 0;
-                afc_make_directory(afc, dirs);
+                afc_make_directory(afc, remote);
                 *p = '/';
             }
         }
+        afc_make_directory(afc, "/Documents");
 
-        char remote[512];
-        snprintf(remote, sizeof(remote), "/%s", rel);
         uint64_t handle = 0;
-        if (afc_file_open(afc, remote, AFC_FOPEN_WRONLY, &handle) != AFC_E_SUCCESS || !handle) {
-            emitf("[pairing] ❌ afc_file_open(%s) thất bại", remote);
+        afc_error_t afe = afc_file_open(afc, remote, AFC_FOPEN_WR, &handle);
+        if (afe != AFC_E_SUCCESS || !handle) {
+            emitf("[pairing] ❌ afc_file_open(%s) thất bại (AFC lỗi %d)", remote, (int)afe);
             break;
         }
         uint32_t total = (uint32_t)strlen(xml);
@@ -940,7 +945,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
         while (done < total) {
             uint32_t w = 0;
             if (afc_file_write(afc, handle, xml + done, total - done, &w) != AFC_E_SUCCESS || w == 0) {
-                emit_log("[pairing] ❌ afc_file_write thất bại");
+                emitf("[pairing] ❌ afc_file_write thất bại (đã ghi %u/%u)", done, total);
                 werr = true;
                 break;
             }

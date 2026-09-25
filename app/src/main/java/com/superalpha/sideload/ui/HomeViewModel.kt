@@ -49,7 +49,10 @@ private val PAIRING_APP_PATHS = listOf(
     "LiveContainer" to "SideStore/Documents/ALTPairingFile.mobiledevicepairing",
     "Feather" to "pairingFile.plist",
     "StikDebug" to "pairingFile.plist",
+    "StikDebug (Sideloaded)" to "rp_pairing_file.plist",
     "StikTest" to "stiktest_pairing.plist",
+    "Protokolle" to "pairingFile.plist",
+    "Antrag" to "pairingFile.plist",
     "SparseBox" to "pairingFile.plist",
     "StikStore" to "pairingFile.plist",
     "ByeTunes" to "pairing file/pairingFile.plist",
@@ -253,21 +256,31 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Ghép app đã cài với đường dẫn file ghép nối tương ứng (bảng iLoader). */
+    /**
+     * Ghép app đã cài với đường dẫn file ghép nối tương ứng (bảng iLoader).
+     *
+     * Fix v57: danh sách browse có thể chứa cả EXTENSION của app (vd
+     * …sa9b733.AltWidget) — bundle id này chứa "SideStore" nên v56 nhúng
+     * nhầm vào extension (extension không có Documents riêng → afc_file_open
+     * thất bại). Giờ bỏ mọi entry là extension của app khác (id bắt đầu bằng
+     * "<id-của-app-khác>."), mỗi app chỉ hiện đúng 1 lần.
+     */
     private fun matchPairingApps(entries: List<Pair<String, String>>): List<PairingAppInfo> {
         val result = ArrayList<PairingAppInfo>(4)
+        val seen = HashSet<String>()
+        val ids = entries.map { it.first }
+        val isExtension = { id: String -> ids.any { other -> other != id && id.startsWith("$other.") } }
         for ((name, rel) in PAIRING_APP_PATHS) {
-            val hit = entries.firstOrNull { (bundleId, displayName) ->
-                displayName.equals(name, ignoreCase = true) ||
-                        bundleId.contains(name, ignoreCase = true)
-            } ?: continue
-            // Bảng sắp xếp SideStore trước — nếu display name trùng tên khác
-            // (bundle id không chứa tên) thì vẫn ưu tiên khớp bundle id.
-            val byBundle = entries.firstOrNull { (bundleId, _) ->
-                bundleId.contains(name, ignoreCase = true)
+            val matches = entries.filter { (bundleId, displayName) ->
+                !isExtension(bundleId) &&
+                        (displayName.equals(name, ignoreCase = true) ||
+                                bundleId.contains(name, ignoreCase = true))
             }
-            val chosen = byBundle ?: hit
-            result.add(PairingAppInfo(name, chosen.first, rel))
+            for ((bundleId, displayName) in matches) {
+                if (seen.add(bundleId)) {
+                    result.add(PairingAppInfo(displayName.ifBlank { name }, bundleId, rel))
+                }
+            }
         }
         return result
     }
