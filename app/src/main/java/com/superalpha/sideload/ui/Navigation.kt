@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.PhonelinkSetup
 import androidx.compose.material.icons.filled.PhoneIphone
 import androidx.compose.material.icons.filled.RocketLaunch
 import androidx.compose.material.icons.filled.Settings
@@ -61,10 +62,13 @@ import com.superalpha.sideload.bridge.NativeBridge
 private sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
     object Sideload : Screen("sideload", "Cài IPA", Icons.Filled.RocketLaunch)
     object Revoke : Screen("revoke", "Thu hồi cert", Icons.Filled.Key)
+    // v56: tab quản lý file ghép nối (.mobiledevicepairing) cho SideStore /
+    // LiveContainer… (xuất file + tự động nhúng vào app sau khi cài).
+    object PairingFile : Screen("pairing_file", "File ghép nối", Icons.Filled.PhonelinkSetup)
     object Settings : Screen("settings", "Cài đặt", Icons.Filled.Settings)
 }
 
-private val screens = listOf(Screen.Sideload, Screen.Revoke, Screen.Settings)
+private val screens = listOf(Screen.Sideload, Screen.Revoke, Screen.PairingFile, Screen.Settings)
 
 /**
  * Banner toàn màn hình khi iPhone yêu cầu Trust — mount ở topBar nên hiện
@@ -156,6 +160,7 @@ fun AppNavHost(viewModel: HomeViewModel) {
         ) {
             composable(Screen.Sideload.route) { SideloadScreen(viewModel) }
             composable(Screen.Revoke.route) { RevokeCertsScreen(viewModel) }
+            composable(Screen.PairingFile.route) { PairingFileManagerScreen(viewModel) }
             composable(Screen.Settings.route) { SettingsScreen(viewModel) }
         }
     }

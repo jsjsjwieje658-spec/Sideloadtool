@@ -549,6 +549,44 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
 _TOOL_CERT_PREFIXES = ("ios-sideload-tool", "sideload-")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# v56: Các app cần file ghép nối (.mobiledevicepairing) sau khi cài — học từ
+# iLoader (github.com/nab138/iloader, src/pairing.rs, PAIRING_APPS).
+# Tên app → đường dẫn file TƯƠNG ĐỐI tính từ gốc Documents của app đó:
+#   SideStore      → Documents/ALTPairingFile.mobiledevicepairing
+#   LiveContainer  → Documents/SideStore/Documents/ALTPairingFile.mobiledevicepairing
+# File ghép nối = pair record hiện có + khóa UDID (định dạng AltStore/SideStore).
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PAIRING_APPS = (
+    ("SideStore", "ALTPairingFile.mobiledevicepairing"),
+    ("LiveContainer", "SideStore/Documents/ALTPairingFile.mobiledevicepairing"),
+    ("Feather", "pairingFile.plist"),
+    ("StikDebug", "pairingFile.plist"),
+    ("StikDebug (Sideloaded)", "rp_pairing_file.plist"),
+    ("StikTest", "stiktest_pairing.plist"),
+    ("Protokolle", "pairingFile.plist"),
+    ("Antrag", "pairingFile.plist"),
+    ("SparseBox", "pairingFile.plist"),
+    ("StikStore", "pairingFile.plist"),
+    ("ByeTunes", "pairing file/pairingFile.plist"),
+    ("Reynard", "pairingFile.plist"),
+    ("PanicAnalyzer", "pairingFile.plist"),
+)
+
+
+def _pairing_rel_path_for(app_name: str, bundle_id: str) -> str:
+    """Đường dẫn file ghép nối trong app nếu app này cần (theo tên hoặc bundle
+    id), ngược lại trả chuỗi rỗng."""
+    name_l = str(app_name or "").strip().lower()
+    bid_l = str(bundle_id or "").lower()
+    for name, rel in _PAIRING_APPS:
+        nl = name.lower()
+        if (name_l and name_l == nl) or (bid_l and nl in bid_l):
+            return rel
+    return ""
+
+
 def _auto_revoke_certs_for_limit(dev_api, state) -> int:
     """Thu hồi certificate để giải phóng chỗ khi bị Apple chặn tạo cert mới.
 
@@ -596,6 +634,7 @@ def do_sideload(
     password: str,
     udid_override: str = "",
     anisette_url: str = "",
+    embed_pairing: bool = True,
 ) -> bool:
     """Ký và cài đặt IPA lên iPhone đang cắm USB."""
     try:
@@ -756,6 +795,20 @@ def do_sideload(
             return False
         print("✅ Cài đặt ứng dụng thành công! (Lần đầu mở app: Cài đặt > Cài đặt chung > "
               "Quản lý VPN & Thiết bị > tin cậy Apple ID của bạn.)")
+        # ── v56: tự động nhúng file ghép nối vào SideStore/LiveContainer… ──
+        if embed_pairing and targets and targets[0] and targets[0][1]:
+            rel = _pairing_rel_path_for(app_name, targets[0][1])
+            if rel:
+                print(f"[pairing] Phát hiện {app_name} — tự động ghi file ghép nối vào app...")
+                try:
+                    from com.superalpha.sideload.bridge import DeviceNative
+                    if DeviceNative.writePairingFileToApp(targets[0][1], rel):
+                        print("[pairing] ✅ App dùng ngay pair record này — mở app không cần ghép nối lại.")
+                    else:
+                        print("[pairing] ⚠️ Không nhúng được file ghép nối (cài đặt vẫn thành công).")
+                except Exception as e:
+                    print(f"[pairing] ⚠️ Lỗi khi nhúng file ghép nối: {e}")
+
         return True
 
     except Exception as e:

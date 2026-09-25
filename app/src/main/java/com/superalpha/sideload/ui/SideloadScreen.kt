@@ -253,7 +253,8 @@ fun SideloadScreen(viewModel: HomeViewModel) {
                     NativeLog.log("Bắt đầu quá trình ký & cài đặt...")
                     val outcome = PythonBridge.sideload(
                         path, savedAppleId, savedPassword, null,
-                        savedAnisetteUrl.ifBlank { null }
+                        savedAnisetteUrl.ifBlank { null },
+                        viewModel.autoEmbedPairing.value
                     )
                     if (!outcome.success && outcome.message.isNotBlank()) {
                         NativeLog.log("Lỗi: ${outcome.message}")

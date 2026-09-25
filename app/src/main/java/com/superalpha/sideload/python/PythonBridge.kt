@@ -109,7 +109,8 @@ object PythonBridge {
         appleId: String,
         password: String,
         twoFaCode: String?,
-        anisetteUrl: String?
+        anisetteUrl: String?,
+        embedPairing: Boolean = true
     ): Outcome = withContext(Dispatchers.IO) {
         try {
             ensurePython()
@@ -123,7 +124,8 @@ object PythonBridge {
                 appleId,
                 password,
                 AppConfig.lastUdid,
-                effectiveAnisetteUrl
+                effectiveAnisetteUrl,
+                embedPairing
             ).toBoolean()
             Outcome(ok, if (ok) "Cài đặt IPA thành công." else "Cài đặt thất bại — xem nhật ký.")
         } catch (e: Exception) {

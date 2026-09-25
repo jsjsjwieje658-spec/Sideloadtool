@@ -117,6 +117,24 @@ object DeviceNative {
     }
 
     /**
+     * v56: Ghi file ghép nối (.mobiledevicepairing) vào Documents của app đã
+     * cài (SideStore/LiveContainer…). Gọi từ sideload_core.py sau khi cài
+     * xong để app đó tự dùng pair record này, không phải ghép nối lại.
+     */
+    @JvmStatic
+    fun writePairingFileToApp(bundleId: String, relPath: String): Boolean = runBlocking {
+        val b = bridge ?: run {
+            NativeLog.emit("[DeviceNative] ❌ Chưa init.")
+            return@runBlocking false
+        }
+        if (!UsbTransport.isConnected()) {
+            NativeLog.emit("[DeviceNative] ❌ USB đã ngắt — không ghi được file ghép nối.")
+            return@runBlocking false
+        }
+        b.writePairingFileToApp(bundleId, relPath)
+    }
+
+    /**
      * diagnostics — Chẩn đoán trạng thái kết nối iPhone.
      * Học từ lệnh "termux-usbmuxd doctor" — trả về báo cáo để hiển thị UI.
      */

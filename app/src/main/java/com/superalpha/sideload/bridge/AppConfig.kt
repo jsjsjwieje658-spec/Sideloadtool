@@ -48,6 +48,11 @@ object AppConfig {
         get() = prefs.getString("anisette_url", "") ?: ""
         set(v) = prefs.edit { putString("anisette_url", v) }
 
+    /** v56: tự động ghi file ghép nối vào SideStore/LiveContainer… sau khi cài. */
+    var autoEmbedPairing: Boolean
+        get() = prefs.getBoolean("auto_embed_pairing", true)
+        set(v) = prefs.edit { putBoolean("auto_embed_pairing", v) }
+
     var lastUdid: String
         get() = prefs.getString("last_udid", "") ?: ""
         set(v) = prefs.edit { putString("last_udid", v) }

@@ -62,7 +62,7 @@ os.chmod(FAKE_ZSIGN, os.stat(FAKE_ZSIGN).st_mode | stat.S_IEXEC)
 
 ui_answers = []
 ui_prompts = []
-native_calls = {"connectAndPair": 0, "sideloadIpa": []}
+native_calls = {"connectAndPair": 0, "sideloadIpa": [], "embedded": []}
 
 
 class AppPaths:
@@ -111,6 +111,11 @@ class DeviceNative:
     @staticmethod
     def sideloadIpa(path):
         native_calls["sideloadIpa"].append(path)
+        return True
+
+    @staticmethod
+    def writePairingFileToApp(bundle_id, rel_path):
+        native_calls["embedded"].append((bundle_id, rel_path))
         return True
 
     @staticmethod
@@ -255,6 +260,7 @@ def reset_run():
         os.remove(ZSIGN_LOG)
     native_calls["connectAndPair"] = 0
     native_calls["sideloadIpa"] = []
+    native_calls["embedded"] = []
     FakeDevAPI.instances.clear()
     auth_instances.clear()
     state = os.path.join(WORK, "sideload_state.json")
@@ -313,6 +319,8 @@ if calls:
               f"profile nhúng trong {os.path.basename(bundle)} khớp App ID + có UDID máy")
 check(len(native_calls["sideloadIpa"]) == 1 and native_calls["sideloadIpa"][0].endswith("_signed.ipa"),
       f"cài qua USB đúng file đã ký: {[os.path.basename(p) for p in native_calls['sideloadIpa']]}")
+check(native_calls["embedded"] == [(new_main, "ALTPairingFile.mobiledevicepairing")],
+      f"v56: tự động nhúng file ghép nối vào SideStore sau khi cài: {native_calls['embedded']}")
 
 print("=== CASE B: chạy lại — dùng lại App ID đã chọn, không tạo thêm (không tốn quota) ===")
 native_calls["sideloadIpa"] = []
@@ -429,6 +437,25 @@ print("=== CASE F: UDID ===")
 check(core._normalize_udid("00008030001A35E80C41802E") == UDID, "UDID 24 ký tự được chèn '-'")
 check(core._looks_like_udid("102e03e0d56583407853e9518f945642c72298d3"), "UDID 40 hex hợp lệ")
 check(not core._looks_like_udid(WORK), "đường dẫn thư mục KHÔNG bị coi là UDID (bản cũ fallback filesDir)")
+
+print("=== CASE I (v56): nhúng file ghép nối — tắt cờ / app ngoài danh sách ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False  # H2/H3 để sót True ở class attr (instance shadow)
+make_ipa(ipa)  # các case trước đã tiêu thụ file ipa gốc
+ok = core.do_sideload(ipa, "user@example.com", "pw", embed_pairing=False)
+check(ok is True, "do_sideload thành công khi embed_pairing=False")
+check(native_calls["embedded"] == [], f"embed_pairing=False → KHÔNG nhúng file ghép nối: {native_calls['embedded']}")
+
+reset_run()
+ipa_other = os.path.join(WORK, "Other.ipa")
+with zipfile.ZipFile(ipa_other, "w") as z:
+    z.writestr("Payload/Other.app/Info.plist", plistlib.dumps({
+        "CFBundleIdentifier": "com.example.OtherApp", "CFBundleDisplayName": "OtherApp",
+        "CFBundleExecutable": "OtherApp"}))
+    z.writestr("Payload/Other.app/OtherApp", b"\xcf\xfa\xed\xfe binary")
+ok = core.do_sideload(ipa_other, "user@example.com", "pw")
+check(ok is True, "cài app ngoài danh sách ghép nối vẫn thành công")
+check(native_calls["embedded"] == [], f"app không cần ghép nối → không nhúng: {native_calls['embedded']}")
 
 shutil.rmtree(WORK, ignore_errors=True)
 print("=" * 70)

@@ -301,6 +301,22 @@ class NativeBridge(private val context: Context) {
     }
 
     // ── Export pair record ─────────────────────────────────────────────────────
+    // ── v56: Quản lý file ghép nối (.mobiledevicepairing) ─────────────────────
+    /** Nội dung file ghép nối chuẩn AltStore/SideStore (XML plist + UDID). */
+    suspend fun getPairingFile(): String? = withContext(Dispatchers.IO) {
+        try { nativeGetPairingFile() } catch (_: Exception) { null }
+    }
+
+    /**
+     * Ghi file ghép nối vào Documents của app đã cài (house_arrest →
+     * VendDocuments → AFC) — SideStore/LiveContainer dùng ngay không cần
+     * ghép nối lại. Chỉ chạy khi đã pair (cần SSL lockdown session).
+     */
+    suspend fun writePairingFileToApp(bundleId: String, relPath: String): Boolean =
+        withContext(Dispatchers.IO) {
+            try { nativeWritePairingFileToApp(bundleId, relPath) } catch (_: Exception) { false }
+        }
+
     suspend fun exportPairingFile(): File? = withContext(Dispatchers.IO) {
         try {
             val xml  = nativeGetPairingPlist() ?: return@withContext null
@@ -337,6 +353,31 @@ class NativeBridge(private val context: Context) {
         }
     }
 
+    /**
+     * v56: (bundleId, displayName) các app User đã cài — cho trình quản lý
+     * file ghép nối (ghép app với đúng đường dẫn file trong app đó).
+     */
+    suspend fun listInstalledAppEntries(): List<Pair<String, String>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val xml = nativeListInstalledApps() ?: return@withContext emptyList()
+                val out = ArrayList<Pair<String, String>>(32)
+                for (chunk in xml.split("</dict>")) {
+                    val id = Regex("<key>CFBundleIdentifier</key>\\s*<string>([^<]+)</string>")
+                        .find(chunk)?.groupValues?.get(1)?.trim() ?: continue
+                    val name = Regex("<key>CFBundleDisplayName</key>\\s*<string>([^<]*)</string>")
+                        .find(chunk)?.groupValues?.get(1)?.trim().takeUnless { it.isNullOrEmpty() } ?: id
+                    out.add(id to name)
+                }
+                out
+            } catch (_: UnsatisfiedLinkError) {
+                emptyList()
+            } catch (e: Exception) {
+                NativeLog.emit("[bridge] ⚠️  listInstalledAppEntries: ${e.message}")
+                emptyList()
+            }
+        }
+
     // ── diagnostics ────────────────────────────────────────────────────────────
     fun diagnostics(): String = try {
         nativeDiagnostics() ?: "(diagnostics không khả dụng ở mode này)"
@@ -364,6 +405,8 @@ class NativeBridge(private val context: Context) {
     private external fun nativeGetUdid(): String?
     private external fun nativeIsPaired(): Boolean
     private external fun nativeGetPairingPlist(): String?
+    private external fun nativeGetPairingFile(): String?
+    private external fun nativeWritePairingFileToApp(bundleId: String, relPath: String): Boolean
     private external fun nativeReset()
     private external fun nativeIsConnected(): Boolean
     private external fun nativeGetConnectionState(): Int

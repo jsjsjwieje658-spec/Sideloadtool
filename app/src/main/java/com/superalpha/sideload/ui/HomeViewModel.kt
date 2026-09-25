@@ -39,6 +39,24 @@ import kotlinx.coroutines.launch
  * 5. [SideloadScreen] PythonBridge.sideload → DeviceNative.connectAndPair() + Apple API
  * 6. nativeSideload → AFC push + instproxy
  */
+/**
+ * v56: app cần file ghép nối sau khi cài — học từ iLoader
+ * (github.com/nab138/iloader, src/pairing.rs PAIRING_APPS).
+ * Tên app → đường dẫn file TƯƠNG ĐỐI từ gốc Documents của app.
+ */
+private val PAIRING_APP_PATHS = listOf(
+    "SideStore" to "ALTPairingFile.mobiledevicepairing",
+    "LiveContainer" to "SideStore/Documents/ALTPairingFile.mobiledevicepairing",
+    "Feather" to "pairingFile.plist",
+    "StikDebug" to "pairingFile.plist",
+    "StikTest" to "stiktest_pairing.plist",
+    "SparseBox" to "pairingFile.plist",
+    "StikStore" to "pairingFile.plist",
+    "ByeTunes" to "pairing file/pairingFile.plist",
+    "Reynard" to "pairingFile.plist",
+    "PanicAnalyzer" to "pairingFile.plist",
+)
+
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     /*
@@ -201,6 +219,72 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _anisetteServers.value = PythonBridge.listAnisetteServers()
             _anisetteServersLoading.value = false
+        }
+    }
+
+    // ── v56: Quản lý file ghép nối (.mobiledevicepairing) ────────────────────
+
+    /** App đã cài trên iPhone cần file ghép nối (kết quả "Quét app"). */
+    data class PairingAppInfo(val displayName: String, val bundleId: String, val relPath: String)
+
+    private val _autoEmbedPairing = MutableStateFlow(AppConfig.autoEmbedPairing)
+    val autoEmbedPairing: StateFlow<Boolean> = _autoEmbedPairing
+
+    private val _pairingFileReady = MutableStateFlow(false)
+    val pairingFileReady: StateFlow<Boolean> = _pairingFileReady
+
+    private val _pairingApps = MutableStateFlow<List<PairingAppInfo>>(emptyList())
+    val pairingApps: StateFlow<List<PairingAppInfo>> = _pairingApps
+
+    fun setAutoEmbedPairing(v: Boolean) {
+        _autoEmbedPairing.value = v
+        AppConfig.autoEmbedPairing = v
+    }
+
+    /**
+     * Làm mới trạng thái file ghép nối: có pair record không + quét các app
+     * đã cài cần file ghép nối (SideStore/LiveContainer…).
+     */
+    fun refreshPairingState() {
+        viewModelScope.launch {
+            _pairingFileReady.value = nativeBridge.getPairingFile() != null
+            val entries = nativeBridge.listInstalledAppEntries()
+            _pairingApps.value = matchPairingApps(entries)
+        }
+    }
+
+    /** Ghép app đã cài với đường dẫn file ghép nối tương ứng (bảng iLoader). */
+    private fun matchPairingApps(entries: List<Pair<String, String>>): List<PairingAppInfo> {
+        val result = ArrayList<PairingAppInfo>(4)
+        for ((name, rel) in PAIRING_APP_PATHS) {
+            val hit = entries.firstOrNull { (bundleId, displayName) ->
+                displayName.equals(name, ignoreCase = true) ||
+                        bundleId.contains(name, ignoreCase = true)
+            } ?: continue
+            // Bảng sắp xếp SideStore trước — nếu display name trùng tên khác
+            // (bundle id không chứa tên) thì vẫn ưu tiên khớp bundle id.
+            val byBundle = entries.firstOrNull { (bundleId, _) ->
+                bundleId.contains(name, ignoreCase = true)
+            }
+            val chosen = byBundle ?: hit
+            result.add(PairingAppInfo(name, chosen.first, rel))
+        }
+        return result
+    }
+
+    /** Ghi file ghép nối vào MỘT app đã cài (nút "Nhúng" trong tab mới). */
+    fun embedPairingNow(bundleId: String, relPath: String) {
+        if (_busy.value) {
+            NativeLog.emit("[pairing] ⏳ Đang bận — thử lại sau.")
+            return
+        }
+        viewModelScope.launch {
+            setBusy(true)
+            setBusyText("Đang ghi file ghép nối…")
+            NativeLog.emit("[pairing] Ghi file ghép nối vào $bundleId …")
+            val ok = nativeBridge.writePairingFileToApp(bundleId, relPath)
+            if (!ok) NativeLog.emit("[pairing] ❌ Không nhúng được — xem nhật ký phía trên.")
+            setBusy(false)
         }
     }
 

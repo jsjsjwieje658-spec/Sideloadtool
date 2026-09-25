@@ -39,6 +39,7 @@
 #include <libimobiledevice/lockdown.h>
 #include <libimobiledevice/afc.h>
 #include <libimobiledevice/installation_proxy.h>
+#include <libimobiledevice/house_arrest.h>
 #include <usbmuxd.h>
 #include <plist/plist.h>
 
@@ -794,6 +795,176 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingPlist(JNIEnv *e
     jstring r = (*env)->NewStringUTF(env, z);
     free(z);
     return r;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * v56 — Quản lý file ghép nối (.mobiledevicepairing) cho SideStore /
+ * LiveContainer… (học từ iLoader — github.com/nab138/iloader, src/pairing.rs)
+ *
+ * Định dạng file: XML plist của pair record HIỆN CÓ (SystemBUID, HostID,
+ * RootCertificate, RootPrivateKey, DeviceCertificate…) + khóa UDID của máy
+ * (iLoader: pairing_file.udid = udid) — đúng định dạng AltStore/SideStore
+ * dùng (ALTPairingFile.mobiledevicepairing).
+ *
+ * Nhúng vào app đã cài: house_arrest → VendDocuments(bundle_id) → AFC ghi
+ * file vào Documents của app (iLoader place_file()).
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static char *build_pairing_file_xml(uint32_t *out_len) {
+    if (!is_real_udid(g_udid)) return NULL;
+    char *data = NULL;
+    uint32_t size = 0;
+    if (usbmuxd_read_pair_record(g_udid, &data, &size) != 0 || !data || !size) {
+        free(data);
+        return NULL;
+    }
+    plist_t pl = NULL;
+    plist_format_t fmt = PLIST_FORMAT_XML;
+    if (plist_from_memory(data, size, &pl, &fmt) != PLIST_ERR_SUCCESS || !pl) {
+        free(data);
+        return NULL;
+    }
+    free(data);
+    if (plist_dict_get_item(pl, "UDID") == NULL) {
+        plist_dict_set_item(pl, "UDID", plist_new_string(g_udid));
+    }
+    char *xml = NULL;
+    uint32_t len = 0;
+    if (plist_to_xml(pl, &xml, &len) != PLIST_ERR_SUCCESS || !xml) {
+        plist_free(pl);
+        return NULL;
+    }
+    plist_free(pl);
+    if (out_len) *out_len = len;
+    return xml;
+}
+
+/* Nội dung file ghép nối hiện tại (XML plist + UDID) — cho nút Xuất file. */
+JNIEXPORT jstring JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFile(JNIEnv *env, jobject obj) {
+    (void)obj;
+    char *xml = build_pairing_file_xml(NULL);
+    if (!xml) return NULL;
+    jstring r = (*env)->NewStringUTF(env, xml);
+    free(xml);
+    return r;
+}
+
+/*
+ * Ghi file ghép nối vào Documents của một app ĐÃ CÀI (SideStore,
+ * LiveContainer…). rel_path tính từ gốc Documents của app, vd:
+ *   SideStore            → "ALTPairingFile.mobiledevicepairing"
+ *   LiveContainer        → "SideStore/Documents/ALTPairingFile.mobiledevicepairing"
+ * Gọi sau khi instproxy_install thành công, khi app đã chịu chữ ký
+ * development (house_arrest chỉ hoạt động với app development-signed).
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
+        JNIEnv *env, jobject obj, jstring j_bundle, jstring j_rel) {
+    (void)obj;
+    const char *bundle = j_bundle ? (*env)->GetStringUTFChars(env, j_bundle, NULL) : NULL;
+    const char *rel    = j_rel    ? (*env)->GetStringUTFChars(env, j_rel, NULL)    : NULL;
+    jboolean ok = JNI_FALSE;
+    house_arrest_client_t ha = NULL;
+    afc_client_t afc = NULL;
+    char *xml = NULL;
+
+    pthread_mutex_lock(&g_api);
+    do {
+        if (!bundle || !rel || !*bundle || !*rel) {
+            emit_log("[pairing] ❌ Thiếu bundle id / đường dẫn file");
+            break;
+        }
+        if (!g_device || !g_paired) {
+            emit_log("[pairing] ❌ iPhone chưa kết nối / chưa ghép nối");
+            break;
+        }
+        xml = build_pairing_file_xml(NULL);
+        if (!xml) {
+            emit_log("[pairing] ❌ Chưa có pair record — ghép nối iPhone trước");
+            break;
+        }
+
+        house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
+        if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
+            emitf("[pairing] ❌ Không mở được house_arrest (lỗi %d)", (int)he);
+            break;
+        }
+
+        he = house_arrest_send_command(ha, "VendDocuments", bundle);
+        plist_t res = NULL;
+        if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
+        if (he == HOUSE_ARREST_E_SUCCESS && res) {
+            plist_t err_item = plist_dict_get_item(res, "Error");
+            if (err_item) {
+                char *es = NULL;
+                plist_get_string_val(err_item, &es);
+                emitf("[pairing] ❌ iPhone từ chối truy cập Documents của %s (%s)",
+                      bundle, es ? es : "?");
+                free(es);
+                he = HOUSE_ARREST_E_UNKNOWN_ERROR;
+            }
+        }
+        if (res) plist_free(res);
+        if (he != HOUSE_ARREST_E_SUCCESS) {
+            emitf("[pairing] ❌ VendDocuments(%s) thất bại (lỗi %d)", bundle, (int)he);
+            break;
+        }
+
+        if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
+            emit_log("[pairing] ❌ Không chuyển sang chế độ AFC được");
+            break;
+        }
+
+        /* Tạo thư mục cha nếu rel_path có dạng "a/b/file" (bỏ qua lỗi đã tồn tại) */
+        char dirs[512];
+        snprintf(dirs, sizeof(dirs), "/%s", rel);
+        for (char *p = dirs + 1; *p; p++) {
+            if (*p == '/') {
+                *p = 0;
+                afc_make_directory(afc, dirs);
+                *p = '/';
+            }
+        }
+
+        char remote[512];
+        snprintf(remote, sizeof(remote), "/%s", rel);
+        uint64_t handle = 0;
+        if (afc_file_open(afc, remote, AFC_FOPEN_WRONLY, &handle) != AFC_E_SUCCESS || !handle) {
+            emitf("[pairing] ❌ afc_file_open(%s) thất bại", remote);
+            break;
+        }
+        uint32_t total = (uint32_t)strlen(xml);
+        uint32_t done = 0;
+        bool werr = false;
+        while (done < total) {
+            uint32_t w = 0;
+            if (afc_file_write(afc, handle, xml + done, total - done, &w) != AFC_E_SUCCESS || w == 0) {
+                emit_log("[pairing] ❌ afc_file_write thất bại");
+                werr = true;
+                break;
+            }
+            done += w;
+        }
+        afc_file_close(afc, handle);
+        if (!werr && done == total) {
+            emitf("[pairing] ✅ Đã ghi file ghép nối vào Documents của %s", bundle);
+            ok = JNI_TRUE;
+        }
+    } while (0);
+
+    /*
+     * LƯU Ý QUAN TRỌNG (tránh double-free): afc_client được tạo từ house_arrest
+     * DÙNG CHUNG service connection với house_arrest client. Chỉ được free
+     * MỘT trong hai — ở đây free house_arrest (sạch chuỗi service + connection).
+     * Struct afc (~vài chục byte) không free — chấp nhận cho lần gọi hiếm.
+     */
+    if (ha) house_arrest_client_free(ha);
+    free(xml);
+    pthread_mutex_unlock(&g_api);
+    if (bundle) (*env)->ReleaseStringUTFChars(env, j_bundle, bundle);
+    if (rel) (*env)->ReleaseStringUTFChars(env, j_rel, rel);
+    return ok;
 }
 
 JNIEXPORT void JNICALL
