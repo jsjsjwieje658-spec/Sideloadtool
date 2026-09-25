@@ -23,29 +23,29 @@ object DeviceNative {
     @Volatile private var bridge: NativeBridge? = null
 
     /**
-     * Gọi từ SuperAlphaApp.onCreate() — khởi tạo bridge singleton.
-     * Idempotent: gọi nhiều lần không tạo thêm instance.
+     * Gọi từ SuperAlphaApp (v52: trên THREAD NỀN ngay sau frame đầu) — khởi
+     * tạo bridge singleton. Idempotent: gọi nhiều lần không tạo thêm instance.
      */
     fun init(context: Context) {
-        if (bridge == null) {
-            synchronized(this) {
-                if (bridge == null) {
-                    bridge = NativeBridge(context.applicationContext)
-                    bridge!!.init()
-                }
-            }
-        }
+        getBridge(context.applicationContext)
     }
 
     /**
      * FIX v21: Expose bridge cho HomeViewModel để dùng chung.
-     * Nếu chưa init (không nên xảy ra), tạo mới với applicationContext.
+     *
+     * v52:race-safe — trước đây nhánh fallback `bridge ?: run { ... }` KHÔNG
+     * nằm trong synchronized: nếu thread nền đang init mà main thread gọi
+     * getBridge() cùng lúc, CÓ THỂ tạo HAI NativeBridge → nativeInit() hai
+     * lần → reset global state của C (đúng bug v21 từng sửa). Nay mọi đường
+     * tạo instance đều đi qua một khối synchronized duy nhất (double-check).
      */
     fun getBridge(context: Context? = null): NativeBridge {
-        return bridge ?: run {
-            val ctx = context?.applicationContext
-                ?: throw IllegalStateException("DeviceNative chưa được init — gọi init(context) trước")
-            NativeBridge(ctx).also {
+        bridge?.let { return it }
+        return synchronized(this) {
+            bridge ?: NativeBridge(
+                context?.applicationContext
+                    ?: throw IllegalStateException("DeviceNative chưa được init — gọi init(context) trước")
+            ).also {
                 it.init()
                 bridge = it
             }

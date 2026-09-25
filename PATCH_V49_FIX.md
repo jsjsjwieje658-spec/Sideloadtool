@@ -180,3 +180,21 @@ Nếu vẫn lỗi, gửi các dòng `[usb]`, `[usbmux]`, `[lockdown]`/`[pair]`, 
    không phải bấm Tin cậy lại.
 3. Nâng cấp từ v50/v50.1: cài đè trực tiếp (cùng chữ ký); lần đầu mở v51 sẽ hiện màn
    đăng nhập (v50 chưa lưu mật khẩu).
+
+
+---
+
+# SideloadTool Patch v52 — Khởi động nhanh (hết màn đen 0.5 s) + mượt hơn
+
+*2026-09-25*
+
+## 14. Thay đổi
+
+| # | Vấn đề | Sửa |
+|---|---|---|
+| 28 | **Mở app bị "màn đen ~0.5 s rồi mới vào"**: `SuperAlphaApp.onCreate()` chạy `Python.start(AndroidPlatform)` (Chaquopy: 300–800 ms — giải nén bootstrap + load libpython + init interpreter) và `DeviceNative.init()` (loadLibrary 5.5 MB + nativeInit + usbmuxd threads) **ngay trên main thread** trước khi frame đầu tiên vẽ xong; trong lúc chờ, cửa sổ hiện `windowBackground` màu gần đen (#0B0F14). | **Defer sang thread nền**: hai việc nặng chạy song song với frame đầu (appScope + Dispatchers.IO), UI hiện gần như tức thì. Action đầu cần Python/bridge (`ensurePython()` / `getBridge()`) có lock — warm-up chưa xong thì chờ tối đa vài trăm ms. `DeviceNative.getBridge()` làm race-safe (mọi đường tạo instance trong cùng một khối synchronized — giữ nguyên fix v21 một-bridge-một-nativeInit). `HomeViewModel.nativeBridge` chuyển `by lazy` để constructor không chờ. |
+| 29 | Màn chờ cold start màu đen trơn → cảm giác app chậm dù tổng thời gian ổn. | **Splash đúng thương hiệu**: API 26–30 windowBackground = layer-list (nền #101823 — đúng màu đỉnh gradient của app + logo giữa màn); API 31+ dùng splash hệ thống (`windowSplashScreenBackground`) cùng màu. Màu status/navigation bar khớp luôn → chuyển tiếp mượt, không còn "nháy đen". |
+
+*Ghi chú: nếu bạn vẫn thấy "hơi lag khi dùng" — kiểm tra lại đang cài artifact
+`superalpha-sideload-release` (R8) chứ không phải `-debug`; bản debug của
+Compose chậm hơn rõ rệt.*

@@ -24,6 +24,11 @@ object AppPaths {
         appContext = context.applicationContext
     }
 
+    /** v52: Context ứng dụng — PythonBridge.ensurePython() dùng khi cần khởi
+     * động Chaquopy mà caller không có sẵn context. */
+    @JvmStatic
+    fun context(): Context = appContext
+
     /** App-private persistent storage directory, e.g. /data/data/<pkg>/files */
     @JvmStatic
     fun filesDir(): String = appContext.filesDir.absolutePath

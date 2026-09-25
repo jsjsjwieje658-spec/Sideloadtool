@@ -4,8 +4,8 @@
          needs to exist so the manifest has a valid android:theme before Compose sets
          its own content, and to control the splash/launch background. -->
     <style name="Theme.SuperAlphaSideload" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@color/brand_background</item>
-        <item name="android:statusBarColor">@color/brand_background</item>
-        <item name="android:navigationBarColor">@color/brand_background</item>
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:statusBarColor">@color/brand_splash_bg</item>
+        <item name="android:navigationBarColor">@color/brand_splash_bg</item>
     </style>
 </resources>

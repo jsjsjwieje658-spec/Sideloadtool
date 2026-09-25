@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v52 (API 31+): Android 12+ tự hiện splash hệ thống với icon app — chỉ cần
+     đặt đúng màu nền splash = màu đỉnh gradient của app để chuyển tiếp mượt.
+     windowBackground giữ màu phẳng (không dùng layer-list logo) tránh hiện
+     logo hai lần (splash hệ thống đã có icon rồi). -->
+<resources>
+    <style name="Theme.SuperAlphaSideload" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_splash_bg</item>
+        <item name="android:statusBarColor">@color/brand_splash_bg</item>
+        <item name="android:navigationBarColor">@color/brand_splash_bg</item>
+        <item name="android:windowSplashScreenBackground">@color/brand_splash_bg</item>
+    </style>
+</resources>

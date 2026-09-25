@@ -1,7 +1,10 @@
 package com.superalpha.sideload.python
 
+import android.content.Context
 import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 import com.superalpha.sideload.bridge.AppConfig
+import com.superalpha.sideload.bridge.AppPaths
 import com.superalpha.sideload.bridge.NativeLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -22,6 +25,25 @@ object PythonBridge {
     data class Outcome(val success: Boolean, val message: String)
 
     private val httpClient by lazy { OkHttpClient() }
+
+    /*
+     * v52: Python runtime (Chaquopy) không còn được khởi động trên main thread
+     * trong SuperAlphaApp.onCreate() (nguyên nhân "0.5 s màn đen" trước khi
+     * UI hiện). App chỉ warm-up trên thread nền; action đầu tiên cần Python
+     * gọi ensurePython() — double-checked locking, chờ tới khi xong.
+     */
+    private val pythonLock = Any()
+
+    /** Khởi động Chaquopy nếu chưa — an toàn gọi từ nhiều luồng. */
+    fun ensurePython(context: Context? = null) {
+        if (Python.isStarted()) return
+        synchronized(pythonLock) {
+            if (Python.isStarted()) return
+            val ctx = context?.applicationContext ?: AppPaths.context()
+            NativeLog.emit("[python] Đang khởi động Python runtime...")
+            Python.start(AndroidPlatform(ctx))
+        }
+    }
 
     fun getSavedAppleId(): String = AppConfig.appleId
     fun saveAppleId(v: String) { AppConfig.appleId = v }
@@ -59,6 +81,7 @@ object PythonBridge {
         certSelector: String
     ): Outcome = withContext(Dispatchers.IO) {
         try {
+            ensurePython()
             NativeLog.emit("[python] Đang đăng nhập & tra cứu chứng chỉ...")
             val core = pythonModule("sideload_core")
             AppConfig.appleId = appleId
@@ -89,6 +112,7 @@ object PythonBridge {
         anisetteUrl: String?
     ): Outcome = withContext(Dispatchers.IO) {
         try {
+            ensurePython()
             NativeLog.emit("[python] Bắt đầu quá trình ký và cài đặt IPA...")
             val core = pythonModule("sideload_core")
             AppConfig.appleId = appleId
@@ -121,6 +145,7 @@ object PythonBridge {
         anisetteUrl: String?
     ): Outcome = withContext(Dispatchers.IO) {
         try {
+            ensurePython()
             NativeLog.emit("[python] Đang đăng ký UDID thiết bị...")
             val core = pythonModule("sideload_core")
             AppConfig.appleId = appleId
@@ -152,6 +177,7 @@ object PythonBridge {
         anisetteUrl: String?
     ): Outcome = withContext(Dispatchers.IO) {
         try {
+            ensurePython()
             NativeLog.emit("[python] Đang xác thực Apple ID...")
             val core = pythonModule("sideload_core")
             val effectiveAnisetteUrl = anisetteUrl?.takeIf { it.isNotBlank() } ?: ""

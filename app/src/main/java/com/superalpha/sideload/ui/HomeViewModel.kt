@@ -15,6 +15,7 @@ import com.superalpha.sideload.bridge.UsbTransport
 import com.superalpha.sideload.python.PythonBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
@@ -40,7 +41,13 @@ import kotlinx.coroutines.launch
  */
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
-    val nativeBridge: NativeBridge = DeviceNative.getBridge(app)
+    /*
+     * FIX v21: dùng DeviceNative.getBridge() — MỘT bridge singleton duy nhất.
+     * v52: `by lazy` — không chặn main thread lúc tạo ViewModel (native đang
+     * được init trên thread nền ngay sau frame đầu). Lazy mặc định đồng bộ,
+     * getBridge() đã race-safe → vẫn đúng một instance, đúng một nativeInit().
+     */
+    val nativeBridge: NativeBridge by lazy { DeviceNative.getBridge(app) }
 
     private val _usbConnected = MutableStateFlow(false)
     val usbConnected: StateFlow<Boolean> = _usbConnected
@@ -88,7 +95,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 if (!connected) UsbReconnectManager.notifyDisconnected()
             }
         }
-        UsbReconnectManager.start(getApplication(), nativeBridge)
+        // v52: start() cần tham chiếu bridge (lazy) — resolves trên IO để
+        // constructor ViewModel không bao giờ phải chờ native init.
+        viewModelScope.launch(Dispatchers.IO) {
+            UsbReconnectManager.start(getApplication(), nativeBridge)
+        }
     }
 
     fun setBusy(v: Boolean) {
