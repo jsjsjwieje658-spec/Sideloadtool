@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- v52: Màn splash thay cho "màn đen" khi cold start (API 26–30).
-     Nền đúng màu đỉnh gradient của app (#101823) + logo trung tâm → cảm giác
-     chuyển thẳng vào app thay vì bị nháy đen. API 31+ dùng values-v31. -->
+     v54: dùng logo mới (app_logo.png — ảnh thật, bo góc, nền trong suốt)
+     trên nền màu đỉnh gradient của app. API 31+ dùng values-v31. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/brand_splash_bg" />
     <item
-        android:drawable="@drawable/ic_launcher_foreground"
+        android:drawable="@drawable/app_logo"
         android:gravity="center"
         android:width="88dp"
         android:height="88dp" />

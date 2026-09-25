@@ -29,15 +29,21 @@ import androidx.compose.ui.unit.sp
  * ════════════════════════════════════════════════════════════════════════
  */
 
+/*
+ * v54 — Bảng màu mới theo LOGO: phân tích ảnh logo (1024×1024) cho 2 màu
+ * chủ đạo: xanh dương #1E6BA5 (hue 206°) và xanh mint #5EBA93 (hue 155°),
+ * nền logo sáng #EBEBEB. UI giữ nền dark đặc trưng của app, đổi màu nhấn
+ * từ vàng cũ sang XANH LOGO.
+ */
 val BrandBackground  = Color(0xFF0A0E13)   // nền sâu nhất (status bar/nav bar)
 val BrandSurface     = Color(0xFF121A23)   // thẻ, surface chính
 val BrandSurfaceAlt  = Color(0xFF18222D)   // surface nhấn/highlight
 val BrandOutline     = Color(0xFF2A3947)   // viền
-val BrandPrimary     = Color(0xFFF5C542)   // vàng Super Alpha
-val BrandPrimaryDeep = Color(0xFFE2A62F)   // vàng đậm — gradient nút chính
-val BrandPrimaryDark = Color(0xFFC79A1E)   // (giữ tên cũ)
-val BrandAccent      = Color(0xFF3DDC97)   // mint — USB / thành công
-val BrandInfo        = Color(0xFF57A8FF)   // xanh dương — tiến trình / log hệ thống
+val BrandPrimary     = Color(0xFF3E8FD0)   // xanh logo (sáng hơn #1E6BA5 để nổi trên nền dark)
+val BrandPrimaryDeep = Color(0xFF1E6BA5)   // xanh logo gốc — cuối gradient nút chính
+val BrandPrimaryDark = Color(0xFF1E6BA5)   // (giữ tên cũ) = xanh logo gốc
+val BrandAccent      = Color(0xFF5EBA93)   // mint logo — USB / thành công
+val BrandInfo        = Color(0xFF7CC0F0)   // xanh nhạt — tiến trình / log hệ thống
 val BrandWarn        = Color(0xFFFFB224)   // cam — cảnh báo / chờ Trust
 val BrandDanger      = Color(0xFFFF5C5C)   // đỏ — lỗi
 val BrandText        = Color(0xFFEAF0F6)
@@ -45,9 +51,9 @@ val BrandTextDim     = Color(0xFF8A97A5)
 
 private val DarkColors = darkColorScheme(
     primary = BrandPrimary,
-    onPrimary = Color(0xFF231B04),
-    primaryContainer = Color(0xFF3A300E),
-    onPrimaryContainer = Color(0xFFF6D878),
+    onPrimary = Color(0xFFFFFFFF),
+    primaryContainer = Color(0xFF143A5A),
+    onPrimaryContainer = Color(0xFFA5CDF2),
     secondary = BrandAccent,
     onSecondary = Color(0xFF06281B),
     secondaryContainer = Color(0xFF123B2B),
