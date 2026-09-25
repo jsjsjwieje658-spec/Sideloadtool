@@ -54,7 +54,26 @@
 #define PAIR_TIMEOUT_MS     (150 * 1000)
 #define MUX_READY_TIMEOUT   14000
 #define INSTALL_TIMEOUT_MS  (15 * 60 * 1000)
-#define AFC_CHUNK           (1024 * 1024)
+/*
+ * v50.1 (fix lỗi "afc_file_write lỗi 30 sau 0 byte"):
+ *
+ * AFC_CHUNK phải NHỎ HƠN buffer socket unix (~208 KB mặc định, có thể thấp
+ * hơn trên một số máy). Lý do: libusbmuxd 2.0.2 để socket client ở chế độ
+ * O_NONBLOCK và usbmuxd_send() chỉ gọi MỘT syscall send() duy nhất — không
+ * loop, không chia nhỏ. Nếu afc_file_write() nhận length lớn hơn buffer
+ * socket thì send() ghi ĐỀN GÓI (~200 KB) và libusbmuxd chỉ in warning
+ * "Did not send enough"; iPhone nhận gói AFC cụt (header vẫn khai toàn bộ
+ * chiều dài), chờ phần còn lại mãi → không có reply → afc_receive_data()
+ * timeout → AFC_E_MUX_ERROR (30). Đây chính là lỗi cài SideStore.ipa fail
+ * ngay byte đầu tiên.
+ *
+ * 32 KB là an toàn: mỗi afc_file_write() (libimobiledevice 1.3.0) chờ reply
+ * của chính nó trước khi trả về, nên giữa hai lần ghi socket đã được server
+ * drain sạch → lần send() kế tiếp luôn có toàn bộ buffer trống. Tốc độ:
+ * 26 MB ≈ 850 vòng lặp (mỗi vòng 1 RTT qua USB) ≈ 2–4 giây.
+ * (ideviceinstaller upstream dùng 8 KB — cùng nguyên tắc.)
+ */
+#define AFC_CHUNK           (32 * 1024)
 
 /* ── Trạng thái ─────────────────────────────────────────────────────────── */
 static pthread_mutex_t    g_api = PTHREAD_MUTEX_INITIALIZER;

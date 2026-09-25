@@ -148,3 +148,11 @@ Nếu vẫn lỗi, gửi các dòng `[usb]`, `[usbmux]`, `[lockdown]`/`[pair]`, 
    lại một lần. Máy đã từng đăng ký UDID vào team Apple thì không cần làm lại.
 3. Luồng sử dụng mới: cắm cáp → thẻ iPhone hiện "sẵn sàng" → chọn IPA → nhập
    Apple ID + mật khẩu → "Ký & Cài đặt". Mọi bước ghép nối/đăng ký UDID tự chạy.
+
+## 11. v50.1 — Sửa "Không cài được IPA: [afc] afc_file_write lỗi 30 sau 0 byte"
+
+| # | Lỗi | Sửa |
+|---|---|---|
+| 25 | **Bước 5/5 thất bại ngay byte đầu**: `afc_file_write` trả `AFC_E_MUX_ERROR (30)`. Nguyên nhân: `AFC_CHUNK` cũ = **1 MB** một lần gọi. libusbmuxd 2.0.2 để socket O_NONBLOCK và `usbmuxd_send()` chỉ làm MỘT syscall `send()` không loop — gói 1 MB bị ghi **đền gói ~200 KB** (buffer socket unix); iPhone nhận gói AFC cụt theo `entire_length` → chờ mãn phần còn lại → không reply → `afc_receive_data()` timeout → lỗi 30. Lỗi có từ v49 (lần đầu test cài thật trên máy — các lần trước chỉ tới connect/pair/UDID với gói nhỏ). | `AFC_CHUNK` = **32 KB**. Mỗi `afc_file_write()` đã chờ reply của chính nó (libimobiledevice 1.3.0) nên socket luôn drain sạch giữa 2 lần ghi — 32 KB vừa buffer mọi máy, 26 MB ≈ 850 vòng ≈ 2–4 s. Tầng usbmuxd/USB giữ nguyên (`usb_bridge_bulk_write` vốn loop + ZLP). |
+
+*2026-09-25 (v50.1)*
