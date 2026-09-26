@@ -393,6 +393,59 @@ def _remember_app_id(state, team_id, base_bundle, ident, app_id):
     _save_state(state)
 
 
+def _find_prefix_pair_app_ids(app_ids, installed, needed_children):
+    """(v66) Tìm CẶP App ID cha-con ĐỀU TRỐNG để tái dùng cho app chính + extension.
+
+    iOS luôn bắt buộc bundle id extension = '<bundle id app chính>.<hậu tố>'
+    (installd: "does not match required prefix ... for parent" — IXErrorDomain,
+    xem SideStore issue #488), nên khi hết lượt tạo, cách tái dùng hợp lệ duy nhất
+    là: cha (app chính) + đủ con (mỗi extension 1 con, tiền tố '<cha>.') cùng
+    KHÔNG bị app nào đang cài trên máy chiếm.
+    → (parent_app_id, [child_app_id...]) hoặc (None, []).
+    """
+    by_ident = {}
+    for a in app_ids or []:
+        ident = _app_id_identifier(a)
+        if ident and "*" not in ident and ident not in by_ident:
+            by_ident[ident] = a
+    free = [i for i in by_ident if not _app_id_occupied_by_device(i, installed)]
+    for parent in free:
+        children = [i for i in free if i.startswith(parent + ".")]
+        if len(children) >= needed_children:
+            return by_ident[parent], [by_ident[c] for c in children[:needed_children]]
+    return None, []
+
+
+def _print_app_id_inventory(app_ids, installed):
+    """(v66) In danh sách App ID: trống / bị app nào chiếm / wildcard + các cặp cha-con."""
+    occ = set(installed or [])
+    print("[appid] Các App ID hiện có trên tài khoản:")
+    for a in app_ids or []:
+        ident = _app_id_identifier(a)
+        if not ident:
+            continue
+        if "*" in ident:
+            print(f"[appid]   • {ident} (wildcard)")
+        elif ident in occ:
+            print(f"[appid]   • {ident} — bị app cùng bundle id đang cài trên máy chiếm")
+        else:
+            print(f"[appid]   • {ident} — trống")
+    idents = [(_app_id_identifier(a) or "") for a in (app_ids or [])]
+    pairs = [(p, c) for p in idents for c in idents
+             if p and c and c != p and "*" not in p and "*" not in c and c.startswith(p + ".")]
+    if pairs:
+        print("[appid] Cặp cha-con (app chính → extension) đang có trên tài khoản:")
+        for pp, cc in pairs:
+            free_p, free_c = pp not in occ, cc not in occ
+            if free_p and free_c:
+                note = "CẢ HAI TRỐNG — tool sẽ tự dùng"
+            else:
+                note = ("cần xoá app đang chiếm KHỎI IPHONE (giữ nguyên App ID trên trang "
+                        "developer) để tool tự dùng")
+            print(f"[appid]   • {pp} → {cc} ({'trống' if free_p else 'bị chiếm'} / "
+                  f"{'trống' if free_c else 'bị chiếm'}; {note})")
+
+
 def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
     """→ (app_id_dict, final_identifier) hoặc (None, None)."""
     remembered = (state.get("app_id_map") or {}).get(f"{team_id}:{bundle_id}") or {}
@@ -557,35 +610,47 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                     wildcard_mode = True
                     break
             else:
-                # Ưu tiên 2 (v65): TÁI DÙNG App ID trống khác cho extension — giống
-                # tính năng "Customize App Extensions" của SideStore (gán App ID
-                # bất kỳ cho từng extension, đổi bundle id extension cho khớp).
-                # Lưu ý: profile tải cho App ID này khớp ĐÚNG bundle id mới nên
-                # không gặp lỗi 0xe8008017; nếu iOS máy bạn vẫn bắt buộc tiền tố
-                # thì sẽ lỗi lúc cài — khi đó dùng wildcard như hướng dẫn.
-                _used = {t[1] for t in targets}
-                rep_id, rep_app = _choose_replacement_app_id(
-                    app_ids, appex_id, _installed_bundle_ids(), exclude=_used)
-                if rep_id:
-                    print(f"[appid] ♻️  Không tạo được App ID cho extension (giới hạn 10 lượt / 7 "
-                          f"ngày) — tái dùng App ID trống '{rep_id}' cho extension.")
-                    set_extension_bundle_id(appex_path, rep_id)
-                    print(f"[appid]    Đổi bundle id extension: {appex_id} → {rep_id} "
-                          "(kiểu Customize App Extensions của SideStore).")
-                    targets.append((appex_path, rep_id, rep_app))
-                    continue
+                # Ưu tiên 2 (v66): TÁI DÙNG CẶP App ID CHA-CON trống cho app chính +
+                # extension. iOS LUÔN bắt buộc bundle id extension = '<app chính>.<hậu tố>'
+                # — installd từ chối với "does not match required prefix ... for parent"
+                # (IXErrorDomain, xem SideStore issue #488), nên KHÔNG THỂ gán App ID
+                # bất kỳ cho extension: cần cha (app chính) + đủ con (mỗi extension 1
+                # con, tiền tố '<cha>.') cùng không bị app trên máy chiếm.
+                all_exts = list(find_extensions(app_bundle_path))
+                parent_app, child_apps = _find_prefix_pair_app_ids(
+                    app_ids, _installed_bundle_ids(), len(all_exts))
+                if parent_app:
+                    pair_parent = _app_id_identifier(parent_app)
+                    print(f"[appid] ♻️  Hết lượt tạo App ID — tái dùng CẶP App ID cha-con trống: "
+                          f"app chính → '{pair_parent}'.")
+                    set_bundle_id(app_bundle_path, pair_parent)
+                    targets = [(app_bundle_path, pair_parent, parent_app)]
+                    for (epath, _old), child in zip(all_exts, child_apps):
+                        child_id = _app_id_identifier(child)
+                        set_extension_bundle_id(epath, child_id)
+                        print(f"[appid]    Extension {os.path.basename(epath)} → '{child_id}' "
+                              "(có tiền tố app chính ✓).")
+                        targets.append((epath, child_id, child))
+                    _remember_app_id(state, team_id, bundle_id, pair_parent, parent_app)
+                    wildcard_mode = False
+                    break
                 print(f"[appid] ❌ Không đăng ký được App ID cho extension '{appex_id}' (hết lượt "
-                      "10 App ID / 7 ngày), không có wildcard che phủ và không còn App ID trống "
-                      "nào để tái dùng.")
-                print("[appid]    (Xoá App ID trên developer.apple.com KHÔNG trả lại lượt tạo — "
-                      "giới hạn đếm số lượt TẠO trong 7 ngày.)")
+                      "10 App ID / 7 ngày), không có wildcard che phủ và không có CẶP App ID "
+                      "cha-con trống nào để tái dùng.")
+                print("[appid]    iOS bắt buộc bundle id extension = '<app chính>.<hậu tố>' "
+                      "(lỗi 'does not match required prefix' nếu sai) — còn xoá App ID trên "
+                      "developer.apple.com thì KHÔNG trả lại lượt tạo (giới hạn đếm số lượt "
+                      "TẠO trong 7 ngày).")
+                _print_app_id_inventory(app_ids, _installed_bundle_ids())
                 print("[appid]    → Cách xử lý (chọn 1):")
                 print("[appid]      1. Chờ chu kỳ 7 ngày reset lượt tạo App ID, vào "
                       "developer.apple.com → Identifiers → đăng ký App ID WILDCARD "
                       "(nhập '*' hoặc 'com.tenban.*') — từ đó tool không bao giờ thiếu App ID "
                       "cho app + extension nữa.")
-                print("[appid]      2. Cài tạm bản IPA KHÔNG có extension (nếu nơi phát hành có).")
+                print("[appid]      2. Xoá KHỎI IPHONE app đang chiếm một cặp cha-con ở trên "
+                      "(giữ nguyên App ID trên trang developer) → cài lại, tool sẽ tự dùng cặp đó.")
                 print("[appid]      3. Dùng tài khoản Apple ID khác còn lượt tạo App ID.")
+                print("[appid]      4. Cài tạm bản IPA KHÔNG có extension (nếu nơi phát hành có).")
                 return None
             continue
         if final_appex_id != appex_id:

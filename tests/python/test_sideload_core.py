@@ -571,7 +571,7 @@ for bundle_k in (app_dir_k, appex_k):
     check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.*",
           f"profile trong {os.path.basename(bundle_k)} là wildcard toàn team")
 
-print("=== CASE N (v65): hết lượt tạo App ID → extension TÁI DÙNG App ID trống khác ===")
+print("=== CASE N (v66): hết lượt tạo App ID → tái dùng CẶP App ID cha-con trống ===")
 reset_run()
 FakeDevAPI.cert_fail_first = False
 make_jit_ipa(ipa)
@@ -579,30 +579,33 @@ DeviceNative.installed_raw = "com.SideStore.SideStore.sa9b733\ncom.other.App"
 FakeDevAPI.app_id_limit = True
 FakeDevAPI.has_wildcard = False
 FakeDevAPI.extra_app_ids = [
-    {"identifier": "com.old.Uninstalled", "appIdId": "OLD1"},
-    {"identifier": "com.old.Uninstalled2", "appIdId": "OLD2"},
+    {"identifier": "com.old.Uninstalled", "appIdId": "OLD1"},   # mồi: không phải cha của ai
+    {"identifier": "com.old.Pair", "appIdId": "PR1"},           # CHA trống
+    {"identifier": "com.old.Pair.Widget", "appIdId": "PR2"},    # CON trống (tiền tố cha)
     {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},  # bị chiếm
 ]
 ok = core.do_sideload(ipa, "user@example.com", "pw")
-check(ok is True, "cài thành công: app chính + extension đều TÁI DÙNG App ID trống")
+check(ok is True, "cài thành công: tái dùng CẶP App ID cha-con (app chính + extension)")
 dev = FakeDevAPI.instances[-1]
 check(dev.created_ids == [], f"KHÔNG tạo App ID mới nào (không tốn lượt): {dev.created_ids}")
 calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
 app_dir_n = calls[0]["args"][-1] if calls else ""
 with open(os.path.join(app_dir_n, "Info.plist"), "rb") as f:
     n_main = plistlib.load(f)
-check(n_main["CFBundleIdentifier"] == "com.old.Uninstalled",
-      f"app chính tái dùng App ID trống 1: {n_main['CFBundleIdentifier']}")
+check(n_main["CFBundleIdentifier"] == "com.old.Pair",
+      f"app chính bị ĐỔI sang App ID cha trống: {n_main['CFBundleIdentifier']}")
 appex_n = os.path.join(app_dir_n, "PlugIns", "JitterbugTunnel.appex")
 with open(os.path.join(appex_n, "Info.plist"), "rb") as f:
     n_appex = plistlib.load(f)
-check(n_appex["CFBundleIdentifier"] == "com.old.Uninstalled2",
-      f"v65: extension tái dùng App ID trống 2 (đổi bundle id cho khớp profile): {n_appex['CFBundleIdentifier']}")
-check(dev.profiles_for == ["com.old.Uninstalled", "com.old.Uninstalled2"],
-      f"2 profile riêng cho 2 App ID tái dùng: {dev.profiles_for}")
+check(n_appex["CFBundleIdentifier"] == "com.old.Pair.Widget",
+      f"extension dùng App ID con: {n_appex['CFBundleIdentifier']}")
+check(n_appex["CFBundleIdentifier"].startswith(n_main["CFBundleIdentifier"] + "."),
+      "extension = '<app chính>.<hậu tố>' — đúng luật installd (prefix bắt buộc)")
+check(dev.profiles_for == ["com.old.Pair", "com.old.Pair.Widget"],
+      f"2 profile riêng cho cặp cha-con: {dev.profiles_for}")
 ms = [calls[0]["args"][i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
 check(len(ms) == 2, f"2 cờ -m (2 profile khác nhau, không dedupe): {len(ms)}")
-for bundle_n, want_n in ((app_dir_n, "com.old.Uninstalled"), (appex_n, "com.old.Uninstalled2")):
+for bundle_n, want_n in ((app_dir_n, "com.old.Pair"), (appex_n, "com.old.Pair.Widget")):
     with open(os.path.join(bundle_n, "embedded.mobileprovision"), "rb") as f:
         prof_n = plistlib.load(f)
     check(prof_n["Entitlements"]["application-identifier"] == f"{TEAM}.{want_n}",
