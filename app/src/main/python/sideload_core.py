@@ -559,32 +559,38 @@ _TOOL_CERT_PREFIXES = ("ios-sideload-tool", "sideload-")
 # ──────────────────────────────────────────────────────────────────────────────
 
 _PAIRING_APPS = (
-    ("SideStore", "ALTPairingFile.mobiledevicepairing"),
-    ("LiveContainer", "SideStore/Documents/ALTPairingFile.mobiledevicepairing"),
-    ("Feather", "pairingFile.plist"),
-    ("StikDebug", "pairingFile.plist"),
-    ("StikDebug (Sideloaded)", "rp_pairing_file.plist"),
-    ("StikTest", "stiktest_pairing.plist"),
-    ("Protokolle", "pairingFile.plist"),
-    ("Antrag", "pairingFile.plist"),
-    ("SparseBox", "pairingFile.plist"),
-    ("StikStore", "pairingFile.plist"),
-    ("ByeTunes", "pairing file/pairingFile.plist"),
-    ("Reynard", "pairingFile.plist"),
-    ("PanicAnalyzer", "pairingFile.plist"),
+    # SideStore 0.7+ đổi tên file: "PairingFile_Lockdown.plist" (bản cũ dùng
+    # ALTPairingFile.mobiledevicepairing) → ghi CẢ HAI; migration của 0.7 sẽ
+    # tự dọn file legacy. Lưu ý: SideStore 0.7 KHÔNG tự nạp file có sẵn —
+    # người dùng phải chọn file 1 lần duy nhất khi app hỏi (xem hướng dẫn
+    # sau khi nhúng).
+    ("SideStore", ("ALTPairingFile.mobiledevicepairing", "PairingFile_Lockdown.plist")),
+    ("LiveContainer", ("SideStore/Documents/ALTPairingFile.mobiledevicepairing",
+                       "SideStore/Documents/PairingFile_Lockdown.plist")),
+    ("Feather", ("pairingFile.plist",)),
+    ("StikDebug", ("pairingFile.plist",)),
+    ("StikDebug (Sideloaded)", ("rp_pairing_file.plist",)),
+    ("StikTest", ("stiktest_pairing.plist",)),
+    ("Protokolle", ("pairingFile.plist",)),
+    ("Antrag", ("pairingFile.plist",)),
+    ("SparseBox", ("pairingFile.plist",)),
+    ("StikStore", ("pairingFile.plist",)),
+    ("ByeTunes", ("pairing file/pairingFile.plist",)),
+    ("Reynard", ("pairingFile.plist",)),
+    ("PanicAnalyzer", ("pairingFile.plist",)),
 )
 
 
-def _pairing_rel_path_for(app_name: str, bundle_id: str) -> str:
-    """Đường dẫn file ghép nối trong app nếu app này cần (theo tên hoặc bundle
-    id), ngược lại trả chuỗi rỗng."""
+def _pairing_rel_paths_for(app_name: str, bundle_id: str) -> tuple:
+    """Các đường dẫn file ghép nối cần ghi vào app nếu app này cần (theo tên
+    hoặc bundle id), ngược lại trả tuple rỗng."""
     name_l = str(app_name or "").strip().lower()
     bid_l = str(bundle_id or "").lower()
-    for name, rel in _PAIRING_APPS:
+    for name, rels in _PAIRING_APPS:
         nl = name.lower()
         if (name_l and name_l == nl) or (bid_l and nl in bid_l):
-            return rel
-    return ""
+            return rels
+    return ()
 
 
 def _auto_revoke_certs_for_limit(dev_api, state) -> int:
@@ -795,19 +801,28 @@ def do_sideload(
             return False
         print("✅ Cài đặt ứng dụng thành công! (Lần đầu mở app: Cài đặt > Cài đặt chung > "
               "Quản lý VPN & Thiết bị > tin cậy Apple ID của bạn.)")
-        # ── v56: tự động nhúng file ghép nối vào SideStore/LiveContainer… ──
+        # ── v56..v58: tự động nhúng file ghép nối vào SideStore/LiveContainer… ──
         if embed_pairing and targets and targets[0] and targets[0][1]:
-            rel = _pairing_rel_path_for(app_name, targets[0][1])
-            if rel:
+            rels = _pairing_rel_paths_for(app_name, targets[0][1])
+            if rels:
                 print(f"[pairing] Phát hiện {app_name} — tự động ghi file ghép nối vào app...")
+                placed = False
                 try:
                     from com.superalpha.sideload.bridge import DeviceNative
-                    if DeviceNative.writePairingFileToApp(targets[0][1], rel):
-                        print("[pairing] ✅ App dùng ngay pair record này — mở app không cần ghép nối lại.")
-                    else:
-                        print("[pairing] ⚠️ Không nhúng được file ghép nối (cài đặt vẫn thành công).")
+                    for rel in rels:
+                        if DeviceNative.writePairingFileToApp(targets[0][1], rel):
+                            placed = True
                 except Exception as e:
                     print(f"[pairing] ⚠️ Lỗi khi nhúng file ghép nối: {e}")
+                if placed:
+                    print(f"[pairing] ✅ Đã ghi {len(rels)} file ghép nối vào Documents của {app_name}.")
+                    print("[pairing] ℹ️ SideStore 0.7+ KHÔNG tự nạp file có sẵn — kích hoạt 1 lần duy nhất:")
+                    print("[pairing]    1. Mở SideStore → khi hiện hộp thoại chọn file ghép nối → bấm chọn file")
+                    print('[pairing]    2. Chọn "Trên iPhone của tôi" → SideStore → PairingFile_Lockdown.plist')
+                    print("[pairing]    3. Nếu không thấy hộp thoại: Cài đặt → Advanced → Pairing File → Import")
+                    print("[pairing]       rồi chọn file như trên, sau đó KHỞI ĐỘNG LẠI SideStore.")
+                else:
+                    print("[pairing] ⚠️ Không nhúng được file ghép nối (cài đặt vẫn thành công).")
 
         return True
 

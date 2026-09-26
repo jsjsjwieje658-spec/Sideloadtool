@@ -45,19 +45,24 @@ import kotlinx.coroutines.launch
  * Tên app → đường dẫn file TƯƠNG ĐỐI từ gốc Documents của app.
  */
 private val PAIRING_APP_PATHS = listOf(
-    "SideStore" to "ALTPairingFile.mobiledevicepairing",
-    "LiveContainer" to "SideStore/Documents/ALTPairingFile.mobiledevicepairing",
-    "Feather" to "pairingFile.plist",
-    "StikDebug" to "pairingFile.plist",
-    "StikDebug (Sideloaded)" to "rp_pairing_file.plist",
-    "StikTest" to "stiktest_pairing.plist",
-    "Protokolle" to "pairingFile.plist",
-    "Antrag" to "pairingFile.plist",
-    "SparseBox" to "pairingFile.plist",
-    "StikStore" to "pairingFile.plist",
-    "ByeTunes" to "pairing file/pairingFile.plist",
-    "Reynard" to "pairingFile.plist",
-    "PanicAnalyzer" to "pairingFile.plist",
+    // v58: SideStore 0.7+ đổi tên file pairing → ghi CẢ HAI (legacy + mới);
+    // migration của SideStore sẽ tự dọn file legacy.
+    "SideStore" to listOf("ALTPairingFile.mobiledevicepairing", "PairingFile_Lockdown.plist"),
+    "LiveContainer" to listOf(
+        "SideStore/Documents/ALTPairingFile.mobiledevicepairing",
+        "SideStore/Documents/PairingFile_Lockdown.plist"
+    ),
+    "Feather" to listOf("pairingFile.plist"),
+    "StikDebug" to listOf("pairingFile.plist"),
+    "StikDebug (Sideloaded)" to listOf("rp_pairing_file.plist"),
+    "StikTest" to listOf("stiktest_pairing.plist"),
+    "Protokolle" to listOf("pairingFile.plist"),
+    "Antrag" to listOf("pairingFile.plist"),
+    "SparseBox" to listOf("pairingFile.plist"),
+    "StikStore" to listOf("pairingFile.plist"),
+    "ByeTunes" to listOf("pairing file/pairingFile.plist"),
+    "Reynard" to listOf("pairingFile.plist"),
+    "PanicAnalyzer" to listOf("pairingFile.plist"),
 )
 
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
@@ -228,7 +233,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     // ── v56: Quản lý file ghép nối (.mobiledevicepairing) ────────────────────
 
     /** App đã cài trên iPhone cần file ghép nối (kết quả "Quét app"). */
-    data class PairingAppInfo(val displayName: String, val bundleId: String, val relPath: String)
+    data class PairingAppInfo(val displayName: String, val bundleId: String, val paths: List<String>)
 
     private val _autoEmbedPairing = MutableStateFlow(AppConfig.autoEmbedPairing)
     val autoEmbedPairing: StateFlow<Boolean> = _autoEmbedPairing
@@ -270,7 +275,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val seen = HashSet<String>()
         val ids = entries.map { it.first }
         val isExtension = { id: String -> ids.any { other -> other != id && id.startsWith("$other.") } }
-        for ((name, rel) in PAIRING_APP_PATHS) {
+        for ((name, paths) in PAIRING_APP_PATHS) {
             val matches = entries.filter { (bundleId, displayName) ->
                 !isExtension(bundleId) &&
                         (displayName.equals(name, ignoreCase = true) ||
@@ -278,15 +283,19 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             }
             for ((bundleId, displayName) in matches) {
                 if (seen.add(bundleId)) {
-                    result.add(PairingAppInfo(displayName.ifBlank { name }, bundleId, rel))
+                    result.add(PairingAppInfo(displayName.ifBlank { name }, bundleId, paths))
                 }
             }
         }
         return result
     }
 
-    /** Ghi file ghép nối vào MỘT app đã cài (nút "Nhúng" trong tab mới). */
-    fun embedPairingNow(bundleId: String, relPath: String) {
+    /**
+     * Ghi file ghép nối vào MỘT app đã cài (nút "Nhúng" trong tab mới) —
+     * v58: ghi MỌI đường dẫn của app đó (SideStore 0.7+ dùng tên file mới
+     * PairingFile_Lockdown.plist, bản cũ dùng ALTPairingFile.mobiledevicepairing).
+     */
+    fun embedPairingNow(bundleId: String, paths: List<String>) {
         if (_busy.value) {
             NativeLog.emit("[pairing] ⏳ Đang bận — thử lại sau.")
             return
@@ -294,9 +303,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             setBusy(true)
             setBusyText("Đang ghi file ghép nối…")
-            NativeLog.emit("[pairing] Ghi file ghép nối vào $bundleId …")
-            val ok = nativeBridge.writePairingFileToApp(bundleId, relPath)
-            if (!ok) NativeLog.emit("[pairing] ❌ Không nhúng được — xem nhật ký phía trên.")
+            NativeLog.emit("[pairing] Ghi ${paths.size} file ghép nối vào $bundleId …")
+            var placed = false
+            for (rel in paths) {
+                if (nativeBridge.writePairingFileToApp(bundleId, rel)) placed = true
+            }
+            if (placed) {
+                NativeLog.emit("[pairing] ✅ Đã ghi xong — xem hướng dẫn kích hoạt trong tab File ghép nối.")
+            } else {
+                NativeLog.emit("[pairing] ❌ Không nhúng được — xem nhật ký phía trên.")
+            }
             setBusy(false)
         }
     }

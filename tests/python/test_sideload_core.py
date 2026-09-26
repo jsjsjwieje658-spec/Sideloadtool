@@ -319,8 +319,9 @@ if calls:
               f"profile nhúng trong {os.path.basename(bundle)} khớp App ID + có UDID máy")
 check(len(native_calls["sideloadIpa"]) == 1 and native_calls["sideloadIpa"][0].endswith("_signed.ipa"),
       f"cài qua USB đúng file đã ký: {[os.path.basename(p) for p in native_calls['sideloadIpa']]}")
-check(native_calls["embedded"] == [(new_main, "ALTPairingFile.mobiledevicepairing")],
-      f"v56: tự động nhúng file ghép nối vào SideStore sau khi cài: {native_calls['embedded']}")
+check(native_calls["embedded"] == [(new_main, "ALTPairingFile.mobiledevicepairing"),
+                                    (new_main, "PairingFile_Lockdown.plist")],
+      f"v58: nhúng CẢ 2 file ghép nối cho SideStore (legacy + 0.7+): {native_calls['embedded']}")
 
 print("=== CASE B: chạy lại — dùng lại App ID đã chọn, không tạo thêm (không tốn quota) ===")
 native_calls["sideloadIpa"] = []

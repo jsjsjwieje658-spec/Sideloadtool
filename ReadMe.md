@@ -26,9 +26,12 @@ ngay trong một chiếc điện thoại Android.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).
 - **File ghép nối (.mobiledevicepairing)** cho SideStore / LiveContainer…
   (mô hình iLoader): sau khi cài app, tool tự ghi pair record + UDID vào
-  `Documents` của app qua house_arrest/AFC — mở app là dùng được ngay, không
-  cần ghép nối lại. Tab **File ghép nối** còn cho xuất file và nhúng thủ công
-  vào app đã cài.
+  `Documents` của app qua house_arrest/AFC — ghi cả 2 tên file
+  (`ALTPairingFile.mobiledevicepairing` bản cũ và `PairingFile_Lockdown.plist`
+  SideStore 0.7+). Lưu ý SideStore 0.7 không tự nạp file có sẵn: mở SideStore →
+  chọn file khi được hỏi → "Trên iPhone của tôi" → SideStore →
+  `PairingFile_Lockdown.plist` (1 lần duy nhất). Tab **File ghép nối** còn cho
+  xuất file và nhúng thủ công vào app đã cài.
 - Chọn server **Anisette** (tự dò từ `servers.sidestore.io` hoặc nhập tay).
 - Nhật ký thời gian thực từng bước — màu theo mức độ, sao chép được.
 - Tự kết nối lại khi cáp bị rút cắm lại (backoff + retry).

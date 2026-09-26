@@ -173,6 +173,20 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
             }
         }
 
+        // ── Hướng dẫn kích hoạt (v58) ──────────────────────────────────────
+        SectionCard(title = "Kích hoạt trong SideStore (1 lần duy nhất)", icon = Icons.Filled.PhonelinkSetup) {
+            Text(
+                "SideStore 0.7 trở lên KHÔNG tự nạp file ghép nối có sẵn — " +
+                        "sau khi nhúng, làm 1 lần duy nhất:\n" +
+                        "1. Mở SideStore → khi hiện hộp thoại chọn file ghép nối, bấm chọn file\n" +
+                        "2. Chọn \"Trên iPhone của tôi\" → SideStore → PairingFile_Lockdown.plist\n" +
+                        "3. Nếu không thấy hộp thoại: Cài đặt → Advanced → Pairing File → Import, " +
+                        "chọn file như trên rồi KHỞI ĐỘNG LẠI SideStore",
+                style = MaterialTheme.typography.bodySmall,
+                color = BrandTextDim
+            )
+        }
+
         // ── Nhúng vào app đã cài ────────────────────────────────────────────
         SectionCard(title = "Nhúng vào app đã cài", icon = Icons.Filled.Refresh) {
             Text(
@@ -216,15 +230,17 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
                                 color = BrandTextDim,
                                 fontFamily = FontFamily.Monospace
                             )
-                            Text(
-                                "Documents/${app.relPath}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = BrandTextDim
-                            )
+                            app.paths.forEach { path ->
+                                Text(
+                                    "Documents/$path",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = BrandTextDim
+                                )
+                            }
                         }
                         Spacer(Modifier.width(8.dp))
                         Button(
-                            onClick = { viewModel.embedPairingNow(app.bundleId, app.relPath) },
+                            onClick = { viewModel.embedPairingNow(app.bundleId, app.paths) },
                             enabled = pairingFileReady && !busy,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                         ) {
