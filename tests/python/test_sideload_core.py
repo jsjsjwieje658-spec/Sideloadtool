@@ -571,25 +571,50 @@ for bundle_k in (app_dir_k, appex_k):
     check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.*",
           f"profile trong {os.path.basename(bundle_k)} là wildcard toàn team")
 
-print("=== CASE O (v67): cài lại app cũ (App ID nhớ bị CHÍNH app đó chiếm) → CÀI ĐÈ refresh + extension dùng App ID con trống ===")
+print("=== CASE O (v68): app cũ VẪN còn trên máy + hết lượt + không còn App ID trống → DỪNG, KHÔNG cài đè ===")
 reset_run()
 FakeDevAPI.cert_fail_first = False
 make_jit_ipa(ipa)
-# App cũ do tool cài lần trước vẫn đang trên máy — chiếm ĐÚNG bundle id App ID nhớ
+# App cũ (tool cài lần trước, cùng bundle gốc) vẫn đang trên máy — chiếm ĐÚNG bundle id App ID nhớ
 DeviceNative.installed_raw = "com.old.Pair\ncom.other.App"
 FakeDevAPI.app_id_limit = True
 FakeDevAPI.has_wildcard = False
 FakeDevAPI.extra_app_ids = [
-    {"identifier": "com.old.Pair", "appIdId": "PR1"},         # bị chính app cũ (cùng app) chiếm
-    {"identifier": "com.old.Pair.Widget", "appIdId": "PR2"},  # App ID CON trống
-    {"identifier": "com.old.Pair.Widget2", "appIdId": "PR3"}, # con trống thứ 2
+    {"identifier": "com.old.Pair", "appIdId": "PR1"},         # bị app cũ đang cài chiếm
+    {"identifier": "com.old.Pair.Widget", "appIdId": "PR2"},  # slot extension của app cũ → cũng bị coi là chiếm
+    {"identifier": "com.old.Pair.Widget2", "appIdId": "PR3"}, #_slot extension của app cũ → cũng bị coi là chiếm
 ]
 _state_path = os.path.join(WORK, "sideload_state.json")
 with open(_state_path, "w") as f:
     json.dump({"app_id_map": {f"{TEAM}:com.osy86.Jitterbug": {
         "effective_bundle": "com.old.Pair", "app_id_id": "PR1"}}}, f)
 ok = core.do_sideload(ipa, "user@example.com", "pw")
-check(ok is True, "v67: cài lại app cũ → CÀI ĐÈ (refresh) thành công, KHÔNG cần xoá app")
+check(ok is False, "v68: app cũ còn trên máy + hết lượt + hết App ID trống → DỪNG SỚM (không cài đè)")
+check(not os.path.exists(ZSIGN_LOG), "KHÔNG gọi zsign (không ký hụt)")
+check(native_calls["sideloadIpa"] == [], "KHÔNG cài đặt gì (không đè app cũ)")
+dev = FakeDevAPI.instances[-1]
+check(dev.created_ids == [], f"KHÔNG tạo App ID mới: {dev.created_ids}")
+st = json.load(open(_state_path))
+check(f"{TEAM}:com.osy86.Jitterbug" not in st.get("app_id_map", {}),
+      "memory bị xoá (App ID nhớ đang bị chiếm — không dùng lại)")
+
+print("=== CASE O2 (v68): app cũ đã XOÁ khỏi máy → cài lại thành công qua App ID trống (con của cha) ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False
+make_jit_ipa(ipa)
+# App cũ đã xoá khỏi iPhone — chỉ còn app khác
+DeviceNative.installed_raw = "com.other.App"
+FakeDevAPI.app_id_limit = True
+FakeDevAPI.has_wildcard = False
+FakeDevAPI.extra_app_ids = [
+    {"identifier": "com.old.Pair", "appIdId": "PR1"},         # đã trống trở lại (app cũ đã xoá)
+    {"identifier": "com.old.Pair.Widget", "appIdId": "PR2"},  # App ID CON trống
+]
+with open(_state_path, "w") as f:
+    json.dump({"app_id_map": {f"{TEAM}:com.osy86.Jitterbug": {
+        "effective_bundle": "com.old.Pair", "app_id_id": "PR1"}}}, f)
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "v68: app cũ đã xoá → cài lại THÀNH CÔNG bằng App ID trống (không đè ai)")
 dev = FakeDevAPI.instances[-1]
 check(dev.created_ids == [], f"KHÔNG tạo App ID mới (0 lượt): {dev.created_ids}")
 calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
@@ -597,7 +622,7 @@ app_dir_o = calls[0]["args"][-1] if calls else ""
 with open(os.path.join(app_dir_o, "Info.plist"), "rb") as f:
     o_main = plistlib.load(f)
 check(o_main["CFBundleIdentifier"] == "com.old.Pair",
-      f"main GIỮ NGUYÊN bundle id cũ (cài đè tại chỗ, giữ data): {o_main['CFBundleIdentifier']}")
+      f"main dùng App ID trống (giữ nguyên như lần trước): {o_main['CFBundleIdentifier']}")
 appex_o = os.path.join(app_dir_o, "PlugIns", "JitterbugTunnel.appex")
 with open(os.path.join(appex_o, "Info.plist"), "rb") as f:
     o_appex = plistlib.load(f)
@@ -607,15 +632,7 @@ check(o_appex["CFBundleIdentifier"].startswith(o_main["CFBundleIdentifier"] + ".
       "extension = '<app chính>.<hậu tố>' — đúng luật installd")
 check(dev.profiles_for == ["com.old.Pair", "com.old.Pair.Widget"],
       f"2 profile riêng (cha + con): {dev.profiles_for}")
-for bundle_o, want_o in ((app_dir_o, "com.old.Pair"), (appex_o, "com.old.Pair.Widget")):
-    with open(os.path.join(bundle_o, "embedded.mobileprovision"), "rb") as f:
-        prof_o = plistlib.load(f)
-    check(prof_o["Entitlements"]["application-identifier"] == f"{TEAM}.{want_o}",
-          f"profile trong {os.path.basename(bundle_o)} khớp ĐÚNG bundle id của nó")
-check(len(native_calls["sideloadIpa"]) == 1, "cài đúng file đã ký (đè lên app cũ)")
-st = json.load(open(_state_path))
-check(st["app_id_map"].get(f"{TEAM}:com.osy86.Jitterbug", {}).get("effective_bundle") == "com.old.Pair",
-      "memory KHÔNG bị xoá (lần sau vẫn refresh được)")
+check(len(native_calls["sideloadIpa"]) == 1, "cài đúng file đã ký")
 
 print("=== CASE N (v66): hết lượt tạo App ID → tái dùng CẶP App ID cha-con trống ===")
 reset_run()

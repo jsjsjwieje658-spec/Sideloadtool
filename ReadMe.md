@@ -30,12 +30,15 @@ ngay trong một chiếc điện thoại Android.
   lượt tạo App ID cho extension: ưu tiên wildcard che phủ, rồi App ID CON
   trống của App ID chính (installd chỉ bắt buộc tiền tố '<app chính>.', hậu
   tố gì cũng được — xem SideStore issue #488), rồi CẶP cha-con trống; hết
-  hẳn mới DỪNG SỚM kèm danh sách App ID và hướng dẫn. CÀI LẠI/REFRESH: khi
-  App ID nhớ lần trước bị CHÍNH app cũ (tool cài, cùng bundle gốc) chiếm —
-  tool CÀI ĐÈ tại chỗ như refresh của AltStore/SideStore (giữ nguyên bundle
-  id + App ID + dữ liệu app, 0 lượt tạo mới); chỉ từ chối khi App ID là ô
-  extension của app KHÁC. Lưu ý: giới hạn 10 App ID / 7 ngày của Apple đếm
-  số lượt TẠO — xoá App ID trên trang developer không trả lại lượt. Chấp nhận cả IPA
+  hẳn mới DỪNG SỚM kèm danh sách App ID và hướng dẫn. QUY TẮC KHÔNG CÀI ĐÈ
+  (v68): tool liệt kê app đang cài trên iOS + App ID đã đăng ký; App ID bị
+  app nào trên máy chiếm (trùng bundle id hoặc là ô extension của app đang
+  cài) sẽ KHÔNG BAO GIỜ được dùng lại — kể cả App ID trùng đúng bundle id
+  gốc, App ID nhớ lần trước hay App ID phái sinh; chỉ dùng App ID KHÔNG
+  thấy cài trên máy; khi mọi App ID đã bị lấp đầy thì DỪNG SỚM (muốn cài
+  lại thì xoá app cũ khỏi iPhone trước). Lưu ý: giới hạn 10 App ID / 7 ngày
+  của Apple đếm số lượt TẠO — xoá App ID trên trang developer không trả
+  lại lượt. Chấp nhận cả IPA
   zip lại từ .app trần (thiếu Payload/) và file ZIP chứa .ipa lồng bên trong
   (tự giải nén tiếp, tối đa 2 tầng).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài

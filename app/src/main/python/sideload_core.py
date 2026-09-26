@@ -453,29 +453,16 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
     if rem_ident:
         found = _find_app_id(app_ids, rem_ident)
         if found:
-            # App ID nhớ từ lần trước có thể đang bị app trên iPhone chiếm.
-            # PHÂN BIỆT 2 trường hợp (v67):
-            #  (a) TRÙNG ĐÚNG bundle id của app đang cài → đó chính là app cũ
-            #      TOOL đã cài cho cùng app này (memory ghi theo bundle gốc;
-            #      id suffix ngẫu nhiên chỉ tool này đặt ra) → CÀI ĐÈ kiểu
-            #      refresh của AltStore/SideStore: giữ nguyên bundle id +
-            #      App ID, KHÔNG tốn lượt tạo mới, installd GIỮ NGUYÊN data
-            #      app cũ (cùng bundle id = nâng cấp tại chỗ).
-            #  (b) App ID là Ô EXTENSION của app KHÁC (id cha đang cài) — dùng
-            #      vào sẽ đè widget/extension của app đó (bug v59) → bỏ ghi
-            #      nhớ, chọn App ID khác (giữ nguyên v64).
+            # v68: KHÔNG BAO GIỜ cài đè app đang cài trên máy (yêu cầu của
+            # người dùng). App ID nhớ lần trước giờ bị chiếm — trùng bundle id
+            # của app đang cài HOẶC là ô extension của app đang cài — đều bỏ
+            # ghi nhớ và chọn App ID trống khác.
             installed_now = _installed_bundle_ids()
-            if rem_ident in installed_now:
-                print(f"[appid] ♻️  App ID đã chọn lần trước '{rem_ident}' đang bị app cùng "
-                      f"bundle id trên máy chiếm — đây là app cũ do tool cài cho CHÍNH app này "
-                      f"(bundle gốc '{bundle_id}'). CÀI ĐÈ như refresh của AltStore/SideStore: "
-                      "giữ nguyên bundle id + App ID, không tốn lượt tạo mới, dữ liệu app cũ "
-                      "được giữ nguyên.")
-                return found, rem_ident
             if _app_id_occupied_by_device(rem_ident, installed_now):
-                print(f"[appid] ⚠️  App ID đã chọn lần trước '{rem_ident}' là ô extension của "
-                      "app khác đang cài trên máy — bỏ ghi nhớ này, chọn App ID khác để không "
-                      "đè widget/extension của app đó.")
+                reason = ("trùng bundle id của một app đang cài" if rem_ident in installed_now
+                          else "là ô extension của app khác đang cài")
+                print(f"[appid] ⚠️  App ID đã chọn lần trước '{rem_ident}' {reason} — "
+                      "KHÔNG cài đè app có sẵn; bỏ ghi nhớ này, chọn App ID trống khác.")
                 (state.get("app_id_map") or {}).pop(f"{team_id}:{bundle_id}", None)
                 _save_state(state)
             else:
@@ -483,50 +470,83 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
                 return found, rem_ident
 
     existing = _find_app_id(app_ids, bundle_id) or _find_app_id(app_ids, bundle_id, ignore_case=True)
+    skip_create = False
     if existing:
         ident = _app_id_identifier(existing)
-        print(f"[appid] ✅ Đã có App ID '{ident}' — dùng lại.")
-        _remember_app_id(state, team_id, bundle_id, ident, existing)
-        return existing, ident
+        if _app_id_occupied_by_device(ident, _installed_bundle_ids()):
+            # v68: App ID trùng đúng bundle id nhưng app cùng id đang cài trên
+            # máy → dùng vào là CÀI ĐÈ → không dùng; tìm App ID/bundle id khác.
+            print(f"[appid] ⚠️  Tài khoản có App ID '{ident}' nhưng app cùng bundle id đang "
+                  "cài trên iPhone — KHÔNG cài đè; tìm App ID trống khác.")
+            skip_create = True          # tạo lại đúng id này cũng chỉ bị 'đã tồn tại'
+        else:
+            print(f"[appid] ✅ Đã có App ID '{ident}' — dùng lại.")
+            _remember_app_id(state, team_id, bundle_id, ident, existing)
+            return existing, ident
 
-    print(f"[appid] Chưa có App ID cho '{bundle_id}' — đang tạo...")
-    created = dev_api.create_app_id(bundle_id, app_name)
-    if created:
-        print(f"[appid] ✅ Đã tạo App ID '{bundle_id}'.")
-        app_ids.append(created)
-        _remember_app_id(state, team_id, bundle_id, bundle_id, created)
-        return created, bundle_id
+    if not skip_create:
+        print(f"[appid] Chưa có App ID cho '{bundle_id}' — đang tạo...")
+        created = dev_api.create_app_id(bundle_id, app_name)
+        if created:
+            print(f"[appid] ✅ Đã tạo App ID '{bundle_id}'.")
+            app_ids.append(created)
+            _remember_app_id(state, team_id, bundle_id, bundle_id, created)
+            return created, bundle_id
 
-    refreshed = dev_api.list_app_ids()
-    again = _find_app_id(refreshed, bundle_id) or _find_app_id(refreshed, bundle_id, ignore_case=True)
-    if again:
-        ident = _app_id_identifier(again)
-        print(f"[appid] ✅ Liệt kê lại thì thấy App ID '{ident}' — dùng lại.")
-        app_ids[:] = refreshed
-        _remember_app_id(state, team_id, bundle_id, ident, again)
-        return again, ident
+        refreshed = dev_api.list_app_ids()
+        again = _find_app_id(refreshed, bundle_id) or _find_app_id(refreshed, bundle_id, ignore_case=True)
+        if again:
+            ident = _app_id_identifier(again)
+            if _app_id_occupied_by_device(ident, _installed_bundle_ids()):
+                print(f"[appid] ⚠️  App ID '{ident}' đang bị app trên máy chiếm — bỏ qua, "
+                      "không cài đè.")
+            else:
+                print(f"[appid] ✅ Liệt kê lại thì thấy App ID '{ident}' — dùng lại.")
+                app_ids[:] = refreshed
+                _remember_app_id(state, team_id, bundle_id, ident, again)
+                return again, ident
 
     taken, limit = _is_identifier_taken(dev_api), _is_app_id_limit(dev_api)
-    print(f"[appid] ❌ Apple từ chối App ID '{bundle_id}': {_error_text(dev_api)}")
+    if skip_create:
+        taken = True
+    else:
+        print(f"[appid] ❌ Apple từ chối App ID '{bundle_id}': {_error_text(dev_api)}")
     if not (taken or limit):
         return None, None
     if taken:
-        print("[appid]    → bundle id này đã bị MỘT TÀI KHOẢN APPLE KHÁC đăng ký (App ID là duy nhất"
-              " toàn cầu — rất hay gặp với SideStore/AltStore). Sẽ đổi bundle id của IPA.")
+        if skip_create:
+            print("[appid]    → bundle id gốc đang bị app trên iPhone chiếm — sẽ dùng App ID "
+                  "khác (tool KHÔNG cài đè app đang cài trên máy).")
+        else:
+            print("[appid]    → bundle id này đã bị MỘT TÀI KHOẢN APPLE KHÁC đăng ký (App ID là duy nhất"
+                  " toàn cầu — rất hay gặp với SideStore/AltStore). Sẽ đổi bundle id của IPA.")
     if limit:
         print("[appid]    → tài khoản đã hết lượt tạo App ID (10 / 7 ngày). Sẽ tái dùng App ID sẵn có.")
         print("[appid]      (giới hạn đếm số lượt TẠO trong 7 ngày — xoá App ID trên "
               "developer.apple.com KHÔNG trả lại lượt; chỉ tái dùng App ID sẵn có hoặc chờ reset.)")
+    if limit or skip_create:
+        # v68: wildcard chạy khi hết lượt tạo HOẶC bundle gốc bị chiếm. Nếu bundle
+        # gốc đang bị app trên máy cài → đổi sang id suffix (vẫn được wildcard che
+        # phủ) để KHÔNG cài đè.
         for wc in app_ids or []:
             wc_ident = _app_id_identifier(wc)
             if wc_ident and "*" in wc_ident and _wildcard_covers(wc_ident, bundle_id, team_id):
-                print(f"[appid] ♻️  Dùng App ID wildcard '{wc_ident}' — giữ nguyên bundle id "
-                      f"'{bundle_id}', extension cũng được che phủ (không tốn lượt tạo App ID).")
-                return wc, bundle_id
+                target_bid = bundle_id
+                if _app_id_occupied_by_device(bundle_id, _installed_bundle_ids()):
+                    target_bid = _suffixed_identifier(bundle_id)
+                    print(f"[appid]    Bundle id gốc đang bị app trên máy chiếm — dùng "
+                          f"'{target_bid}' (vẫn được wildcard che phủ, không cài đè).")
+                print(f"[appid] ♻️  Dùng App ID wildcard '{wc_ident}' — bundle id "
+                      f"'{target_bid}', extension cũng được che phủ (không tốn lượt tạo App ID).")
+                return wc, target_bid
 
     for a in app_ids:                          # App ID phái sinh từ lần chạy trước
         ident = _app_id_identifier(a)
         if "*" not in ident and (ident.startswith(bundle_id + ".") or ident.startswith(bundle_id + "-")):
+            if _app_id_occupied_by_device(ident, _installed_bundle_ids()):
+                print(f"[appid] ⚠️  Bỏ qua App ID phái sinh '{ident}' — đang bị app trên máy "
+                      "chiếm (không cài đè).")
+                continue
             print(f"[appid] ♻️  Tái dùng App ID phái sinh có sẵn: {ident}")
             _remember_app_id(state, team_id, bundle_id, ident, a)
             return a, ident
@@ -590,8 +610,9 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
         return None
     resolved_ident = _app_id_identifier(main_app_id)
     if "*" in resolved_ident:
-        # Wildcard: profile che phủ theo mẫu — GIỮ NGUYÊN bundle id gốc của IPA.
-        final_bundle_id = bundle_id
+        # Wildcard: profile che phủ theo mẫu — dùng bundle id _resolve trả về
+        # (v68: là id suffix nếu bundle gốc đang bị app trên máy chiếm).
+        final_bundle_id = final_bundle_id or bundle_id
     else:
         final_bundle_id = resolved_ident or final_bundle_id
     if final_bundle_id != bundle_id:
@@ -636,13 +657,12 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                     _used_ids = {t[1] for t in targets}
                     for child in app_ids or []:
                         cid = _app_id_identifier(child)
-                        # KHÔNG check 'bị chiếm' cho ô con của chính App ID chính:
-                        # cha đang cài thì con là extension slot của app ĐANG ĐƯỢC
-                        # MÌNH cài đè (refresh) — dùng lại là đúng. Nguy cơ v59
-                        # (đè widget app KHÁC) chỉ nằm ở slot của cha KHÁC, mà ở
-                        # đây cid luôn có tiền tố đúng cha của mình.
+                        # v68: KHÔNG cài đè — check 'bị chiếm' ĐẦY ĐỦ cho ô con
+                        # (trùng app đang cài hoặc là slot extension của app
+                        # khác đều bỏ qua; chống bug v59: đè widget app người ta).
                         if (cid and "*" not in cid and cid.startswith(main_ident + ".")
-                                and cid not in _used_ids):
+                                and cid not in _used_ids
+                                and not _app_id_occupied_by_device(cid, _installed_bundle_ids())):
                             reused_child = (cid, child)
                             break
                 if reused_child:
@@ -684,8 +704,8 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                       "developer.apple.com thì KHÔNG trả lại lượt tạo (giới hạn đếm số lượt "
                       "TẠO trong 7 ngày).")
                 _print_app_id_inventory(app_ids, _installed_bundle_ids())
-                print("[appid]    (Cài lại/refresh CHÍNH app tool đã cài bao giờ cũng được — "
-                      "tool tự cài đè giữ nguyên App ID + dữ liệu, xem dòng '♻️ CÀI ĐÈ'.)")
+                print("[appid]    (Tool KHÔNG bao giờ cài đè app đang cài trên máy — App ID "
+                      "bị app nào chiếm thì không được dùng; chỉ dùng App ID trống.)")
                 print("[appid]    → Cách xử lý (chọn 1):")
                 print("[appid]      1. Chờ chu kỳ 7 ngày reset lượt tạo App ID, vào "
                       "developer.apple.com → Identifiers → đăng ký App ID WILDCARD "
