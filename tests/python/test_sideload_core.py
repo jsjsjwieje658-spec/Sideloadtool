@@ -188,7 +188,9 @@ class FakeDevAPI:
         self.devices = []
         self.app_ids = []
         if FakeDevAPI.has_wildcard:
-            self.app_ids.append({"identifier": f"{TEAM}.*", "appIdId": "WILD"})
+            # Wildcard toàn team của Apple = App ID identifier "*" → profile
+            # application-identifier "<TeamID>.*" che phủ mọi bundle id.
+            self.app_ids.append({"identifier": "*", "appIdId": "WILD"})
         self.app_ids.extend(dict(a) for a in FakeDevAPI.extra_app_ids)
         self.registered = []
         self.created_ids = []
@@ -503,11 +505,12 @@ check(jit_plist["CFBundleIdentifier"] == "com.osy86.Jitterbug",
       f"wildcard → KHÔNG đổi bundle id: {jit_plist['CFBundleIdentifier']}")
 check(os.path.isdir(os.path.join(app_dir_j, "PlugIns", "JitterbugTunnel.appex")),
       "extension KHÔNG bị bỏ (wildcard che phủ)")
-ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
+ms = [calls[0]["args"][i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
 check(len(ms) == 1, f"v62: wildcard dedupe — 1 cờ -m cho app + extension: {ms}")
 
-print("=== CASE K (v61): hết hạn mức, KHÔNG wildcard → tái dùng App ID trống, extension DÙNG CHUNG profile chính ===")
+print("=== CASE K (v64): hết hạn mức + KHÔNG wildcard → dừng SỚM với hướng dẫn (không ký hụt) ===")
 reset_run()
+FakeDevAPI.cert_fail_first = False
 make_jit_ipa(ipa)
 DeviceNative.installed_raw = ["com.SideStore.SideStore.sa9b733"]
 FakeDevAPI.app_id_limit = True
@@ -516,34 +519,57 @@ FakeDevAPI.extra_app_ids = [
     {"identifier": "com.old.Uninstalled", "appIdId": "OLD1"},
     {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},
 ]
+# Ghi nhớ App ID đang bị SideStore chiếm — tool phải nhận ra và KHÔNG dùng lại
+_state_path = os.path.join(WORK, "sideload_state.json")
+with open(_state_path, "w") as f:
+    json.dump({"app_id_map": {f"{TEAM}:com.osy86.Jitterbug": {
+        "effective_bundle": "com.SideStore.SideStore.sa9b733.AltWidget", "app_id_id": "ALTW"}}}, f)
 ok = core.do_sideload(ipa, "user@example.com", "pw")
-check(ok is True, "cài thành công: tái dùng App ID trống + extension dùng chung profile chính")
+check(ok is False, "v64: hết App ID + không wildcard → dừng SỚM (trả False) thay vì ký xong chết ở installd")
+check(not os.path.exists(ZSIGN_LOG), "KHÔNG gọi zsign (không ký hụt)")
+check(native_calls["sideloadIpa"] == [], "KHÔNG cài đặt gì")
 dev = FakeDevAPI.instances[-1]
 check(dev.created_ids == [], f"KHÔNG tạo App ID mới: {dev.created_ids}")
+
+print("=== CASE K2 (v64): wildcard TOÀN TEAM (TEAM.*) che phủ cả extension + App ID nhớ bị chiếm ===")
+reset_run()
+make_jit_ipa(ipa)
+DeviceNative.installed_raw = ["com.SideStore.SideStore.sa9b733"]
+FakeDevAPI.app_id_limit = True
+FakeDevAPI.has_wildcard = True     # App ID f"{TEAM}.*" — wildcard toàn team
+FakeDevAPI.extra_app_ids = [
+    {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},
+]
+_state_path = os.path.join(WORK, "sideload_state.json")
+with open(_state_path, "w") as f:
+    json.dump({"app_id_map": {f"{TEAM}:com.osy86.Jitterbug": {
+        "effective_bundle": "com.SideStore.SideStore.sa9b733.AltWidget", "app_id_id": "ALTW"}}}, f)
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "cài thành công qua wildcard toàn team (kể cả extension)")
+dev = FakeDevAPI.instances[-1]
+check(dev.created_ids == [], f"KHÔNG tạo App ID mới: {dev.created_ids}")
+check(dev.profiles_for == ["*"], f"chỉ tải 1 profile wildcard (cache dùng lại): {dev.profiles_for}")
 calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
 app_dir_k = calls[0]["args"][-1] if calls else ""
 with open(os.path.join(app_dir_k, "Info.plist"), "rb") as f:
     k_plist = plistlib.load(f)
-check(k_plist["CFBundleIdentifier"] == "com.old.Uninstalled",
-      f"tái dùng App ID trống 'com.old.Uninstalled': {k_plist['CFBundleIdentifier']}")
+check(k_plist["CFBundleIdentifier"] == "com.osy86.Jitterbug",
+      f"giữ NGUYÊN bundle id gốc (wildcard che phủ): {k_plist['CFBundleIdentifier']}")
 check(k_plist["CFBundleIdentifier"] != "com.SideStore.SideStore.sa9b733.AltWidget",
-      "KHÔNG chọn nhầm App ID extension của app đang cài (bug v59)")
+      "v64: KHÔNG dùng lại App ID đang bị SideStore chiếm (sẽ đè app đó)")
 appex_k = os.path.join(app_dir_k, "PlugIns", "JitterbugTunnel.appex")
 check(os.path.isdir(appex_k), "extension KHÔNG bị bỏ (VPN/tunnel cần nó)")
 with open(os.path.join(appex_k, "Info.plist"), "rb") as f:
     k_appex = plistlib.load(f)
-check(k_appex["CFBundleIdentifier"] == "com.old.Uninstalled",
-      f"v62: bundle id extension == bundle id của profile chính (giống SideStore Use Main Profile): "
-      f"{k_appex['CFBundleIdentifier']}")
-ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
-check(len(ms) == 1, f"v62: profile trùng nội dung được dedupe — chỉ 1 cờ -m: {ms}")
-check(dev.profiles_for == ["com.old.Uninstalled", "com.old.Uninstalled"],
-      f"cả 2 profile đều của cùng App ID tái dùng (Use Main Profile): {dev.profiles_for}")
-for bundle_k, want_k in ((app_dir_k, "com.old.Uninstalled"), (appex_k, "com.old.Uninstalled")):
+check(k_appex["CFBundleIdentifier"] == "com.osy86.Jitterbug.JitterbugTunnel",
+      f"bundle id extension giữ nguyên tiền tố app chính: {k_appex['CFBundleIdentifier']}")
+ms = [calls[0]["args"][i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
+check(len(ms) == 1, f"1 profile wildcard cho cả app + extension (dedupe): {ms}")
+for bundle_k in (app_dir_k, appex_k):
     with open(os.path.join(bundle_k, "embedded.mobileprovision"), "rb") as f:
         prof_k = plistlib.load(f)
-    check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.{want_k}",
-          f"profile trong {os.path.basename(bundle_k)} là của App ID chính")
+    check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.*",
+          f"profile trong {os.path.basename(bundle_k)} là wildcard toàn team")
 
 print("=== CASE L (v62): IPA không có Payload/ (.app nằm ở gốc) vẫn xử lý được ===")
 reset_run()

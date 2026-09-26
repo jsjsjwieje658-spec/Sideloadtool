@@ -367,13 +367,21 @@ def _choose_replacement_app_id(app_ids, original_bundle_id, installed):
     return None, None
 
 
-def _wildcard_matches(pattern, bundle_id):
+def _wildcard_covers(pattern, bundle_id, team_id=None):
+    """App ID wildcard 'pattern' có che phủ được bundle_id này không — theo
+    NGỮ NGHĨA của entitlement application-identifier trong profile
+    (= "<TeamID>.<pattern>", khớp TIỀN TỐ với dấu * ở cuối):
+      - App ID '*' → pattern '<TeamID>.*' → che phủ MỌI bundle id trong team
+      - App ID 'com.osy86.*' → che phủ com.osy86.<gì đó>
+    (team_id không dùng — giữ cho tương thích caller.)
+    """
     if not pattern or not bundle_id:
         return False
     if pattern == "*":
         return True
     if pattern.endswith(".*"):
-        return bundle_id.startswith(pattern[:-1])  # giữ lại dấu chấm
+        # profile application-identifier = "<TeamID>.<pattern>" → khớp tiền tố
+        return bundle_id.startswith(pattern[:-1])   # giữ lại dấu chấm
     return pattern == bundle_id
 
 
@@ -390,8 +398,18 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
     if rem_ident:
         found = _find_app_id(app_ids, rem_ident)
         if found:
-            print(f"[appid] ♻️  Dùng lại App ID đã chọn lần trước: {rem_ident}")
-            return found, rem_ident
+            # v64: App ID nhớ từ lần trước có thể giờ đang bị MỘT APP KHÁC trên
+            # iPhone chiếm (vd cài đè SideStore cùng App ID) — cài vào sẽ ĐÈ
+            # app đó. Kiểm tra trước khi dùng.
+            installed_now = _installed_bundle_ids()
+            if _app_id_occupied_by_device(rem_ident, installed_now):
+                print(f"[appid] ⚠️  App ID đã chọn lần trước '{rem_ident}' giờ đang bị app trên "
+                      f"iPhone chiếm — bỏ ghi nhớ này, chọn App ID khác để không đè app đó.")
+                (state.get("app_id_map") or {}).pop(f"{team_id}:{bundle_id}", None)
+                _save_state(state)
+            else:
+                print(f"[appid] ♻️  Dùng lại App ID đã chọn lần trước: {rem_ident}")
+                return found, rem_ident
 
     existing = _find_app_id(app_ids, bundle_id) or _find_app_id(app_ids, bundle_id, ignore_case=True)
     if existing:
@@ -428,7 +446,7 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
         print("[appid]    → tài khoản đã hết lượt tạo App ID (10 / 7 ngày). Sẽ tái dùng App ID sẵn có.")
         for wc in app_ids or []:
             wc_ident = _app_id_identifier(wc)
-            if wc_ident and "*" in wc_ident and _wildcard_matches(wc_ident, bundle_id):
+            if wc_ident and "*" in wc_ident and _wildcard_covers(wc_ident, bundle_id, team_id):
                 print(f"[appid] ♻️  Dùng App ID wildcard '{wc_ident}' — giữ nguyên bundle id "
                       f"'{bundle_id}', extension cũng được che phủ (không tốn lượt tạo App ID).")
                 return wc, bundle_id
@@ -517,25 +535,36 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
         label = f"{app_name} {os.path.splitext(os.path.basename(appex_path))[0]}"
         appex_app_id, final_appex_id = _ensure_app_id(dev_api, app_ids, appex_id, label)
         if not appex_app_id:
-            # v61: KHÔNG BỎ extension (v60 bỏ là sai — VPN/tunnel/widget sống
-            # nhờ extension). Dùng chung App ID + profile của APP CHÍNH cho
-            # extension — đúng cách "Keep App Extensions (Use Main Profile)"
-            # của SideStore.
-            #
-            # v62 (fix 0xe8008017 trên thiết bị thật): SideStore đặt bundle id
-            # của extension BẰNG ĐÚNG bundle id của profile chính (ResignApp-
-            # Operation.prepare: newBundleID = profile.bundleIdentifier) —
-            # KHÔNG phải X.Tunnel. Lý do: installd soi từng bundle, entitlement
-            # application-identifier (lấy từ profile, = X) phải khớp
-            # CFBundleIdentifier của chính bundle đó; để X.Tunnel là lệch →
-            # "Failed to verify code signature … 0xe8008017".
-            print(f"[appid] ♻️  Không tạo được App ID riêng cho extension '{appex_id}' (hết lượt "
-                  "10 App ID / 7 ngày) — dùng chung App ID + profile của app chính "
-                  f"'{final_bundle_id}' (kiểu Use Main Profile của SideStore).")
-            set_extension_bundle_id(appex_path, final_bundle_id)
-            print(f"[appid]    Bundle id extension đặt bằng bundle id của profile chính: "
-                  f"{appex_id} → {final_bundle_id} (đúng cách SideStore làm).")
-            targets.append((appex_path, final_bundle_id, main_app_id))
+            # v64: khi hết lượt tạo App ID, CÁCH DUY NHẤT cài được extension là
+            # App ID WILDCARD che phủ (profile application-identifier 'TEAM.*'
+            # hoặc '<prefix>.*' chấp nhận mọi bundle id con). Hai cách khác đều
+            # bị iPhone từ chối — đã thử trên iOS 16.7 thật:
+            #   - ext id = X.Tunnel + profile của app chính (X) → 0xe8008017
+            #     (entitlement không khớp bundle id).
+            #   - ext id = X (trùng app chính, kiểu SideStore Use Main Profile)
+            #     → "Failed to set app extension placeholders" (APIInternalError).
+            for wc in app_ids or []:
+                wc_ident = _app_id_identifier(wc)
+                if wc_ident and "*" in wc_ident and _wildcard_covers(wc_ident, appex_id, team_id):
+                    print(f"[appid] ♻️  Extension '{appex_id}' dùng App ID wildcard '{wc_ident}' — "
+                          "profile che phủ sẵn, không cần tạo mới.")
+                    targets.append((appex_path, appex_id, wc))
+                    wildcard_mode = True
+                    break
+            else:
+                print(f"[appid] ❌ Không đăng ký được App ID cho extension '{appex_id}' (hết lượt "
+                      "10 App ID / 7 ngày) và tài khoản KHÔNG có App ID wildcard nào che phủ.")
+                print("[appid]    iOS bắt buộc: bundle id extension phải có tiền tố của app chính "
+                      "VÀ profile phải khớp đúng bundle id đó — không thể 'dùng chung' profile "
+                      "app chính (đã thử: lỗi verify 0xe8008017 và lỗi extension placeholders).")
+                print("[appid]    → Cách xử lý (chọn 1):")
+                print("[appid]      1. Chờ chu kỳ 7 ngày reset lượt tạo App ID, vào "
+                      "developer.apple.com → Identifiers → đăng ký App ID WILDCARD "
+                      "(nhập '*' hoặc 'com.tenban.*') — từ đó tool không bao giờ thiếu App ID "
+                      "cho app + extension nữa.")
+                print("[appid]      2. Cài tạm bản IPA KHÔNG có extension (nếu nơi phát hành có).")
+                print("[appid]      3. Dùng tài khoản Apple ID khác còn lượt tạo App ID.")
+                return None
             continue
         if final_appex_id != appex_id:
             print(f"[appid] Ghi đè bundle id của extension: {appex_id} → {final_appex_id}")
@@ -543,11 +572,19 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
         targets.append((appex_path, final_appex_id, appex_app_id))
 
     result = []
+    profile_cache = {}   # v64: 1 App ID → tải profile 1 lần, các bundle dùng chung
     for bundle_path, ident, app_id_obj in targets:
         app_id_id = _app_id_key(app_id_obj)
         if not app_id_id:
             print(f"[profile] ❌ App ID '{ident}' không có appIdId.")
             return None
+        out_path = os.path.join(bundle_path, "embedded.mobileprovision")
+        cached = profile_cache.get(app_id_id)
+        if cached:
+            shutil.copyfile(cached, out_path)
+            print(f"[profile] ✅ Dùng lại profile đã tải cho {ident} → {os.path.basename(bundle_path)}")
+            result.append((bundle_path, ident, out_path))
+            continue
         print(f"[profile] Tải provisioning profile cho {ident}...")
         profile = dev_api.download_provisioning_profile(app_id_id)
         raw = _first_present(profile or {}, ["encodedProfile", "profileContent", "content"])
@@ -555,10 +592,10 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
             print(f"[profile] ❌ Không tải được profile cho {ident} (thiết bị đã vào team chưa?).")
             return None
         data = decode_apple_data_field(raw)
-        out_path = os.path.join(bundle_path, "embedded.mobileprovision")
         with open(out_path, "wb") as f:
             f.write(data if isinstance(data, bytes) else data.encode())
         print(f"[profile] ✅ Nhúng {len(data)} byte vào {os.path.basename(bundle_path)}")
+        profile_cache[app_id_id] = out_path
         result.append((bundle_path, ident, out_path))
     return result
 

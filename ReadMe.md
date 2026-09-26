@@ -24,14 +24,15 @@ ngay trong một chiếc điện thoại Android.
 - **Thông minh khi hết hạn mức 10 App ID / 7 ngày**: đọc danh sách app đang
   cài trên iPhone (App ID đang bị chiếm — kể cả App ID extension của app
   đang cài — không được tái dùng), tự tái dùng App ID trống; nếu tài khoản
-  có App ID wildcard thì giữ nguyên bundle id gốc và extension cũng được
-  che phủ; hết lượt tạo App ID cho extension thì extension DÙNG CHUNG App
-  ID + profile của app chính (đúng cách "Use Main Profile" của SideStore:
-  bundle id extension được đặt bằng bundle id của profile chính, xoá
-  _CodeSignature cũ trước khi ký, profile trùng được dedupe — VPN/tunnel/
-  widget không bị bỏ). Chấp nhận cả IPA zip lại từ .app trần (thiếu
-  Payload/) và file ZIP chứa .ipa lồng bên trong (tự giải nén tiếp, tối đa
-  2 tầng).
+  có App ID wildcard (kể cả wildcard toàn team "*") thì giữ nguyên bundle id
+  gốc và extension cũng được che phủ; App ID đã chọn lần trước mà giờ bị app
+  khác trên iPhone chiếm thì tự chọn App ID khác (không đè app cũ). Khi hết
+  lượt tạo App ID cho extension và không còn wildcard nào che phủ, tool DỪNG
+  SỚM kèm hướng dẫn (bundle id extension bắt buộc phải có tiền tố app chính
+  và profile phải khớp đúng — dùng chung profile app chính đã bị iPhone từ
+  chối với 2 lỗi 0xe8008017 và "extension placeholders"). Chấp nhận cả IPA
+  zip lại từ .app trần (thiếu Payload/) và file ZIP chứa .ipa lồng bên trong
+  (tự giải nén tiếp, tối đa 2 tầng).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).
