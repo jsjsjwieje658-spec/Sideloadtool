@@ -453,13 +453,29 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
     if rem_ident:
         found = _find_app_id(app_ids, rem_ident)
         if found:
-            # v64: App ID nhớ từ lần trước có thể giờ đang bị MỘT APP KHÁC trên
-            # iPhone chiếm (vd cài đè SideStore cùng App ID) — cài vào sẽ ĐÈ
-            # app đó. Kiểm tra trước khi dùng.
+            # App ID nhớ từ lần trước có thể đang bị app trên iPhone chiếm.
+            # PHÂN BIỆT 2 trường hợp (v67):
+            #  (a) TRÙNG ĐÚNG bundle id của app đang cài → đó chính là app cũ
+            #      TOOL đã cài cho cùng app này (memory ghi theo bundle gốc;
+            #      id suffix ngẫu nhiên chỉ tool này đặt ra) → CÀI ĐÈ kiểu
+            #      refresh của AltStore/SideStore: giữ nguyên bundle id +
+            #      App ID, KHÔNG tốn lượt tạo mới, installd GIỮ NGUYÊN data
+            #      app cũ (cùng bundle id = nâng cấp tại chỗ).
+            #  (b) App ID là Ô EXTENSION của app KHÁC (id cha đang cài) — dùng
+            #      vào sẽ đè widget/extension của app đó (bug v59) → bỏ ghi
+            #      nhớ, chọn App ID khác (giữ nguyên v64).
             installed_now = _installed_bundle_ids()
+            if rem_ident in installed_now:
+                print(f"[appid] ♻️  App ID đã chọn lần trước '{rem_ident}' đang bị app cùng "
+                      f"bundle id trên máy chiếm — đây là app cũ do tool cài cho CHÍNH app này "
+                      f"(bundle gốc '{bundle_id}'). CÀI ĐÈ như refresh của AltStore/SideStore: "
+                      "giữ nguyên bundle id + App ID, không tốn lượt tạo mới, dữ liệu app cũ "
+                      "được giữ nguyên.")
+                return found, rem_ident
             if _app_id_occupied_by_device(rem_ident, installed_now):
-                print(f"[appid] ⚠️  App ID đã chọn lần trước '{rem_ident}' giờ đang bị app trên "
-                      f"iPhone chiếm — bỏ ghi nhớ này, chọn App ID khác để không đè app đó.")
+                print(f"[appid] ⚠️  App ID đã chọn lần trước '{rem_ident}' là ô extension của "
+                      "app khác đang cài trên máy — bỏ ghi nhớ này, chọn App ID khác để không "
+                      "đè widget/extension của app đó.")
                 (state.get("app_id_map") or {}).pop(f"{team_id}:{bundle_id}", None)
                 _save_state(state)
             else:
@@ -610,7 +626,33 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                     wildcard_mode = True
                     break
             else:
-                # Ưu tiên 2 (v66): TÁI DÙNG CẶP App ID CHA-CON trống cho app chính +
+                # Ưu tiên 2 (v67): App ID CON trống của App ID CHÍNH. installd chỉ
+                # bắt buộc extension CÓ TIỀN TỐ '<app chính>.' — hậu tố nào cũng
+                # được, nên MỌI App ID con trống của App ID chính đều dùng được
+                # cho extension (giữ nguyên app chính, không cần tìm cặp đôi).
+                main_ident = targets[0][1] if targets else None
+                reused_child = None
+                if main_ident:
+                    _used_ids = {t[1] for t in targets}
+                    for child in app_ids or []:
+                        cid = _app_id_identifier(child)
+                        # KHÔNG check 'bị chiếm' cho ô con của chính App ID chính:
+                        # cha đang cài thì con là extension slot của app ĐANG ĐƯỢC
+                        # MÌNH cài đè (refresh) — dùng lại là đúng. Nguy cơ v59
+                        # (đè widget app KHÁC) chỉ nằm ở slot của cha KHÁC, mà ở
+                        # đây cid luôn có tiền tố đúng cha của mình.
+                        if (cid and "*" not in cid and cid.startswith(main_ident + ".")
+                                and cid not in _used_ids):
+                            reused_child = (cid, child)
+                            break
+                if reused_child:
+                    cid, child = reused_child
+                    print(f"[appid] ♻️  Extension dùng lại App ID con trống '{cid}' của App ID "
+                          f"chính '{main_ident}' (installd chỉ yêu cầu tiền tố '<app chính>.').")
+                    set_extension_bundle_id(appex_path, cid)
+                    targets.append((appex_path, cid, child))
+                    continue
+                # Ưu tiên 3 (v66): TÁI DÙNG CẶP App ID CHA-CON trống cho app chính +
                 # extension. iOS LUÔN bắt buộc bundle id extension = '<app chính>.<hậu tố>'
                 # — installd từ chối với "does not match required prefix ... for parent"
                 # (IXErrorDomain, xem SideStore issue #488), nên KHÔNG THỂ gán App ID
@@ -642,6 +684,8 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                       "developer.apple.com thì KHÔNG trả lại lượt tạo (giới hạn đếm số lượt "
                       "TẠO trong 7 ngày).")
                 _print_app_id_inventory(app_ids, _installed_bundle_ids())
+                print("[appid]    (Cài lại/refresh CHÍNH app tool đã cài bao giờ cũng được — "
+                      "tool tự cài đè giữ nguyên App ID + dữ liệu, xem dòng '♻️ CÀI ĐÈ'.)")
                 print("[appid]    → Cách xử lý (chọn 1):")
                 print("[appid]      1. Chờ chu kỳ 7 ngày reset lượt tạo App ID, vào "
                       "developer.apple.com → Identifiers → đăng ký App ID WILDCARD "

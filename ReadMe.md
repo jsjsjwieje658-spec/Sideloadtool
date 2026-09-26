@@ -27,13 +27,15 @@ ngay trong một chiếc điện thoại Android.
   có App ID wildcard (kể cả wildcard toàn team "*") thì giữ nguyên bundle id
   gốc và extension cũng được che phủ; App ID đã chọn lần trước mà giờ bị app
   khác trên iPhone chiếm thì tự chọn App ID khác (không đè app cũ). Khi hết
-  lượt tạo App ID cho extension: ưu tiên wildcard che phủ, rồi TÁI DÙNG CẶP
-  App ID cha-con trống (cha cho app chính, con cho extension — iOS bắt buộc
-  bundle id extension = '<app chính>.<hậu tố>', installd báo "does not match
-  required prefix" nếu sai, xem SideStore issue #488); hết hẳn mới DỪNG SỚM,
-  kèm danh sách App ID (cái nào trống / bị app nào chiếm) và hướng dẫn. Lưu
-  ý: giới hạn 10 App ID / 7 ngày của Apple đếm số lượt TẠO — xoá App ID trên
-  trang developer không trả lại lượt. Chấp nhận cả IPA
+  lượt tạo App ID cho extension: ưu tiên wildcard che phủ, rồi App ID CON
+  trống của App ID chính (installd chỉ bắt buộc tiền tố '<app chính>.', hậu
+  tố gì cũng được — xem SideStore issue #488), rồi CẶP cha-con trống; hết
+  hẳn mới DỪNG SỚM kèm danh sách App ID và hướng dẫn. CÀI LẠI/REFRESH: khi
+  App ID nhớ lần trước bị CHÍNH app cũ (tool cài, cùng bundle gốc) chiếm —
+  tool CÀI ĐÈ tại chỗ như refresh của AltStore/SideStore (giữ nguyên bundle
+  id + App ID + dữ liệu app, 0 lượt tạo mới); chỉ từ chối khi App ID là ô
+  extension của app KHÁC. Lưu ý: giới hạn 10 App ID / 7 ngày của Apple đếm
+  số lượt TẠO — xoá App ID trên trang developer không trả lại lượt. Chấp nhận cả IPA
   zip lại từ .app trần (thiếu Payload/) và file ZIP chứa .ipa lồng bên trong
   (tự giải nén tiếp, tối đa 2 tầng).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
