@@ -490,16 +490,6 @@ def _ensure_app_id(dev_api, app_ids, identifier, display_name):
     return None, None
 
 
-def _remove_extensions(app_bundle_path):
-    removed = []
-    for sub in ("PlugIns", "Extensions"):
-        d = os.path.join(app_bundle_path, sub)
-        if os.path.isdir(d):
-            removed.extend(sorted(os.listdir(d)))
-            shutil.rmtree(d, ignore_errors=True)
-    print(f"[appid] 🗑  Đã bỏ {len(removed)} extension: {', '.join(removed) or '(không có)'}")
-
-
 def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name, state, team_id):
     """→ list[(bundle_path, bundle_id, profile_path)] (phần tử đầu = app chính)."""
     app_ids = dev_api.list_app_ids()
@@ -527,15 +517,18 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
         label = f"{app_name} {os.path.splitext(os.path.basename(appex_path))[0]}"
         appex_app_id, final_appex_id = _ensure_app_id(dev_api, app_ids, appex_id, label)
         if not appex_app_id:
-            # v60: TỰ ĐỘNG bỏ extension (thay vì hỏi) — yêu cầu người dùng
-            # 2026-09-26: cài được app chính thay vì dừng cả quy trình.
-            print(f"[appid] ⚠️  Không đăng ký được App ID cho extension '{appex_id}' (thường do hết "
-                  "10 App ID / 7 ngày) — tự bỏ extension để cài được app chính. App có thể mất "
-                  "widget/tunnel/share… ; xoá bớt app không dùng trên iPhone rồi cài lại, hoặc chờ "
-                  "hết chu kỳ 7 ngày để có lại App ID cho extension.")
-            _remove_extensions(app_bundle_path)
-            targets = targets[:1]
-            break
+            # v61: KHÔNG BỎ extension (v60 bỏ là sai — VPN/tunnel/widget sống
+            # nhờ extension). Dùng chung App ID + profile của APP CHÍNH cho
+            # extension — đúng cách "Keep App Extensions (Use Main Profile)"
+            # của SideStore. Bundle id extension đã được derive từ App ID
+            # chính (vd X.JitterbugTunnel khi App ID chính là X) nên luôn
+            # đúng tiền tố iOS yêu cầu; entitlement lấy từ profile chính.
+            print(f"[appid] ♻️  Không tạo được App ID riêng cho extension '{appex_id}' (hết lượt "
+                  "10 App ID / 7 ngày) — dùng chung App ID + profile của app chính "
+                  f"'{final_bundle_id}' (kiểu Use Main Profile của SideStore). Nếu iPhone từ chối "
+                  "cài, xoá bớt app không dùng để giải phóng App ID rồi cài lại.")
+            targets.append((appex_path, appex_id, main_app_id))
+            continue
         if final_appex_id != appex_id:
             print(f"[appid] Ghi đè bundle id của extension: {appex_id} → {final_appex_id}")
             set_extension_bundle_id(appex_path, final_appex_id)

@@ -506,7 +506,7 @@ check(os.path.isdir(os.path.join(app_dir_j, "PlugIns", "JitterbugTunnel.appex"))
 ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
 check(len(ms) == 2, f"2 profile (app + extension) dùng chung wildcard: {ms}")
 
-print("=== CASE K (v60): hết hạn mức, KHÔNG wildcard → tái dùng App ID trống, tự bỏ extension ===")
+print("=== CASE K (v61): hết hạn mức, KHÔNG wildcard → tái dùng App ID trống, extension DÙNG CHUNG profile chính ===")
 reset_run()
 make_jit_ipa(ipa)
 DeviceNative.installed_raw = ["com.SideStore.SideStore.sa9b733"]
@@ -517,7 +517,7 @@ FakeDevAPI.extra_app_ids = [
     {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},
 ]
 ok = core.do_sideload(ipa, "user@example.com", "pw")
-check(ok is True, "cài thành công: tái dùng App ID trống + bỏ extension")
+check(ok is True, "cài thành công: tái dùng App ID trống + extension dùng chung profile chính")
 dev = FakeDevAPI.instances[-1]
 check(dev.created_ids == [], f"KHÔNG tạo App ID mới: {dev.created_ids}")
 calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
@@ -528,11 +528,21 @@ check(k_plist["CFBundleIdentifier"] == "com.old.Uninstalled",
       f"tái dùng App ID trống 'com.old.Uninstalled': {k_plist['CFBundleIdentifier']}")
 check(k_plist["CFBundleIdentifier"] != "com.SideStore.SideStore.sa9b733.AltWidget",
       "KHÔNG chọn nhầm App ID extension của app đang cài (bug v59)")
-check(not os.path.exists(os.path.join(app_dir_k, "PlugIns")),
-      "extension bị tự bỏ (hết hạn mức, không còn App ID cho extension)")
+appex_k = os.path.join(app_dir_k, "PlugIns", "JitterbugTunnel.appex")
+check(os.path.isdir(appex_k), "extension KHÔNG bị bỏ (VPN/tunnel cần nó)")
+with open(os.path.join(appex_k, "Info.plist"), "rb") as f:
+    k_appex = plistlib.load(f)
+check(k_appex["CFBundleIdentifier"] == "com.old.Uninstalled.JitterbugTunnel",
+      f"bundle id extension derive từ App ID chính (đúng tiền tố): {k_appex['CFBundleIdentifier']}")
 ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
-check(len(ms) == 1, f"chỉ 1 profile cho app chính: {ms}")
-check(dev.profiles_for == ["com.old.Uninstalled"], f"profile cho đúng App ID tái dùng: {dev.profiles_for}")
+check(len(ms) == 2, f"2 cờ -m (app + extension): {ms}")
+check(dev.profiles_for == ["com.old.Uninstalled", "com.old.Uninstalled"],
+      f"cả 2 profile đều của cùng App ID tái dùng (Use Main Profile): {dev.profiles_for}")
+for bundle_k, want_k in ((app_dir_k, "com.old.Uninstalled"), (appex_k, "com.old.Uninstalled")):
+    with open(os.path.join(bundle_k, "embedded.mobileprovision"), "rb") as f:
+        prof_k = plistlib.load(f)
+    check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.{want_k}",
+          f"profile trong {os.path.basename(bundle_k)} là của App ID chính")
 
 print("=== CASE I (v56): nhúng file ghép nối — tắt cờ / app ngoài danh sách ===")
 reset_run()

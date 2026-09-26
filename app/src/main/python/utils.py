@@ -342,6 +342,13 @@ def find_extensions(app_bundle_path):
     cho app chính rồi truyền MỘT `-m` duy nhất cho cả bundle có extension,
     zsign có thể không tìm được entitlements hợp lệ cho phần extension và
     thoát với lỗi (thường gặp: exit code -1 / 255).
+
+    [v61] NGOẠI LỆ quan trọng: khi tài khoản HẾT LƯỢT tạo App ID (10/7 ngày),
+    extension CÓ THỂ dùng chung App ID + profile của app chính — chính là
+    cách SideStore làm với tùy chọn "Keep App Extensions (Use Main Profile)":
+    bundle id extension được derive từ App ID chính (X.Tunnel) nên đúng
+    tiền tố, entitlement lấy từ profile chính. sideload_core.py dùng cách
+    này thay vì bỏ extension (bỏ extension làm gãy VPN/tunnel/widget).
     """
     extensions = []
     plugins_dir = os.path.join(app_bundle_path, "PlugIns")

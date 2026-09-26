@@ -25,7 +25,9 @@ ngay trong một chiếc điện thoại Android.
   cài trên iPhone (App ID đang bị chiếm — kể cả App ID extension của app
   đang cài — không được tái dùng), tự tái dùng App ID trống; nếu tài khoản
   có App ID wildcard thì giữ nguyên bundle id gốc và extension cũng được
-  che phủ; hết cách thì tự bỏ extension để vẫn cài được app chính.
+  che phủ; hết lượt tạo App ID cho extension thì extension DÙNG CHUNG App
+  ID + profile của app chính (kiểu "Use Main Profile" của SideStore — bundle
+  id extension vẫn derive đúng tiền tố, VPN/tunnel/widget không bị bỏ).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).
