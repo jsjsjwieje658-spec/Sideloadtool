@@ -919,9 +919,15 @@ static bool write_pairing_prefs(afc_client_t afc, const char *path) {
     bool ok = false;
     if (plist_to_bin(prefs, &bin, &blen) == PLIST_ERR_SUCCESS && bin && blen) {
         ok = afc_write_file_all(afc, path, bin, blen);
+        if (!ok) {
+            /* File cũ có thể bị chủ sở hữu khác chặn open — xoá rồi thử lại. */
+            afc_remove_path(afc, path);
+            ok = afc_write_file_all(afc, path, bin, blen);
+        }
     }
     free(bin);
     plist_free(prefs);
+    if (ok) emitf("[prefs] ✅ Đã ghi %s", path);
     return ok;
 }
 
@@ -1050,7 +1056,6 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWriteSideStorePrefs(
     (void)obj;
     const char *bundle = j_bundle ? (*env)->GetStringUTFChars(env, j_bundle, NULL) : NULL;
     jboolean ok = JNI_FALSE;
-    house_arrest_client_t ha = NULL;
     pthread_mutex_lock(&g_api);
     do {
         if (!bundle || !*bundle) {
@@ -1061,49 +1066,74 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWriteSideStorePrefs(
             emit_log("[prefs] ❌ iPhone chưa kết nối / chưa ghép nối");
             break;
         }
-        house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
-        if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
-            emitf("[prefs] ❌ Không mở được house_arrest (lỗi %d)", (int)he);
-            break;
-        }
-        he = house_arrest_send_command(ha, "VendDocuments", bundle);
-        plist_t res = NULL;
-        if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
-        if (he == HOUSE_ARREST_E_SUCCESS && res) {
-            plist_t err_item = plist_dict_get_item(res, "Error");
-            if (err_item) {
-                char *es = NULL;
-                plist_get_string_val(err_item, &es);
-                emitf("[prefs] ❌ iPhone từ chối truy cập Documents của %s (%s)",
-                      bundle, es ? es : "?");
-                free(es);
-                he = HOUSE_ARREST_E_UNKNOWN_ERROR;
+
+        /*
+         * v63: afcd qua VendDocuments bị iOS 16 chặn ghi vào /Library
+         * (AFC lỗi 10 = PERM_DENIED — thực tế trên iPhone 16.7.16). Thử
+         * VendContainer (quyền TOÀN container) trước, VendDocuments sau.
+         * Mỗi lượt dùng MỘT client house_arrest mới: sau khi chuyển sang
+         * AFC không gửi lại vend command trên cùng client được.
+         */
+        static const char *vend_cmds[] = {"VendContainer", "VendDocuments"};
+        bool wrote = false;
+        for (int ci = 0; ci < 2 && !wrote; ci++) {
+            house_arrest_client_t ha = NULL;
+            house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
+            if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
+                emitf("[prefs] ❌ Không mở được house_arrest (lỗi %d)", (int)he);
+                break;
             }
+            he = house_arrest_send_command(ha, vend_cmds[ci], bundle);
+            plist_t res = NULL;
+            if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
+            if (he == HOUSE_ARREST_E_SUCCESS && res) {
+                plist_t err_item = plist_dict_get_item(res, "Error");
+                if (err_item) {
+                    char *es = NULL;
+                    plist_get_string_val(err_item, &es);
+                    emitf("[prefs] ⚠️ %s bị từ chối cho %s (%s) — thử cách khác…",
+                          vend_cmds[ci], bundle, es ? es : "?");
+                    free(es);
+                    he = HOUSE_ARREST_E_UNKNOWN_ERROR;
+                }
+            }
+            if (res) plist_free(res);
+            if (he == HOUSE_ARREST_E_SUCCESS) {
+                afc_client_t afc = NULL;
+                if (afc_client_new_from_house_arrest_client(ha, &afc) == AFC_E_SUCCESS && afc) {
+                    afc_error_t me = afc_make_directory(afc, "/Library/Preferences");
+                    if (me != AFC_E_SUCCESS && me != AFC_E_OBJECT_EXISTS) {
+                        emitf("[prefs] ℹ️ mkdir /Library/Preferences qua %s: AFC lỗi %d",
+                              vend_cmds[ci], (int)me);
+                    }
+                    char path[600];
+                    bool o1 = false, o2 = false;
+                    snprintf(path, sizeof(path),
+                             "/Library/Preferences/group.com.SideStore.SideStore.plist");
+                    o1 = write_pairing_prefs(afc, path);
+                    snprintf(path, sizeof(path), "/Library/Preferences/%s.plist", bundle);
+                    o2 = write_pairing_prefs(afc, path);
+                    wrote = o1 || o2;
+                    if (!wrote) {
+                        emitf("[prefs] ⚠️ Không ghi được /Library/Preferences qua %s", vend_cmds[ci]);
+                    }
+                } else {
+                    emit_log("[prefs] ⚠️ Không chuyển sang AFC được");
+                }
+            }
+            if (ha) house_arrest_client_free(ha);
         }
-        if (res) plist_free(res);
-        if (he != HOUSE_ARREST_E_SUCCESS) break;
 
-        afc_client_t afc = NULL;
-        if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
-            emit_log("[prefs] ❌ Không chuyển sang chế độ AFC được");
-            break;
-        }
-
-        char path[600];
-        snprintf(path, sizeof(path), "/Library/Preferences/group.com.SideStore.SideStore.plist");
-        bool o1 = write_pairing_prefs(afc, path);
-        snprintf(path, sizeof(path), "/Library/Preferences/%s.plist", bundle);
-        bool o2 = write_pairing_prefs(afc, path);
-        if (o1 || o2) {
-            emitf("[prefs] ✅ Đã ghi UserDefaults kích hoạt pairing cho %s — mở app là tự dùng, không cần chọn file.", bundle);
+        if (wrote) {
+            emitf("[prefs] ✅ Đã ghi UserDefaults kích hoạt pairing cho %s — mở app là tự dùng, "
+                  "không cần chọn file.", bundle);
             ok = JNI_TRUE;
         } else {
-            emit_log("[prefs] ❌ Không ghi được UserDefaults của SideStore");
+            emit_log("[prefs] ❌ Không ghi được UserDefaults của SideStore (afcd chặn /Library) — "
+                     "dùng cách thủ công: mở app rồi chọn file PairingFile_Lockdown.plist 1 lần.");
         }
     } while (0);
 
-    /* Chỉ free house_arrest (afc sharing service_client — tránh double-free). */
-    if (ha) house_arrest_client_free(ha);
     pthread_mutex_unlock(&g_api);
     if (bundle) (*env)->ReleaseStringUTFChars(env, j_bundle, bundle);
     return ok;

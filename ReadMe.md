@@ -30,7 +30,8 @@ ngay trong một chiếc điện thoại Android.
   bundle id extension được đặt bằng bundle id của profile chính, xoá
   _CodeSignature cũ trước khi ký, profile trùng được dedupe — VPN/tunnel/
   widget không bị bỏ). Chấp nhận cả IPA zip lại từ .app trần (thiếu
-  Payload/).
+  Payload/) và file ZIP chứa .ipa lồng bên trong (tự giải nén tiếp, tối đa
+  2 tầng).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).

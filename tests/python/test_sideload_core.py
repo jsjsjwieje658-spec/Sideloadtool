@@ -570,6 +570,24 @@ try:
 except Exception as e:
     check("hello.txt" in str(e), f"lỗi liệt kê nội dung để chẩn đoán: {str(e)[:60]}…")
 
+print("=== CASE M (v63): file ZIP chứa .ipa lồng bên trong — tự giải nén tiếp ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False
+inner_ipa = os.path.join(WORK, "Real.ipa")
+with zipfile.ZipFile(inner_ipa, "w") as z:
+    z.writestr("Payload/RealApp.app/Info.plist", plistlib.dumps({
+        "CFBundleIdentifier": "com.example.RealApp", "CFBundleDisplayName": "RealApp",
+        "CFBundleExecutable": "RealApp"}))
+    z.writestr("Payload/RealApp.app/RealApp", b"\xcf\xfa\xed\xfe binary")
+wrapped_ipa = os.path.join(WORK, "MiniStore.ipa")
+with zipfile.ZipFile(wrapped_ipa, "w") as z:
+    z.write(inner_ipa, "MiniStore.ipa")
+ok = core.do_sideload(wrapped_ipa, "user@example.com", "pw")
+check(ok is True, "ZIP chứa .ipa lồng vẫn cài được (tự giải nén tầng trong)")
+calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
+check(ok and calls and calls[0]["args"][-1].endswith("RealApp.app"),
+      "ký đúng app bên trong (RealApp.app)")
+
 print("=== CASE I (v56): nhúng file ghép nối — tắt cờ / app ngoài danh sách ===")
 reset_run()
 FakeDevAPI.cert_fail_first = False  # H2/H3 để sót True ở class attr (instance shadow)

@@ -102,7 +102,7 @@ def _find_app_dir_in(folder):
     return fallback
 
 
-def find_app_bundle(extracted_ipa_path):
+def find_app_bundle(extracted_ipa_path, _depth=0):
     """Tìm thư mục .app trong IPA đã giải nén.
 
     v62: một số IPA không theo chuẩn `Payload/*.app` ở gốc (zip lại từ thư
@@ -112,7 +112,11 @@ def find_app_bundle(extracted_ipa_path):
       2. *.app ngay ở gốc — zip của thư mục .app
       3. */Payload/*.app — lồng một cấp
     Không thấy thì báo lỗi kèm danh sách thư mục (chẩn đoán ngay được file
-    người dùng chọn thực chất là gì)."""
+    người dùng chọn thực chất là gì).
+
+    v63: một số nguồn phân phối file là ZIP chứa .ipa LỒNG BÊN TRONG (vd
+    giải nén ra chỉ có [MiniStore.ipa]) — tự giải nén tiếp tầng trong
+    (tối đa 2 tầng) thay vì báo lỗi."""
     try:
         top = sorted(os.listdir(extracted_ipa_path))
     except OSError as e:
@@ -147,6 +151,26 @@ def find_app_bundle(extracted_ipa_path):
                 if found:
                     print(f"[IPA] ⚠️ Payload/ lồng trong '{item}' — dùng .app: {found}")
                     return found
+
+    # v63: ZIP chứa .ipa/.zip lồng bên trong? Giải nén tiếp (tối đa 2 tầng).
+    if _depth < 2:
+        inner = None
+        for _root, _dirs, _files in os.walk(extracted_ipa_path):
+            for _f in _files:
+                if _f.lower().endswith((".ipa", ".zip")):
+                    inner = os.path.join(_root, _f)
+                    break
+            if inner:
+                break
+        if inner:
+            print(f"[IPA] ⚠️ File chọn là ZIP chứa '{os.path.basename(inner)}' — "
+                  f"giải nén tiếp tầng trong (lần {_depth + 1})...")
+            inner_dir = extracted_ipa_path.rstrip("/\\") + f"_inner{_depth + 1}"
+            try:
+                extract_ipa(inner, inner_dir)
+                return find_app_bundle(inner_dir, _depth + 1)
+            except Exception as e:
+                print(f"[IPA] ⚠️ Giải nén tầng trong thất bại: {e}")
 
     listing = ", ".join(top[:12]) or "(trống)"
     raise Exception(
