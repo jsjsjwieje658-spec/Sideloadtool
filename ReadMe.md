@@ -21,6 +21,11 @@ ngay trong một chiếc điện thoại Android.
 - **Tự thu hồi certificate** ngay khi tạo cert mới thất bại — không cần đủ
   giới hạn 2 cert mới kích hoạt (ưu tiên thu hồi cert do tool tạo, thu hồi
   xong tự tạo lại).
+- **Thông minh khi hết hạn mức 10 App ID / 7 ngày**: đọc danh sách app đang
+  cài trên iPhone (App ID đang bị chiếm — kể cả App ID extension của app
+  đang cài — không được tái dùng), tự tái dùng App ID trống; nếu tài khoản
+  có App ID wildcard thì giữ nguyên bundle id gốc và extension cũng được
+  che phủ; hết cách thì tự bỏ extension để vẫn cài được app chính.
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).
@@ -30,8 +35,11 @@ ngay trong một chiếc điện thoại Android.
   (`ALTPairingFile.mobiledevicepairing` bản cũ và `PairingFile_Lockdown.plist`
   SideStore 0.7+). Lưu ý SideStore 0.7 không tự nạp file có sẵn: mở SideStore →
   chọn file khi được hỏi → "Trên iPhone của tôi" → SideStore →
-  `PairingFile_Lockdown.plist` (1 lần duy nhất). Tab **File ghép nối** còn cho
-  xuất file và nhúng thủ công vào app đã cài.
+  `PairingFile_Lockdown.plist` (1 lần duy nhất). Đồng thời ghi thẳng
+  UserDefaults của SideStore (activePairingProtocol=lockdown,
+  isPairingReset=false) → SideStore cài qua tool và CHƯA từng mở sẽ tự kích
+  hoạt pairing, không cần chọn file. Tab **File ghép nối** còn cho xuất file
+  và nhúng thủ công vào app đã cài.
 - Chọn server **Anisette** (tự dò từ `servers.sidestore.io` hoặc nhập tay).
 - Nhật ký thời gian thực từng bước — màu theo mức độ, sao chép được.
 - Tự kết nối lại khi cáp bị rút cắm lại (backoff + retry).

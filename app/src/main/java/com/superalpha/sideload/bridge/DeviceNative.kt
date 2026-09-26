@@ -110,10 +110,16 @@ object DeviceNative {
     /**
      * listInstalledApps — Trả về danh sách bundle ID User apps từ iPhone.
      * Gọi từ device_link.py để sideload_core.py tránh tạo App ID trùng.
+     *
+     * v60: trả CHUỖI join bằng "\n" thay vì List<String> — Chaquopy đưa
+     * Kotlin List sang Python dưới dạng proxy java.util.ArrayList KHÔNG
+     * iterate được ('ArrayList' object is not iterable) khiến tool tưởng
+     * iPhone không có app nào → chọn nhầm App ID đang bị chiếm. Chuỗi
+     * String chuyển đổi an toàn tuyệt đối qua interop.
      */
     @JvmStatic
-    fun listInstalledApps(): List<String> = runBlocking {
-        bridge?.listInstalledApps() ?: emptyList()
+    fun listInstalledApps(): String = runBlocking {
+        bridge?.listInstalledApps()?.joinToString("\n") ?: ""
     }
 
     /**
@@ -132,6 +138,23 @@ object DeviceNative {
             return@runBlocking false
         }
         b.writePairingFileToApp(bundleId, relPath)
+    }
+
+    /**
+     * v59: ghi UserDefaults kích hoạt pairing cho SideStore vừa cài (gọi từ
+     * sideload_core.py sau khi ghi xong các file ghép nối).
+     */
+    @JvmStatic
+    fun writeSideStorePrefs(bundleId: String): Boolean = runBlocking {
+        val b = bridge ?: run {
+            NativeLog.emit("[DeviceNative] ❌ Chưa init.")
+            return@runBlocking false
+        }
+        if (!UsbTransport.isConnected()) {
+            NativeLog.emit("[DeviceNative] ❌ USB đã ngắt — không ghi được UserDefaults.")
+            return@runBlocking false
+        }
+        b.writeSideStoreUserDefaults(bundleId)
     }
 
     /**

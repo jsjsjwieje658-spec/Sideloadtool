@@ -317,6 +317,17 @@ class NativeBridge(private val context: Context) {
             try { nativeWritePairingFileToApp(bundleId, relPath) } catch (_: Exception) { false }
         }
 
+    /**
+     * v59: tự kích hoạt pairing cho SideStore vừa cài — ghi UserDefaults
+     * (activePairingProtocol/preferredPairingProtocol = "lockdown",
+     * isPairingReset = false) vào Library/Preferences của app. Chỉ tác dụng
+     * khi SideStore chưa từng mở (kịch bản cài xong qua tool).
+     */
+    suspend fun writeSideStoreUserDefaults(bundleId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            try { nativeWriteSideStorePrefs(bundleId) } catch (_: Exception) { false }
+        }
+
     suspend fun exportPairingFile(): File? = withContext(Dispatchers.IO) {
         try {
             val xml  = nativeGetPairingPlist() ?: return@withContext null
@@ -407,6 +418,7 @@ class NativeBridge(private val context: Context) {
     private external fun nativeGetPairingPlist(): String?
     private external fun nativeGetPairingFile(): String?
     private external fun nativeWritePairingFileToApp(bundleId: String, relPath: String): Boolean
+    private external fun nativeWriteSideStorePrefs(bundleId: String): Boolean
     private external fun nativeReset()
     private external fun nativeIsConnected(): Boolean
     private external fun nativeGetConnectionState(): Int

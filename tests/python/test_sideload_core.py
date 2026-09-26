@@ -62,7 +62,7 @@ os.chmod(FAKE_ZSIGN, os.stat(FAKE_ZSIGN).st_mode | stat.S_IEXEC)
 
 ui_answers = []
 ui_prompts = []
-native_calls = {"connectAndPair": 0, "sideloadIpa": [], "embedded": []}
+native_calls = {"connectAndPair": 0, "sideloadIpa": [], "embedded": [], "prefs": []}
 
 
 class AppPaths:
@@ -119,8 +119,16 @@ class DeviceNative:
         return True
 
     @staticmethod
+    def writeSideStorePrefs(bundle_id):
+        native_calls["prefs"].append(bundle_id)
+        return True
+
+    # v60: list hoặc chuỗi "\n"-join — mô phỏng cả 2 dạng Chaquopy trả về
+    installed_raw = []
+
+    @staticmethod
     def listInstalledApps():
-        return []
+        return DeviceNative.installed_raw
 
     @staticmethod
     def reset():
@@ -169,11 +177,19 @@ class FakeDevAPI:
     accept_device = True
     instances = []
 
+    # v60: mô phỏng giới hạn 10 App ID / 7 ngày + wildcard tuỳ chọn
+    app_id_limit = False
+    has_wildcard = True
+    extra_app_ids = []
+
     def __init__(self, auth, dsid, token):
         self.last_error = None
         self.team_id = None
         self.devices = []
-        self.app_ids = [{"identifier": f"{TEAM}.*", "appIdId": "WILD"}]
+        self.app_ids = []
+        if FakeDevAPI.has_wildcard:
+            self.app_ids.append({"identifier": f"{TEAM}.*", "appIdId": "WILD"})
+        self.app_ids.extend(dict(a) for a in FakeDevAPI.extra_app_ids)
         self.registered = []
         self.created_ids = []
         self.profiles_for = []
@@ -222,6 +238,11 @@ class FakeDevAPI:
         return [dict(a) for a in self.app_ids]
 
     def create_app_id(self, identifier, name):
+        if FakeDevAPI.app_id_limit:
+            self.last_error = {"resultCode": 9120, "userString":
+                               "Your maximum App ID limit has been reached. You may create up to "
+                               "10 App IDs every 7 days."}
+            return None
         if identifier == MAIN_ID:
             self.last_error = {"resultCode": 9401, "userString":
                                f"An App ID with Identifier '{identifier}' is not available. "
@@ -261,6 +282,11 @@ def reset_run():
     native_calls["connectAndPair"] = 0
     native_calls["sideloadIpa"] = []
     native_calls["embedded"] = []
+    native_calls["prefs"] = []
+    DeviceNative.installed_raw = []
+    FakeDevAPI.app_id_limit = False
+    FakeDevAPI.has_wildcard = True
+    FakeDevAPI.extra_app_ids = []
     FakeDevAPI.instances.clear()
     auth_instances.clear()
     state = os.path.join(WORK, "sideload_state.json")
@@ -322,6 +348,8 @@ check(len(native_calls["sideloadIpa"]) == 1 and native_calls["sideloadIpa"][0].e
 check(native_calls["embedded"] == [(new_main, "ALTPairingFile.mobiledevicepairing"),
                                     (new_main, "PairingFile_Lockdown.plist")],
       f"v58: nhúng CẢ 2 file ghép nối cho SideStore (legacy + 0.7+): {native_calls['embedded']}")
+check(native_calls["prefs"] == [new_main],
+      f"v59: ghi UserDefaults tự kích hoạt pairing cho SideStore: {native_calls['prefs']}")
 
 print("=== CASE B: chạy lại — dùng lại App ID đã chọn, không tạo thêm (không tốn quota) ===")
 native_calls["sideloadIpa"] = []
@@ -439,6 +467,73 @@ check(core._normalize_udid("00008030001A35E80C41802E") == UDID, "UDID 24 ký t�
 check(core._looks_like_udid("102e03e0d56583407853e9518f945642c72298d3"), "UDID 40 hex hợp lệ")
 check(not core._looks_like_udid(WORK), "đường dẫn thư mục KHÔNG bị coi là UDID (bản cũ fallback filesDir)")
 
+def make_jit_ipa(path):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("Payload/Jitterbug.app/Info.plist", plistlib.dumps({
+            "CFBundleIdentifier": "com.osy86.Jitterbug", "CFBundleDisplayName": "Jitterbug",
+            "CFBundleExecutable": "Jitterbug"}))
+        z.writestr("Payload/Jitterbug.app/Jitterbug", b"\xcf\xfa\xed\xfe binary")
+        z.writestr("Payload/Jitterbug.app/PlugIns/JitterbugTunnel.appex/Info.plist", plistlib.dumps({
+            "CFBundleIdentifier": "com.osy86.Jitterbug.JitterbugTunnel",
+            "CFBundleExecutable": "JitterbugTunnel",
+            "NSExtension": {"NSExtensionPointIdentifier": "com.apple.network-extension.packet-tunnel"}}))
+        z.writestr("Payload/Jitterbug.app/PlugIns/JitterbugTunnel.appex/JitterbugTunnel", b"bin")
+
+
+print("=== CASE J (v60): hết hạn mức App ID + có wildcard → giữ nguyên bundle id, extension che phủ ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False  # H2/H3 để sót True ở class attr
+make_jit_ipa(ipa)
+# iPhone đang cài SideStore (bundle phái sinh) —stub trả CHUỖI như Chaquopy thật
+DeviceNative.installed_raw = "com.SideStore.SideStore.sa9b733\ncom.other.InstalledApp"
+FakeDevAPI.app_id_limit = True
+FakeDevAPI.extra_app_ids = [
+    {"identifier": "com.osy86.*", "appIdId": "WC1"},
+    {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "cài thành công qua wildcard khi hết hạn mức App ID")
+dev = FakeDevAPI.instances[-1]
+check(dev.created_ids == [], f"KHÔNG tạo App ID mới nào: {dev.created_ids}")
+calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
+app_dir_j = calls[0]["args"][-1] if calls else ""
+with open(os.path.join(app_dir_j, "Info.plist"), "rb") as f:
+    jit_plist = plistlib.load(f)
+check(jit_plist["CFBundleIdentifier"] == "com.osy86.Jitterbug",
+      f"wildcard → KHÔNG đổi bundle id: {jit_plist['CFBundleIdentifier']}")
+check(os.path.isdir(os.path.join(app_dir_j, "PlugIns", "JitterbugTunnel.appex")),
+      "extension KHÔNG bị bỏ (wildcard che phủ)")
+ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
+check(len(ms) == 2, f"2 profile (app + extension) dùng chung wildcard: {ms}")
+
+print("=== CASE K (v60): hết hạn mức, KHÔNG wildcard → tái dùng App ID trống, tự bỏ extension ===")
+reset_run()
+make_jit_ipa(ipa)
+DeviceNative.installed_raw = ["com.SideStore.SideStore.sa9b733"]
+FakeDevAPI.app_id_limit = True
+FakeDevAPI.has_wildcard = False
+FakeDevAPI.extra_app_ids = [
+    {"identifier": "com.old.Uninstalled", "appIdId": "OLD1"},
+    {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "cài thành công: tái dùng App ID trống + bỏ extension")
+dev = FakeDevAPI.instances[-1]
+check(dev.created_ids == [], f"KHÔNG tạo App ID mới: {dev.created_ids}")
+calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
+app_dir_k = calls[0]["args"][-1] if calls else ""
+with open(os.path.join(app_dir_k, "Info.plist"), "rb") as f:
+    k_plist = plistlib.load(f)
+check(k_plist["CFBundleIdentifier"] == "com.old.Uninstalled",
+      f"tái dùng App ID trống 'com.old.Uninstalled': {k_plist['CFBundleIdentifier']}")
+check(k_plist["CFBundleIdentifier"] != "com.SideStore.SideStore.sa9b733.AltWidget",
+      "KHÔNG chọn nhầm App ID extension của app đang cài (bug v59)")
+check(not os.path.exists(os.path.join(app_dir_k, "PlugIns")),
+      "extension bị tự bỏ (hết hạn mức, không còn App ID cho extension)")
+ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
+check(len(ms) == 1, f"chỉ 1 profile cho app chính: {ms}")
+check(dev.profiles_for == ["com.old.Uninstalled"], f"profile cho đúng App ID tái dùng: {dev.profiles_for}")
+
 print("=== CASE I (v56): nhúng file ghép nối — tắt cờ / app ngoài danh sách ===")
 reset_run()
 FakeDevAPI.cert_fail_first = False  # H2/H3 để sót True ở class attr (instance shadow)
@@ -446,6 +541,7 @@ make_ipa(ipa)  # các case trước đã tiêu thụ file ipa gốc
 ok = core.do_sideload(ipa, "user@example.com", "pw", embed_pairing=False)
 check(ok is True, "do_sideload thành công khi embed_pairing=False")
 check(native_calls["embedded"] == [], f"embed_pairing=False → KHÔNG nhúng file ghép nối: {native_calls['embedded']}")
+check(native_calls["prefs"] == [], f"embed_pairing=False → KHÔNG ghi UserDefaults: {native_calls['prefs']}")
 
 reset_run()
 ipa_other = os.path.join(WORK, "Other.ipa")
@@ -457,6 +553,7 @@ with zipfile.ZipFile(ipa_other, "w") as z:
 ok = core.do_sideload(ipa_other, "user@example.com", "pw")
 check(ok is True, "cài app ngoài danh sách ghép nối vẫn thành công")
 check(native_calls["embedded"] == [], f"app không cần ghép nối → không nhúng: {native_calls['embedded']}")
+check(native_calls["prefs"] == [], f"app ngoài danh sách → KHÔNG ghi UserDefaults: {native_calls['prefs']}")
 
 shutil.rmtree(WORK, ignore_errors=True)
 print("=" * 70)

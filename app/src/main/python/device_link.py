@@ -152,11 +152,15 @@ def list_installed_apps(pair_record: dict) -> list:
     """
     try:
         from com.superalpha.sideload.bridge import DeviceNative
-        bundle_ids = DeviceNative.listInstalledApps()
-        if bundle_ids is not None:
-            result = list(bundle_ids)
-            print(f"[device_link] list_installed_apps: tìm thấy {len(result)} app.")
-            return result
+        raw = DeviceNative.listInstalledApps()
+        # v60: Kotlin trả chuỗi join "\n" (List<String> qua Chaquopy là
+        # proxy ArrayList không iterate được). Chấp nhận cả list cho test.
+        if isinstance(raw, (list, tuple)):
+            result = [str(b) for b in raw]
+        else:
+            result = [line for line in str(raw or "").split("\n") if line]
+        print(f"[device_link] list_installed_apps: tìm thấy {len(result)} app.")
+        return result
     except Exception as e:
         print(f"[device_link] list_installed_apps: {e}")
     return []

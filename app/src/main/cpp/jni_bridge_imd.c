@@ -839,6 +839,92 @@ static char *build_pairing_file_xml(uint32_t *out_len) {
     return xml;
 }
 
+/* ─── v59: ghi 1 file vào data container qua AFC (tạo sẵn thư mục cha) ─── */
+static bool afc_write_file_all(afc_client_t afc, const char *path, const char *data, uint32_t len) {
+    char dirs[512];
+    snprintf(dirs, sizeof(dirs), "%s", path);
+    for (char *p = dirs + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            afc_make_directory(afc, dirs);
+            *p = '/';
+        }
+    }
+    uint64_t h = 0;
+    afc_error_t e = afc_file_open(afc, path, AFC_FOPEN_WR, &h);
+    if (e != AFC_E_SUCCESS || !h) {
+        emitf("[pairing] ❌ afc_file_open(%s) thất bại (AFC lỗi %d)", path, (int)e);
+        return false;
+    }
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t w = 0;
+        if (afc_file_write(afc, h, data + done, len - done, &w) != AFC_E_SUCCESS || w == 0) {
+            emitf("[pairing] ❌ afc_file_write(%s) thất bại (đã ghi %u/%u)", path, done, len);
+            afc_file_close(afc, h);
+            return false;
+        }
+        done += w;
+    }
+    afc_file_close(afc, h);
+    return true;
+}
+
+/* Đọc file plist nhị phân/XML qua AFC — trả dict hoặc NULL nếu không có. */
+static plist_t afc_read_plist(afc_client_t afc, const char *path) {
+    uint64_t h = 0;
+    if (afc_file_open(afc, path, AFC_FOPEN_RDONLY, &h) != AFC_E_SUCCESS || !h) return NULL;
+    uint32_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        uint32_t r = 0;
+        if (afc_file_read(afc, h, buf + len, cap - len, &r) != AFC_E_SUCCESS || r == 0) break;
+        len += r;
+        if (len == cap) {
+            cap *= 2;
+            if (cap > 262144) break; /* file prefs không thể lớn thế */
+            char *nb = realloc(buf, cap);
+            if (!nb) break;
+            buf = nb;
+        }
+    }
+    afc_file_close(afc, h);
+    if (!buf || len == 0) { free(buf); return NULL; }
+    plist_t pl = NULL;
+    plist_format_t fmt = PLIST_FORMAT_XML;
+    if (plist_from_memory(buf, len, &pl, &fmt) != PLIST_ERR_SUCCESS || !pl
+            || plist_get_node_type(pl) != PLIST_DICT) {
+        if (pl) plist_free(pl);
+        free(buf);
+        return NULL;
+    }
+    free(buf);
+    return pl;
+}
+
+/*
+ * Ghi UserDefaults kích hoạt pairing (v59): đọc file cũ nếu có (giữ các khóa
+ * khác), đặt activePairingProtocol + preferredPairingProtocol = "lockdown",
+ * isPairingReset = false — SideStore 0.7+ mặc định isPairingReset=true và
+ * KHÔNG tự nạp file ghép nối trong Documents cho tới khi có các khóa này.
+ */
+static bool write_pairing_prefs(afc_client_t afc, const char *path) {
+    plist_t prefs = afc_read_plist(afc, path);
+    if (!prefs) prefs = plist_new_dict();
+    plist_dict_set_item(prefs, "activePairingProtocol", plist_new_string("lockdown"));
+    plist_dict_set_item(prefs, "preferredPairingProtocol", plist_new_string("lockdown"));
+    plist_dict_set_item(prefs, "isPairingReset", plist_new_bool(0));
+    char *bin = NULL;
+    uint32_t blen = 0;
+    bool ok = false;
+    if (plist_to_bin(prefs, &bin, &blen) == PLIST_ERR_SUCCESS && bin && blen) {
+        ok = afc_write_file_all(afc, path, bin, blen);
+    }
+    free(bin);
+    plist_free(prefs);
+    return ok;
+}
+
 /* Nội dung file ghép nối hiện tại (XML plist + UDID) — cho nút Xuất file. */
 JNIEXPORT jstring JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFile(JNIEnv *env, jobject obj) {
@@ -918,41 +1004,12 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
 
         /*
          * iLoader place_file(): gốc AFC sau VendDocuments là DATA CONTAINER
-         * của app — file phải ghi vào /Documents/<rel_path>, không phải "/"
-         * (v56 ghi nhầm ở gốc → afc_file_open bị từ chối). Luôn tạo sẵn
-         * /Documents + các thư mục cha, bỏ qua lỗi "đã tồn tại".
+         * của app — file phải ghi vào /Documents/<rel_path> (v56 ghi nhầm ở
+         * gốc "/" → bị từ chối). afc_write_file_all tự tạo thư mục cha.
          */
         char remote[512];
         snprintf(remote, sizeof(remote), "/Documents/%s", rel);
-        for (char *p = remote + 1; *p; p++) {
-            if (*p == '/') {
-                *p = 0;
-                afc_make_directory(afc, remote);
-                *p = '/';
-            }
-        }
-        afc_make_directory(afc, "/Documents");
-
-        uint64_t handle = 0;
-        afc_error_t afe = afc_file_open(afc, remote, AFC_FOPEN_WR, &handle);
-        if (afe != AFC_E_SUCCESS || !handle) {
-            emitf("[pairing] ❌ afc_file_open(%s) thất bại (AFC lỗi %d)", remote, (int)afe);
-            break;
-        }
-        uint32_t total = (uint32_t)strlen(xml);
-        uint32_t done = 0;
-        bool werr = false;
-        while (done < total) {
-            uint32_t w = 0;
-            if (afc_file_write(afc, handle, xml + done, total - done, &w) != AFC_E_SUCCESS || w == 0) {
-                emitf("[pairing] ❌ afc_file_write thất bại (đã ghi %u/%u)", done, total);
-                werr = true;
-                break;
-            }
-            done += w;
-        }
-        afc_file_close(afc, handle);
-        if (!werr && done == total) {
+        if (afc_write_file_all(afc, remote, xml, (uint32_t)strlen(xml))) {
             emitf("[pairing] ✅ Đã ghi file ghép nối vào Documents của %s", bundle);
             ok = JNI_TRUE;
         }
@@ -969,6 +1026,86 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
     pthread_mutex_unlock(&g_api);
     if (bundle) (*env)->ReleaseStringUTFChars(env, j_bundle, bundle);
     if (rel) (*env)->ReleaseStringUTFChars(env, j_rel, rel);
+    return ok;
+}
+
+/*
+ * v59: TỰ KÍCH HOẠT file ghép nối cho SideStore vừa cài (app chưa từng mở).
+ *
+ * SideStore 0.7+ mặc định isPairingReset=true (register defaults) và không
+ * tự nạp file ghép nối có sẵn trong Documents — người dùng phải chọn file 1
+ * lần qua UI. Hàm này ghi thẳng UserDefaults của SideStore trong data
+ * container (qua chính AFC đã vend):
+ *   /Library/Preferences/<bundle>.plist        (UserDefaults.standard)
+ *   /Library/Preferences/group.com.SideStore.SideStore.plist (suite)
+ * với activePairingProtocol = preferredPairingProtocol = "lockdown",
+ * isPairingReset = false → lần đầu mở app, boot sequence tự nạp
+ * PairingFile_Lockdown.plist và start minimuxer, không cần bấm gì cả.
+ * File cũ nếu có được ĐỌC và MERGE (không mất khóa khác). Chỉ tác dụng khi
+ * SideStore CHƯA chạy (cfprefcd cache) — đúng kịch bản cài xong qua tool.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeWriteSideStorePrefs(
+        JNIEnv *env, jobject obj, jstring j_bundle) {
+    (void)obj;
+    const char *bundle = j_bundle ? (*env)->GetStringUTFChars(env, j_bundle, NULL) : NULL;
+    jboolean ok = JNI_FALSE;
+    house_arrest_client_t ha = NULL;
+    pthread_mutex_lock(&g_api);
+    do {
+        if (!bundle || !*bundle) {
+            emit_log("[prefs] ❌ Thiếu bundle id");
+            break;
+        }
+        if (!g_device || !g_paired) {
+            emit_log("[prefs] ❌ iPhone chưa kết nối / chưa ghép nối");
+            break;
+        }
+        house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
+        if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
+            emitf("[prefs] ❌ Không mở được house_arrest (lỗi %d)", (int)he);
+            break;
+        }
+        he = house_arrest_send_command(ha, "VendDocuments", bundle);
+        plist_t res = NULL;
+        if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
+        if (he == HOUSE_ARREST_E_SUCCESS && res) {
+            plist_t err_item = plist_dict_get_item(res, "Error");
+            if (err_item) {
+                char *es = NULL;
+                plist_get_string_val(err_item, &es);
+                emitf("[prefs] ❌ iPhone từ chối truy cập Documents của %s (%s)",
+                      bundle, es ? es : "?");
+                free(es);
+                he = HOUSE_ARREST_E_UNKNOWN_ERROR;
+            }
+        }
+        if (res) plist_free(res);
+        if (he != HOUSE_ARREST_E_SUCCESS) break;
+
+        afc_client_t afc = NULL;
+        if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
+            emit_log("[prefs] ❌ Không chuyển sang chế độ AFC được");
+            break;
+        }
+
+        char path[600];
+        snprintf(path, sizeof(path), "/Library/Preferences/group.com.SideStore.SideStore.plist");
+        bool o1 = write_pairing_prefs(afc, path);
+        snprintf(path, sizeof(path), "/Library/Preferences/%s.plist", bundle);
+        bool o2 = write_pairing_prefs(afc, path);
+        if (o1 || o2) {
+            emitf("[prefs] ✅ Đã ghi UserDefaults kích hoạt pairing cho %s — mở app là tự dùng, không cần chọn file.", bundle);
+            ok = JNI_TRUE;
+        } else {
+            emit_log("[prefs] ❌ Không ghi được UserDefaults của SideStore");
+        }
+    } while (0);
+
+    /* Chỉ free house_arrest (afc sharing service_client — tránh double-free). */
+    if (ha) house_arrest_client_free(ha);
+    pthread_mutex_unlock(&g_api);
+    if (bundle) (*env)->ReleaseStringUTFChars(env, j_bundle, bundle);
     return ok;
 }
 

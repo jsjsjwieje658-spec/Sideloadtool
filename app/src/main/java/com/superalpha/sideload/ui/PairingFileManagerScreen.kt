@@ -174,14 +174,14 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
         }
 
         // ── Hướng dẫn kích hoạt (v58) ──────────────────────────────────────
-        SectionCard(title = "Kích hoạt trong SideStore (1 lần duy nhất)", icon = Icons.Filled.PhonelinkSetup) {
+        SectionCard(title = "Kích hoạt pairing (tự động / thủ công)", icon = Icons.Filled.PhonelinkSetup) {
             Text(
-                "SideStore 0.7 trở lên KHÔNG tự nạp file ghép nối có sẵn — " +
-                        "sau khi nhúng, làm 1 lần duy nhất:\n" +
-                        "1. Mở SideStore → khi hiện hộp thoại chọn file ghép nối, bấm chọn file\n" +
-                        "2. Chọn \"Trên iPhone của tôi\" → SideStore → PairingFile_Lockdown.plist\n" +
-                        "3. Nếu không thấy hộp thoại: Cài đặt → Advanced → Pairing File → Import, " +
-                        "chọn file như trên rồi KHỞI ĐỘNG LẠI SideStore",
+                "• SideStore CÀI QUA TOOL (chưa từng mở): tool tự ghi cả UserDefaults " +
+                        "kích hoạt — mở app lên là tự dùng ngay, không cần bấm gì.\n" +
+                        "• SideStore ĐÃ MỞ TRƯỚC ĐÓ: bản 0.7 không tự nạp file có sẵn — làm 1 lần: " +
+                        "mở SideStore → hộp thoại chọn file → \"Trên iPhone của tôi\" → SideStore → " +
+                        "PairingFile_Lockdown.plist. Không thấy hộp thoại thì Cài đặt → Advanced → " +
+                        "Pairing File → Import rồi khởi động lại app.",
                 style = MaterialTheme.typography.bodySmall,
                 color = BrandTextDim
             )
@@ -240,7 +240,7 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
                         }
                         Spacer(Modifier.width(8.dp))
                         Button(
-                            onClick = { viewModel.embedPairingNow(app.bundleId, app.paths) },
+                            onClick = { viewModel.embedPairingNow(app.bundleId, app.paths, app.autoActivate) },
                             enabled = pairingFileReady && !busy,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                         ) {

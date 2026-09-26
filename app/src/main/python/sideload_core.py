@@ -330,11 +330,22 @@ def _installed_bundle_ids() -> set:
         return set()
 
 
+def _app_id_occupied_by_device(ident, installed):
+    """v60: App ID bị coi là ĐANG BỊ CHIẾM nếu trùng bundle id của một app đang
+    cài HOẶC là extension của app đang cài (vd 'X.AltWidget' khi X đang cài —
+    extension không xuất hiện riêng trong danh sách browse nhưng đang sống
+    bên trong app X; v59 chọn nhầm App ID kiểu này khiến cài đè widget của
+    SideStore)."""
+    if ident in installed:
+        return True
+    return any(ident.startswith(i + ".") for i in installed)
+
+
 def _choose_replacement_app_id(app_ids, original_bundle_id, installed):
     exact, prefixed, other = [], [], []
     for a in app_ids or []:
         ident = _app_id_identifier(a)
-        if not ident or "*" in ident or ident in installed:
+        if not ident or "*" in ident or _app_id_occupied_by_device(ident, installed):
             continue
         if ident == original_bundle_id:
             exact.append(a)
@@ -342,10 +353,28 @@ def _choose_replacement_app_id(app_ids, original_bundle_id, installed):
             prefixed.append(a)
         else:
             other.append(a)
+    all_idents = {_app_id_identifier(a) for a in (app_ids or []) if _app_id_identifier(a)}
+
+    def _is_ext_of_other(ident):
+        return any(id2 != ident and ident.startswith(id2 + ".") for id2 in all_idents)
+
+    # Ưu tiên App ID "trung lập" (không phải id extension của App ID khác) —
+    # tránh kiểu 'X.AltWidget' làm bundle id chính.
+    other.sort(key=lambda a: _is_ext_of_other(_app_id_identifier(a)))
     for bucket in (exact, prefixed, other):
         if bucket:
             return _app_id_identifier(bucket[0]), bucket[0]
     return None, None
+
+
+def _wildcard_matches(pattern, bundle_id):
+    if not pattern or not bundle_id:
+        return False
+    if pattern == "*":
+        return True
+    if pattern.endswith(".*"):
+        return bundle_id.startswith(pattern[:-1])  # giữ lại dấu chấm
+    return pattern == bundle_id
 
 
 def _remember_app_id(state, team_id, base_bundle, ident, app_id):
@@ -397,6 +426,12 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
               " toàn cầu — rất hay gặp với SideStore/AltStore). Sẽ đổi bundle id của IPA.")
     if limit:
         print("[appid]    → tài khoản đã hết lượt tạo App ID (10 / 7 ngày). Sẽ tái dùng App ID sẵn có.")
+        for wc in app_ids or []:
+            wc_ident = _app_id_identifier(wc)
+            if wc_ident and "*" in wc_ident and _wildcard_matches(wc_ident, bundle_id):
+                print(f"[appid] ♻️  Dùng App ID wildcard '{wc_ident}' — giữ nguyên bundle id "
+                      f"'{bundle_id}', extension cũng được che phủ (không tốn lượt tạo App ID).")
+                return wc, bundle_id
 
     for a in app_ids:                          # App ID phái sinh từ lần chạy trước
         ident = _app_id_identifier(a)
@@ -465,14 +500,6 @@ def _remove_extensions(app_bundle_path):
     print(f"[appid] 🗑  Đã bỏ {len(removed)} extension: {', '.join(removed) or '(không có)'}")
 
 
-def _ask_drop_extensions(failed_id) -> bool:
-    answer = _ui_input(
-        f"Không đăng ký được App ID cho extension '{failed_id}' (thường do hết 10 App ID/7 ngày).\n"
-        "App chính vẫn cài được nếu bỏ extension (mất widget/share extension…).\n"
-        "Gõ C để bỏ extension và tiếp tục, bỏ trống để huỷ:")
-    return answer.strip().lower() in ("c", "co", "có", "y", "yes")
-
-
 def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name, state, team_id):
     """→ list[(bundle_path, bundle_id, profile_path)] (phần tử đầu = app chính)."""
     app_ids = dev_api.list_app_ids()
@@ -480,21 +507,35 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
     main_app_id, final_bundle_id = _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id)
     if not main_app_id:
         return None
-    final_bundle_id = _app_id_identifier(main_app_id) or final_bundle_id
+    resolved_ident = _app_id_identifier(main_app_id)
+    if "*" in resolved_ident:
+        # Wildcard: profile che phủ theo mẫu — GIỮ NGUYÊN bundle id gốc của IPA.
+        final_bundle_id = bundle_id
+    else:
+        final_bundle_id = resolved_ident or final_bundle_id
     if final_bundle_id != bundle_id:
         print(f"[appid] Ghi đè bundle id trong IPA cho khớp App ID đã nộp: {bundle_id} → {final_bundle_id}")
         set_bundle_id(app_bundle_path, final_bundle_id)
 
+    wildcard_mode = "*" in (_app_id_identifier(main_app_id) or "")
     targets = [(app_bundle_path, final_bundle_id, main_app_id)]
     for appex_path, appex_id in find_extensions(app_bundle_path):     # đọc SAU khi đã đổi
+        if wildcard_mode:
+            print(f"[appid] ✅ Extension '{appex_id}' được che phủ bởi wildcard profile — không cần App ID riêng.")
+            targets.append((appex_path, appex_id, main_app_id))
+            continue
         label = f"{app_name} {os.path.splitext(os.path.basename(appex_path))[0]}"
         appex_app_id, final_appex_id = _ensure_app_id(dev_api, app_ids, appex_id, label)
         if not appex_app_id:
-            if _ask_drop_extensions(appex_id):
-                _remove_extensions(app_bundle_path)
-                targets = targets[:1]
-                break
-            return None
+            # v60: TỰ ĐỘNG bỏ extension (thay vì hỏi) — yêu cầu người dùng
+            # 2026-09-26: cài được app chính thay vì dừng cả quy trình.
+            print(f"[appid] ⚠️  Không đăng ký được App ID cho extension '{appex_id}' (thường do hết "
+                  "10 App ID / 7 ngày) — tự bỏ extension để cài được app chính. App có thể mất "
+                  "widget/tunnel/share… ; xoá bớt app không dùng trên iPhone rồi cài lại, hoặc chờ "
+                  "hết chu kỳ 7 ngày để có lại App ID cho extension.")
+            _remove_extensions(app_bundle_path)
+            targets = targets[:1]
+            break
         if final_appex_id != appex_id:
             print(f"[appid] Ghi đè bundle id của extension: {appex_id} → {final_appex_id}")
             set_extension_bundle_id(appex_path, final_appex_id)
@@ -579,6 +620,17 @@ _PAIRING_APPS = (
     ("Reynard", ("pairingFile.plist",)),
     ("PanicAnalyzer", ("pairingFile.plist",)),
 )
+
+
+def _pairing_needs_prefs(app_name: str, bundle_id: str) -> bool:
+    """True nếu app là SideStore cài TRỰC TIẾP (không phải LiveContainer) —
+    các bản này dùng UserDefaults trong chính container của app, tool ghi
+    được luôn để tự kích hoạt pairing file (v59)."""
+    name_l = str(app_name or "").strip().lower()
+    bid_l = str(bundle_id or "").lower()
+    if "livecontainer" in name_l or "livecontainer" in bid_l:
+        return False
+    return "sidestore" in name_l or "sidestore" in bid_l
 
 
 def _pairing_rel_paths_for(app_name: str, bundle_id: str) -> tuple:
@@ -816,11 +868,22 @@ def do_sideload(
                     print(f"[pairing] ⚠️ Lỗi khi nhúng file ghép nối: {e}")
                 if placed:
                     print(f"[pairing] ✅ Đã ghi {len(rels)} file ghép nối vào Documents của {app_name}.")
-                    print("[pairing] ℹ️ SideStore 0.7+ KHÔNG tự nạp file có sẵn — kích hoạt 1 lần duy nhất:")
-                    print("[pairing]    1. Mở SideStore → khi hiện hộp thoại chọn file ghép nối → bấm chọn file")
-                    print('[pairing]    2. Chọn "Trên iPhone của tôi" → SideStore → PairingFile_Lockdown.plist')
-                    print("[pairing]    3. Nếu không thấy hộp thoại: Cài đặt → Advanced → Pairing File → Import")
-                    print("[pairing]       rồi chọn file như trên, sau đó KHỞI ĐỘNG LẠI SideStore.")
+                    activated = False
+                    if _pairing_needs_prefs(app_name, targets[0][1]):
+                        try:
+                            if DeviceNative.writeSideStorePrefs(targets[0][1]):
+                                activated = True
+                                print("[pairing] ✅ Đã ghi UserDefaults tự kích hoạt — mở SideStore là chạy, "
+                                      "không cần chọn file.")
+                        except Exception as e:
+                            print(f"[pairing] ⚠️ Lỗi ghi UserDefaults: {e}")
+                    if not activated:
+                        print("[pairing] ℹ️ Nếu app không tự nhận pairing (SideStore 0.7+ không tự nạp file "
+                              "với app đã từng mở) — kích hoạt 1 lần duy nhất:")
+                        print("[pairing]    1. Mở SideStore → khi hiện hộp thoại chọn file ghép nối → bấm chọn file")
+                        print('[pairing]    2. Chọn "Trên iPhone của tôi" → SideStore → PairingFile_Lockdown.plist')
+                        print("[pairing]    3. Nếu không thấy hộp thoại: Cài đặt → Advanced → Pairing File → Import")
+                        print("[pairing]       rồi chọn file như trên, sau đó KHỞI ĐỘNG LẠI SideStore.")
                 else:
                     print("[pairing] ⚠️ Không nhúng được file ghép nối (cài đặt vẫn thành công).")
 

@@ -233,7 +233,13 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     // ── v56: Quản lý file ghép nối (.mobiledevicepairing) ────────────────────
 
     /** App đã cài trên iPhone cần file ghép nối (kết quả "Quét app"). */
-    data class PairingAppInfo(val displayName: String, val bundleId: String, val paths: List<String>)
+    data class PairingAppInfo(
+        val displayName: String,
+        val bundleId: String,
+        val paths: List<String>,
+        /** true với SideStore cài trực tiếp → ghi thêm UserDefaults tự kích hoạt. */
+        val autoActivate: Boolean = false
+    )
 
     private val _autoEmbedPairing = MutableStateFlow(AppConfig.autoEmbedPairing)
     val autoEmbedPairing: StateFlow<Boolean> = _autoEmbedPairing
@@ -283,7 +289,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             }
             for ((bundleId, displayName) in matches) {
                 if (seen.add(bundleId)) {
-                    result.add(PairingAppInfo(displayName.ifBlank { name }, bundleId, paths))
+                    result.add(PairingAppInfo(displayName.ifBlank { name }, bundleId, paths,
+                        autoActivate = name == "SideStore"))
                 }
             }
         }
@@ -295,7 +302,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
      * v58: ghi MỌI đường dẫn của app đó (SideStore 0.7+ dùng tên file mới
      * PairingFile_Lockdown.plist, bản cũ dùng ALTPairingFile.mobiledevicepairing).
      */
-    fun embedPairingNow(bundleId: String, paths: List<String>) {
+    fun embedPairingNow(bundleId: String, paths: List<String>, autoActivate: Boolean = false) {
         if (_busy.value) {
             NativeLog.emit("[pairing] ⏳ Đang bận — thử lại sau.")
             return
@@ -309,7 +316,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 if (nativeBridge.writePairingFileToApp(bundleId, rel)) placed = true
             }
             if (placed) {
-                NativeLog.emit("[pairing] ✅ Đã ghi xong — xem hướng dẫn kích hoạt trong tab File ghép nối.")
+                if (autoActivate) {
+                    val prefsOk = nativeBridge.writeSideStoreUserDefaults(bundleId)
+                    if (prefsOk) {
+                        NativeLog.emit("[pairing] ✅ Đã ghi file + UserDefaults tự kích hoạt — mở SideStore là chạy.")
+                    } else {
+                        NativeLog.emit("[pairing] ✅ Đã ghi file ghép nối (UserDefaults không ghi được — nếu app đã từng mở thì chọn file theo hướng dẫn trong tab).")
+                    }
+                } else {
+                    NativeLog.emit("[pairing] ✅ Đã ghi xong — xem hướng dẫn kích hoạt trong tab File ghép nối.")
+                }
             } else {
                 NativeLog.emit("[pairing] ❌ Không nhúng được — xem nhật ký phía trên.")
             }
