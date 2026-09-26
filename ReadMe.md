@@ -26,8 +26,11 @@ ngay trong một chiếc điện thoại Android.
   đang cài — không được tái dùng), tự tái dùng App ID trống; nếu tài khoản
   có App ID wildcard thì giữ nguyên bundle id gốc và extension cũng được
   che phủ; hết lượt tạo App ID cho extension thì extension DÙNG CHUNG App
-  ID + profile của app chính (kiểu "Use Main Profile" của SideStore — bundle
-  id extension vẫn derive đúng tiền tố, VPN/tunnel/widget không bị bỏ).
+  ID + profile của app chính (đúng cách "Use Main Profile" của SideStore:
+  bundle id extension được đặt bằng bundle id của profile chính, xoá
+  _CodeSignature cũ trước khi ký, profile trùng được dedupe — VPN/tunnel/
+  widget không bị bỏ). Chấp nhận cả IPA zip lại từ .app trần (thiếu
+  Payload/).
 - **Đăng nhập một lần** — Apple ID + mật khẩu lưu riêng tư trên máy; đổi tài
   khoản bằng nút "Đăng xuất" trong Cài đặt.
 - **Thu hồi chứng chỉ Development** theo lựa chọn (tất cả / theo số thứ tự).

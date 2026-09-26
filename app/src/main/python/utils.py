@@ -86,18 +86,74 @@ def extract_ipa(ipa_path, output_dir):
     print(f"[IPA] Giải nén hoàn tất.")
     return output_dir
 
+def _find_app_dir_in(folder):
+    """Tìm thư mục *.app (ưu tiên cái có Info.plist) trong một thư mục."""
+    fallback = None
+    try:
+        items = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    for item in items:
+        full = os.path.join(folder, item)
+        if item.endswith(".app") and os.path.isdir(full):
+            if os.path.isfile(os.path.join(full, "Info.plist")):
+                return full
+            fallback = fallback or full
+    return fallback
+
+
 def find_app_bundle(extracted_ipa_path):
-    """Tìm thư mục .app trong IPA đã giải nén."""
-    payload_path = os.path.join(extracted_ipa_path, "Payload")
-    if not os.path.exists(payload_path):
-        raise Exception(f"Thư mục Payload không tìm thấy trong {extracted_ipa_path}")
-    
-    for item in os.listdir(payload_path):
-        if item.endswith(".app"):
-            app_bundle_path = os.path.join(payload_path, item)
-            print(f"[IPA] Tìm thấy thư mục .app: {app_bundle_path}")
-            return app_bundle_path
-    raise Exception(f"Không tìm thấy thư mục .app trong {payload_path}")
+    """Tìm thư mục .app trong IPA đã giải nén.
+
+    v62: một số IPA không theo chuẩn `Payload/*.app` ở gốc (zip lại từ thư
+    mục .app trần, Payload lồng một cấp, viết hoa khác...) — trước đây tool
+    raise "Thư mục Payload không tìm thấy" và dừng hẳn. Giờ tìm theo thứ tự:
+      1. Payload/ (bất kể hoa/thường) ở gốc — chuẩn IPA
+      2. *.app ngay ở gốc — zip của thư mục .app
+      3. */Payload/*.app — lồng một cấp
+    Không thấy thì báo lỗi kèm danh sách thư mục (chẩn đoán ngay được file
+    người dùng chọn thực chất là gì)."""
+    try:
+        top = sorted(os.listdir(extracted_ipa_path))
+    except OSError as e:
+        raise Exception(f"Không đọc được thư mục đã giải nén: {e}")
+
+    # 1) Payload/ ở gốc (chuẩn IPA, bỏ qua hoa/thường)
+    for item in top:
+        if item.lower() == "payload" and os.path.isdir(os.path.join(extracted_ipa_path, item)):
+            found = _find_app_dir_in(os.path.join(extracted_ipa_path, item))
+            if found:
+                print(f"[IPA] Tìm thấy thư mục .app: {found}")
+                return found
+
+    # 2) .app ngay ở gốc (file zip của thư mục .app, thiếu Payload/)
+    found = _find_app_dir_in(extracted_ipa_path)
+    if found:
+        print(f"[IPA] ⚠️ IPA không có thư mục Payload/ — dùng .app nằm ở gốc: {found}")
+        return found
+
+    # 3) Payload lồng một cấp (vd App/Payload/X.app)
+    for item in top:
+        sub = os.path.join(extracted_ipa_path, item)
+        if item == "__MACOSX" or not os.path.isdir(sub):
+            continue
+        try:
+            sub_items = sorted(os.listdir(sub))
+        except OSError:
+            continue
+        for sub_item in sub_items:
+            if sub_item.lower() == "payload" and os.path.isdir(os.path.join(sub, sub_item)):
+                found = _find_app_dir_in(os.path.join(sub, sub_item))
+                if found:
+                    print(f"[IPA] ⚠️ Payload/ lồng trong '{item}' — dùng .app: {found}")
+                    return found
+
+    listing = ", ".join(top[:12]) or "(trống)"
+    raise Exception(
+        f"File này không phải IPA chuẩn: không tìm thấy Payload/*.app sau khi giải nén. "
+        f"Nội dung gốc của file: [{listing}]"
+        + (f" … (+{len(top) - 12} mục)" if len(top) > 12 else "")
+        + ". Hãy kiểm tra lại file đã chọn (có thể là file khác .ipa hoặc tải chưa xong).")
 
 def get_bundle_id(app_bundle_path):
     """Lấy Bundle ID từ Info.plist."""

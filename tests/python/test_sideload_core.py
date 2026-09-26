@@ -504,7 +504,7 @@ check(jit_plist["CFBundleIdentifier"] == "com.osy86.Jitterbug",
 check(os.path.isdir(os.path.join(app_dir_j, "PlugIns", "JitterbugTunnel.appex")),
       "extension KHÔNG bị bỏ (wildcard che phủ)")
 ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
-check(len(ms) == 2, f"2 profile (app + extension) dùng chung wildcard: {ms}")
+check(len(ms) == 1, f"v62: wildcard dedupe — 1 cờ -m cho app + extension: {ms}")
 
 print("=== CASE K (v61): hết hạn mức, KHÔNG wildcard → tái dùng App ID trống, extension DÙNG CHUNG profile chính ===")
 reset_run()
@@ -532,10 +532,11 @@ appex_k = os.path.join(app_dir_k, "PlugIns", "JitterbugTunnel.appex")
 check(os.path.isdir(appex_k), "extension KHÔNG bị bỏ (VPN/tunnel cần nó)")
 with open(os.path.join(appex_k, "Info.plist"), "rb") as f:
     k_appex = plistlib.load(f)
-check(k_appex["CFBundleIdentifier"] == "com.old.Uninstalled.JitterbugTunnel",
-      f"bundle id extension derive từ App ID chính (đúng tiền tố): {k_appex['CFBundleIdentifier']}")
+check(k_appex["CFBundleIdentifier"] == "com.old.Uninstalled",
+      f"v62: bundle id extension == bundle id của profile chính (giống SideStore Use Main Profile): "
+      f"{k_appex['CFBundleIdentifier']}")
 ms = [args[i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
-check(len(ms) == 2, f"2 cờ -m (app + extension): {ms}")
+check(len(ms) == 1, f"v62: profile trùng nội dung được dedupe — chỉ 1 cờ -m: {ms}")
 check(dev.profiles_for == ["com.old.Uninstalled", "com.old.Uninstalled"],
       f"cả 2 profile đều của cùng App ID tái dùng (Use Main Profile): {dev.profiles_for}")
 for bundle_k, want_k in ((app_dir_k, "com.old.Uninstalled"), (appex_k, "com.old.Uninstalled")):
@@ -543,6 +544,31 @@ for bundle_k, want_k in ((app_dir_k, "com.old.Uninstalled"), (appex_k, "com.old.
         prof_k = plistlib.load(f)
     check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.{want_k}",
           f"profile trong {os.path.basename(bundle_k)} là của App ID chính")
+
+print("=== CASE L (v62): IPA không có Payload/ (.app nằm ở gốc) vẫn xử lý được ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False
+ipa_bare = os.path.join(WORK, "Bare.ipa")
+with zipfile.ZipFile(ipa_bare, "w") as z:
+    z.writestr("BareApp.app/Info.plist", plistlib.dumps({
+        "CFBundleIdentifier": "com.example.BareApp", "CFBundleDisplayName": "BareApp",
+        "CFBundleExecutable": "BareApp"}))
+    z.writestr("BareApp.app/BareApp", b"\xcf\xfa\xed\xfe binary")
+ok = core.do_sideload(ipa_bare, "user@example.com", "pw")
+check(ok is True, "IPA zip lại từ .app trần (thiếu Payload/) vẫn cài được")
+check(len(native_calls["sideloadIpa"]) == 1 and native_calls["sideloadIpa"][0].endswith("_signed.ipa"),
+      "vẫn cài đúng file đã ký")
+
+import utils as _utils
+bad_dir = os.path.join(WORK, "bad_extracted")
+os.makedirs(bad_dir, exist_ok=True)
+with open(os.path.join(bad_dir, "hello.txt"), "w") as f:
+    f.write("not an ipa")
+try:
+    _utils.find_app_bundle(bad_dir)
+    check(False, "file không phải IPA phải raise")
+except Exception as e:
+    check("hello.txt" in str(e), f"lỗi liệt kê nội dung để chẩn đoán: {str(e)[:60]}…")
 
 print("=== CASE I (v56): nhúng file ghép nối — tắt cờ / app ngoài danh sách ===")
 reset_run()

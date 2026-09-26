@@ -520,14 +520,22 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
             # v61: KHÔNG BỎ extension (v60 bỏ là sai — VPN/tunnel/widget sống
             # nhờ extension). Dùng chung App ID + profile của APP CHÍNH cho
             # extension — đúng cách "Keep App Extensions (Use Main Profile)"
-            # của SideStore. Bundle id extension đã được derive từ App ID
-            # chính (vd X.JitterbugTunnel khi App ID chính là X) nên luôn
-            # đúng tiền tố iOS yêu cầu; entitlement lấy từ profile chính.
+            # của SideStore.
+            #
+            # v62 (fix 0xe8008017 trên thiết bị thật): SideStore đặt bundle id
+            # của extension BẰNG ĐÚNG bundle id của profile chính (ResignApp-
+            # Operation.prepare: newBundleID = profile.bundleIdentifier) —
+            # KHÔNG phải X.Tunnel. Lý do: installd soi từng bundle, entitlement
+            # application-identifier (lấy từ profile, = X) phải khớp
+            # CFBundleIdentifier của chính bundle đó; để X.Tunnel là lệch →
+            # "Failed to verify code signature … 0xe8008017".
             print(f"[appid] ♻️  Không tạo được App ID riêng cho extension '{appex_id}' (hết lượt "
                   "10 App ID / 7 ngày) — dùng chung App ID + profile của app chính "
-                  f"'{final_bundle_id}' (kiểu Use Main Profile của SideStore). Nếu iPhone từ chối "
-                  "cài, xoá bớt app không dùng để giải phóng App ID rồi cài lại.")
-            targets.append((appex_path, appex_id, main_app_id))
+                  f"'{final_bundle_id}' (kiểu Use Main Profile của SideStore).")
+            set_extension_bundle_id(appex_path, final_bundle_id)
+            print(f"[appid]    Bundle id extension đặt bằng bundle id của profile chính: "
+                  f"{appex_id} → {final_bundle_id} (đúng cách SideStore làm).")
+            targets.append((appex_path, final_bundle_id, main_app_id))
             continue
         if final_appex_id != appex_id:
             print(f"[appid] Ghi đè bundle id của extension: {appex_id} → {final_appex_id}")
@@ -819,7 +827,41 @@ def do_sideload(
         os.makedirs(zsign_tmp_dir, exist_ok=True)
         zsign_bin = AppPaths.zsignPath()
         cmd = [zsign_bin, "-f", "-k", key_file, "-c", cert_file]
+
+        # v62 (fix 0xe8008017): xoá _CodeSignature cũ trong app + mọi bundle
+        # con trước khi ký — SideStore làm y hệt trong ResignAppOperation
+        # ("Removed _CodeSignature folder … may be the cause of some
+        # ApplicationVerificationFailed errors"): chữ ký cũ của nhà phát hành
+        # để sót file zsign không ghi đè thì installd báo "A signed resource
+        # has been added, modified, or deleted".
+        import hashlib as _hashlib
+        _removed_cs = 0
+        for _root, _dirs, _files in os.walk(app_dir):
+            if "_CodeSignature" in _dirs:
+                shutil.rmtree(os.path.join(_root, "_CodeSignature"), ignore_errors=True)
+                _dirs.remove("_CodeSignature")
+                _removed_cs += 1
+        if _removed_cs:
+            print(f"[sign] 🧹 Đã xoá {_removed_cs} thư mục _CodeSignature cũ (tránh lỗi verify 0xe8008017).")
+
+        # v62: dedupe profile TRÙNG NỘI DUNG trước khi truyền -m cho zsign —
+        # chế độ Use Main Profile tạo profile giống hệt nhau cho app +
+        # extension; truyền trùng làm zsign match lệch. Thứ tự giữ nguyên:
+        # profile của APP CHÍNH luôn đứng đầu (app chính là targets[0]).
+        _seen_profiles, _profile_args = set(), []
         for _bp, _ident, prof in targets:
+            try:
+                with open(prof, "rb") as _f:
+                    _key = _hashlib.md5(_f.read()).hexdigest()
+            except OSError:
+                _key = prof
+            if _key not in _seen_profiles:
+                _seen_profiles.add(_key)
+                _profile_args.append(prof)
+        if len(_profile_args) < len(targets):
+            print(f"[sign] ℹ️ {len(targets)} bundle dùng chung {len(_profile_args)} profile "
+                  "(Use Main Profile) — zsign sẽ ký tất cả bằng profile chính.")
+        for prof in _profile_args:
             cmd += ["-m", prof]
         cmd += ["-o", signed_ipa, "-z", "9", "-t", zsign_tmp_dir, app_dir]
         try:
