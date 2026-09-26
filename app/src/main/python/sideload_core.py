@@ -341,11 +341,13 @@ def _app_id_occupied_by_device(ident, installed):
     return any(ident.startswith(i + ".") for i in installed)
 
 
-def _choose_replacement_app_id(app_ids, original_bundle_id, installed):
+def _choose_replacement_app_id(app_ids, original_bundle_id, installed, exclude=()):
     exact, prefixed, other = [], [], []
     for a in app_ids or []:
         ident = _app_id_identifier(a)
         if not ident or "*" in ident or _app_id_occupied_by_device(ident, installed):
+            continue
+        if ident in exclude:
             continue
         if ident == original_bundle_id:
             exact.append(a)
@@ -444,6 +446,8 @@ def _resolve_main_app_id(dev_api, app_ids, bundle_id, app_name, state, team_id):
               " toàn cầu — rất hay gặp với SideStore/AltStore). Sẽ đổi bundle id của IPA.")
     if limit:
         print("[appid]    → tài khoản đã hết lượt tạo App ID (10 / 7 ngày). Sẽ tái dùng App ID sẵn có.")
+        print("[appid]      (giới hạn đếm số lượt TẠO trong 7 ngày — xoá App ID trên "
+              "developer.apple.com KHÔNG trả lại lượt; chỉ tái dùng App ID sẵn có hoặc chờ reset.)")
         for wc in app_ids or []:
             wc_ident = _app_id_identifier(wc)
             if wc_ident and "*" in wc_ident and _wildcard_covers(wc_ident, bundle_id, team_id):
@@ -543,6 +547,7 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
             #     (entitlement không khớp bundle id).
             #   - ext id = X (trùng app chính, kiểu SideStore Use Main Profile)
             #     → "Failed to set app extension placeholders" (APIInternalError).
+            # Ưu tiên 1: App ID WILDCARD che phủ — giữ nguyên bundle id extension.
             for wc in app_ids or []:
                 wc_ident = _app_id_identifier(wc)
                 if wc_ident and "*" in wc_ident and _wildcard_covers(wc_ident, appex_id, team_id):
@@ -552,11 +557,28 @@ def _prepare_app_ids_and_profiles(dev_api, app_bundle_path, bundle_id, app_name,
                     wildcard_mode = True
                     break
             else:
+                # Ưu tiên 2 (v65): TÁI DÙNG App ID trống khác cho extension — giống
+                # tính năng "Customize App Extensions" của SideStore (gán App ID
+                # bất kỳ cho từng extension, đổi bundle id extension cho khớp).
+                # Lưu ý: profile tải cho App ID này khớp ĐÚNG bundle id mới nên
+                # không gặp lỗi 0xe8008017; nếu iOS máy bạn vẫn bắt buộc tiền tố
+                # thì sẽ lỗi lúc cài — khi đó dùng wildcard như hướng dẫn.
+                _used = {t[1] for t in targets}
+                rep_id, rep_app = _choose_replacement_app_id(
+                    app_ids, appex_id, _installed_bundle_ids(), exclude=_used)
+                if rep_id:
+                    print(f"[appid] ♻️  Không tạo được App ID cho extension (giới hạn 10 lượt / 7 "
+                          f"ngày) — tái dùng App ID trống '{rep_id}' cho extension.")
+                    set_extension_bundle_id(appex_path, rep_id)
+                    print(f"[appid]    Đổi bundle id extension: {appex_id} → {rep_id} "
+                          "(kiểu Customize App Extensions của SideStore).")
+                    targets.append((appex_path, rep_id, rep_app))
+                    continue
                 print(f"[appid] ❌ Không đăng ký được App ID cho extension '{appex_id}' (hết lượt "
-                      "10 App ID / 7 ngày) và tài khoản KHÔNG có App ID wildcard nào che phủ.")
-                print("[appid]    iOS bắt buộc: bundle id extension phải có tiền tố của app chính "
-                      "VÀ profile phải khớp đúng bundle id đó — không thể 'dùng chung' profile "
-                      "app chính (đã thử: lỗi verify 0xe8008017 và lỗi extension placeholders).")
+                      "10 App ID / 7 ngày), không có wildcard che phủ và không còn App ID trống "
+                      "nào để tái dùng.")
+                print("[appid]    (Xoá App ID trên developer.apple.com KHÔNG trả lại lượt tạo — "
+                      "giới hạn đếm số lượt TẠO trong 7 ngày.)")
                 print("[appid]    → Cách xử lý (chọn 1):")
                 print("[appid]      1. Chờ chu kỳ 7 ngày reset lượt tạo App ID, vào "
                       "developer.apple.com → Identifiers → đăng ký App ID WILDCARD "

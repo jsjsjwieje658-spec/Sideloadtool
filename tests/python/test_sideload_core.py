@@ -571,6 +571,44 @@ for bundle_k in (app_dir_k, appex_k):
     check(prof_k["Entitlements"]["application-identifier"] == f"{TEAM}.*",
           f"profile trong {os.path.basename(bundle_k)} là wildcard toàn team")
 
+print("=== CASE N (v65): hết lượt tạo App ID → extension TÁI DÙNG App ID trống khác ===")
+reset_run()
+FakeDevAPI.cert_fail_first = False
+make_jit_ipa(ipa)
+DeviceNative.installed_raw = "com.SideStore.SideStore.sa9b733\ncom.other.App"
+FakeDevAPI.app_id_limit = True
+FakeDevAPI.has_wildcard = False
+FakeDevAPI.extra_app_ids = [
+    {"identifier": "com.old.Uninstalled", "appIdId": "OLD1"},
+    {"identifier": "com.old.Uninstalled2", "appIdId": "OLD2"},
+    {"identifier": "com.SideStore.SideStore.sa9b733.AltWidget", "appIdId": "ALTW"},  # bị chiếm
+]
+ok = core.do_sideload(ipa, "user@example.com", "pw")
+check(ok is True, "cài thành công: app chính + extension đều TÁI DÙNG App ID trống")
+dev = FakeDevAPI.instances[-1]
+check(dev.created_ids == [], f"KHÔNG tạo App ID mới nào (không tốn lượt): {dev.created_ids}")
+calls = json.load(open(ZSIGN_LOG)) if os.path.exists(ZSIGN_LOG) else []
+app_dir_n = calls[0]["args"][-1] if calls else ""
+with open(os.path.join(app_dir_n, "Info.plist"), "rb") as f:
+    n_main = plistlib.load(f)
+check(n_main["CFBundleIdentifier"] == "com.old.Uninstalled",
+      f"app chính tái dùng App ID trống 1: {n_main['CFBundleIdentifier']}")
+appex_n = os.path.join(app_dir_n, "PlugIns", "JitterbugTunnel.appex")
+with open(os.path.join(appex_n, "Info.plist"), "rb") as f:
+    n_appex = plistlib.load(f)
+check(n_appex["CFBundleIdentifier"] == "com.old.Uninstalled2",
+      f"v65: extension tái dùng App ID trống 2 (đổi bundle id cho khớp profile): {n_appex['CFBundleIdentifier']}")
+check(dev.profiles_for == ["com.old.Uninstalled", "com.old.Uninstalled2"],
+      f"2 profile riêng cho 2 App ID tái dùng: {dev.profiles_for}")
+ms = [calls[0]["args"][i + 1] for i, a in enumerate(calls[0]["args"]) if a == "-m"] if calls else []
+check(len(ms) == 2, f"2 cờ -m (2 profile khác nhau, không dedupe): {len(ms)}")
+for bundle_n, want_n in ((app_dir_n, "com.old.Uninstalled"), (appex_n, "com.old.Uninstalled2")):
+    with open(os.path.join(bundle_n, "embedded.mobileprovision"), "rb") as f:
+        prof_n = plistlib.load(f)
+    check(prof_n["Entitlements"]["application-identifier"] == f"{TEAM}.{want_n}",
+          f"profile trong {os.path.basename(bundle_n)} khớp ĐÚNG bundle id của nó")
+check(len(native_calls["sideloadIpa"]) == 1, "cài đúng file đã ký")
+
 print("=== CASE L (v62): IPA không có Payload/ (.app nằm ở gốc) vẫn xử lý được ===")
 reset_run()
 FakeDevAPI.cert_fail_first = False
