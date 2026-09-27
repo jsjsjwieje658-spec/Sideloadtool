@@ -48,7 +48,13 @@ ngay trong một chiếc điện thoại Android.
   (mô hình iLoader): sau khi cài app, tool tự ghi pair record + UDID vào
   `Documents` của app qua house_arrest/AFC — ghi cả 2 tên file
   (`ALTPairingFile.mobiledevicepairing` bản cũ và `PairingFile_Lockdown.plist`
-  SideStore 0.7+). Lưu ý SideStore 0.7 không tự nạp file có sẵn: mở SideStore →
+  SideStore 0.7+). **v70:** tool tự bật `com.apple.mobile.wireless_lockdown →
+  EnableWifiDebugging` (bắt buộc như JitterbugPair/iLoader/idevice_pair) mỗi
+  khi ghép nối, kết nối lại, hoặc xuất file ghép nối — thiếu bước này
+  lockdownd sẽ **đóng kết nối khi StartSession qua VPN loopback** và SideStore
+  báo "Lockdown session failed: early eof / Broken pipe" (Device Registration
+  Error). iPhone phải **đặt mật mã màn hình** thì mới bật được Wi-Fi Debugging.
+  Lưu ý SideStore 0.7 không tự nạp file có sẵn: mở SideStore →
   chọn file khi được hỏi → "Trên iPhone của tôi" → SideStore →
   `PairingFile_Lockdown.plist` (1 lần duy nhất). Đồng thời ghi thẳng
   UserDefaults của SideStore (activePairingProtocol=lockdown,

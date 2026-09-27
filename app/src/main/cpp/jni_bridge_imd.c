@@ -239,6 +239,47 @@ static char *ld_get_string(lockdownd_client_t ld, const char *key) {
     return s;
 }
 
+/*
+ * v70 — BẬT WI-FI DEBUGGING (wireless lockdown) — BẮT BUỘC cho SideStore/
+ * MiniStore/LocalDevVPN.
+ *
+ * JitterbugPair (osy/Jitterbug), iLoader và idevice_pair đều gọi
+ *   lockdownd_set_value(client, "com.apple.mobile.wireless_lockdown",
+ *                       "EnableWifiDebugging", true)
+ * ngay sau khi ghép nối, TRƯỚC khi xuất file .mobiledevicepairing.
+ *
+ * Nếu thiếu bước này: lockdownd vẫn bắt tay TCP trên interface ảo (VPN
+ * loopback của SideStore/LocalDevVPN) nhưng ĐÓNG kết nối ngay khi nhận
+ * StartSession → SideStore báo đúng lỗi:
+ *   "Device Registration Error — Lockdown session failed:
+ *    Socket(Custom { kind: UnexpectedEof, error: \"early eof\" })"
+ * (hoặc "Broken pipe"). Qua USB thì vẫn bình thường nên tool không lộ lỗi.
+ *
+ * Lưu ý: iPhone phải ĐẶT MẬT MÃ màn hình, nếu không set_value trả về
+ * LOCKDOWN_E_UNKNOWN_ERROR (đúng thông báo của JitterbugPair).
+ */
+static void enable_wifi_debugging(const char *ctx) {
+    lockdownd_client_t ld = g_lockdown;
+    lockdownd_client_t tmp = NULL;
+    if (!ld) {
+        if (!g_device) return;
+        if (lockdownd_client_new_with_handshake(g_device, &tmp, CLIENT_LABEL) != LOCKDOWN_E_SUCCESS || !tmp)
+            return;
+        ld = tmp;
+    }
+    plist_t val = plist_new_bool(1);   /* ownership chuyển cho lockdownd_set_value */
+    lockdownd_error_t e = lockdownd_set_value(ld, "com.apple.mobile.wireless_lockdown",
+                                             "EnableWifiDebugging", val);
+    if (e == LOCKDOWN_E_SUCCESS) {
+        emitf("[wifi-debug] ✅ Đã bật Wi-Fi Debugging (%s) — lockdownd chấp nhận phiên lockdown qua VPN loopback", ctx);
+    } else if (e == LOCKDOWN_E_UNKNOWN_ERROR) {
+        emitf("[wifi-debug] ⚠️ Không bật được Wi-Fi Debugging (%s): iPhone cần ĐẶT MẬT MÃ màn hình, rồi ghép nối lại", ctx);
+    } else {
+        emitf("[wifi-debug] ⚠️ Không bật được Wi-Fi Debugging (%s): %s", ctx, ld_err(e));
+    }
+    if (tmp) lockdownd_client_free(tmp);
+}
+
 /* ── nativeInit ─────────────────────────────────────────────────────────── */
 JNIEXPORT void JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeInit(JNIEnv *env, jobject obj, jstring filesDir) {
@@ -426,6 +467,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(JNIEnv *env, jobj
             g_lockdown = hs;
             g_paired = true;
             emit_log("[pair] ✅ Đã ghép nối từ trước — phiên SSL lockdownd OK");
+            /* Tự vá các bản ghép nối cũ (chưa bật Wi-Fi Debugging) để
+             * SideStore không bị "early eof" khi StartSession qua VPN. */
+            enable_wifi_debugging("kết nối lại");
             pthread_mutex_unlock(&g_api);
             return JNI_TRUE;
         }
@@ -533,6 +577,9 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(JNIEnv *env, jobject
     g_paired = true;
     notify_trust(false);
     emit_log("[pair] ✅ Ghép nối + phiên SSL OK (pair record đã lưu, lần sau không cần Tin cậy lại)");
+    /* JitterbugPair/iLoader: BẮT BUỘC bật Wi-Fi Debugging để lockdownd
+     * chấp nhận phiên lockdown qua VPN loopback của SideStore/LocalDevVPN. */
+    enable_wifi_debugging("ghép nối");
     pthread_mutex_unlock(&g_api);
     return JNI_TRUE;
 
@@ -935,7 +982,10 @@ static bool write_pairing_prefs(afc_client_t afc, const char *path) {
 JNIEXPORT jstring JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFile(JNIEnv *env, jobject obj) {
     (void)obj;
+    pthread_mutex_lock(&g_api);
+    if (g_device && g_paired) enable_wifi_debugging("xuất file ghép nối");
     char *xml = build_pairing_file_xml(NULL);
+    pthread_mutex_unlock(&g_api);
     if (!xml) return NULL;
     jstring r = (*env)->NewStringUTF(env, xml);
     free(xml);
@@ -971,6 +1021,11 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
             emit_log("[pairing] ❌ iPhone chưa kết nối / chưa ghép nối");
             break;
         }
+        /* JitterbugPair bật Wi-Fi Debugging ngay trước khi xuất file ghép
+         * nối — làm lại tại đây để file nhúng vào app luôn kèm cấu hình
+         * mà SideStore cần (bắt tay TCP trên VPN loopback sẽ bị lockdownd
+         * đóng nếu thiếu → "early eof" khi StartSession). */
+        enable_wifi_debugging("xuất file ghép nối");
         xml = build_pairing_file_xml(NULL);
         if (!xml) {
             emit_log("[pairing] ❌ Chưa có pair record — ghép nối iPhone trước");
