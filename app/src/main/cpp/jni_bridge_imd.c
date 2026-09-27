@@ -83,6 +83,7 @@ static lockdownd_client_t g_lockdown = NULL;
 static char               g_udid[128] = {0};
 static char               g_files_dir[512] = {0};
 static volatile bool      g_paired = false;
+static volatile bool      g_wifi_debug_ok = false;
 static int                g_product_id = 0;
 static int                g_session_fd = -1;
 static volatile int       g_cancel = 0;
@@ -227,6 +228,7 @@ static void free_ld_device(void) {
     if (g_lockdown) { lockdownd_client_free(g_lockdown); g_lockdown = NULL; }
     if (g_device)   { idevice_free(g_device); g_device = NULL; }
     g_paired = false;
+    g_wifi_debug_ok = false;
 }
 
 static char *ld_get_string(lockdownd_client_t ld, const char *key) {
@@ -258,26 +260,61 @@ static char *ld_get_string(lockdownd_client_t ld, const char *key) {
  * Lưu ý: iPhone phải ĐẶT MẬT MÃ màn hình, nếu không set_value trả về
  * LOCKDOWN_E_UNKNOWN_ERROR (đúng thông báo của JitterbugPair).
  */
-static void enable_wifi_debugging(const char *ctx) {
+/*
+ * ensure_wifi_debugging — bật Wi-Fi Debugging rồi TRẢ VỀ kết quả.
+ * iLoader (generate_lockdown_plist) làm đúng bước này trước khi xuất file
+ * ghép nối và BỎ LUÔN nếu lockdownd từ chối — vì MiniStore/SideStore chỉ
+ * kết nối lockdownd qua VPN loopback khi cờ này đã bật trên máy.
+ * Bản cũ (void) chỉ cảnh báo rồi cho qua, khiến tool xuất/nhúng những file
+ * ghép nối "đúng định dạng nhưng không dùng được" mà không ai hay.
+ *
+ * Quy ước dùng ở các call site (g_wifi_debug_ok):
+ *  - true  = đã từng SetValue thành công trong process này → tin luôn,
+ *            khỏi khẳng định lại (cờ đã lưu bền trên máy).
+ *  - false = chưa chứng minh được → phía xuất/nhúng file PHẢI fail-closed.
+ * Trả về LOCKDOWN_E_SUCCESS khi bật được; *skipped_out=1 khi không có
+ * client (offline) để caller tự quyết.
+ */
+static lockdownd_error_t ensure_wifi_debugging(const char *ctx, int *skipped_out) {
+    if (skipped_out) *skipped_out = 0;
     lockdownd_client_t ld = g_lockdown;
     lockdownd_client_t tmp = NULL;
     if (!ld) {
-        if (!g_device) return;
+        if (!g_device) { if (skipped_out) *skipped_out = 1; return LOCKDOWN_E_INVALID_ARG; }
         if (lockdownd_client_new_with_handshake(g_device, &tmp, CLIENT_LABEL) != LOCKDOWN_E_SUCCESS || !tmp)
-            return;
+            { if (skipped_out) *skipped_out = 1; return LOCKDOWN_E_MUX_ERROR; }
         ld = tmp;
     }
-    plist_t val = plist_new_bool(1);   /* ownership chuyển cho lockdownd_set_value */
-    lockdownd_error_t e = lockdownd_set_value(ld, "com.apple.mobile.wireless_lockdown",
-                                             "EnableWifiDebugging", val);
-    if (e == LOCKDOWN_E_SUCCESS) {
-        emitf("[wifi-debug] ✅ Đã bật Wi-Fi Debugging (%s) — lockdownd chấp nhận phiên lockdown qua VPN loopback", ctx);
-    } else if (e == LOCKDOWN_E_UNKNOWN_ERROR) {
-        emitf("[wifi-debug] ⚠️ Không bật được Wi-Fi Debugging (%s): iPhone cần ĐẶT MẬT MÃ màn hình, rồi ghép nối lại", ctx);
-    } else {
-        emitf("[wifi-debug] ⚠️ Không bật được Wi-Fi Debugging (%s): %s", ctx, ld_err(e));
+    lockdownd_error_t e = LOCKDOWN_E_UNKNOWN_ERROR;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        plist_t val = plist_new_bool(1);   /* ownership chuyển cho lockdownd_set_value */
+        e = lockdownd_set_value(ld, "com.apple.mobile.wireless_lockdown",
+                                "EnableWifiDebugging", val);
+        if (e == LOCKDOWN_E_SUCCESS) break;
+        /* Phiên cũ rớt giữa chừng (dùng tool nhiều ngày) → bắt tay lại 1 lần. */
+        if (!tmp && attempt == 0 &&
+            (e == LOCKDOWN_E_SESSION_INACTIVE || e == LOCKDOWN_E_NO_RUNNING_SESSION ||
+             e == LOCKDOWN_E_INVALID_SESSION_ID || e == LOCKDOWN_E_MISSING_SESSION_ID)) {
+            lockdownd_client_t fresh = NULL;
+            if (lockdownd_client_new_with_handshake(g_device, &fresh, CLIENT_LABEL) == LOCKDOWN_E_SUCCESS && fresh) {
+                lockdownd_client_free(g_lockdown);
+                g_lockdown = ld = fresh;
+                emitf("[wifi-debug] Phiên lockdownd đã rớt (%s) — bắt tay lại rồi thử bật Wi-Fi Debugging tiếp", ctx);
+                continue;
+            }
+        }
+        break;
     }
     if (tmp) lockdownd_client_free(tmp);
+    if (e == LOCKDOWN_E_SUCCESS) {
+        g_wifi_debug_ok = true;
+        emitf("[wifi-debug] ✅ Đã bật Wi-Fi Debugging (%s) — lockdownd chấp nhận phiên lockdown qua VPN loopback", ctx);
+    } else if (e == LOCKDOWN_E_UNKNOWN_ERROR) {
+        emitf("[wifi-debug] ❌ Không bật được Wi-Fi Debugging (%s): iPhone cần ĐẶT MẬT MÃ màn hình, rồi ghép nối lại", ctx);
+    } else {
+        emitf("[wifi-debug] ❌ Không bật được Wi-Fi Debugging (%s): %s", ctx, ld_err(e));
+    }
+    return e;
 }
 
 /* ── nativeInit ─────────────────────────────────────────────────────────── */
@@ -468,8 +505,12 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(JNIEnv *env, jobj
             g_paired = true;
             emit_log("[pair] ✅ Đã ghép nối từ trước — phiên SSL lockdownd OK");
             /* Tự vá các bản ghép nối cũ (chưa bật Wi-Fi Debugging) để
-             * SideStore không bị "early eof" khi StartSession qua VPN. */
-            enable_wifi_debugging("kết nối lại");
+             * SideStore không bị "early eof" khi StartSession qua VPN.
+             * Pair qua USB vẫn dùng được nên giữ thành công; xuất/nhúng
+             * file về sau sẽ từ chối nếu cờ này chưa từng bật được. */
+            { int sk = 0; lockdownd_error_t we = ensure_wifi_debugging("kết nối lại", &sk);
+              if (!sk && we != LOCKDOWN_E_SUCCESS)
+                  emit_log("[wifi-debug] ⚠️ MiniStore sẽ KHÔNG kết nối qua VPN cho tới khi đặt mật mã màn hình + ghép nối lại"); }
             pthread_mutex_unlock(&g_api);
             return JNI_TRUE;
         }
@@ -481,6 +522,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeConnect(JNIEnv *env, jobj
     }
     g_lockdown = ld;
     g_paired = false;
+    g_wifi_debug_ok = false;
     emit_log("[lockdown] ✅ lockdownd OK — cần ghép nối (Tin cậy) trước khi cài app");
     pthread_mutex_unlock(&g_api);
     return JNI_TRUE;
@@ -501,6 +543,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(JNIEnv *env, jobject
         pthread_mutex_unlock(&g_api);
         return JNI_TRUE;
     }
+    g_wifi_debug_ok = false; /* HostID mới sau pair — kiến thức cũ vô hiệu, phải chứng minh lại */
 
     emit_log("[pair] Bắt đầu ghép nối — mở khoá iPhone, bấm \"Tin cậy\" rồi nhập mật mã khi được hỏi");
     uint64_t deadline = now_ms() + PAIR_TIMEOUT_MS;
@@ -578,8 +621,12 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativePair(JNIEnv *env, jobject
     notify_trust(false);
     emit_log("[pair] ✅ Ghép nối + phiên SSL OK (pair record đã lưu, lần sau không cần Tin cậy lại)");
     /* JitterbugPair/iLoader: BẮT BUỘC bật Wi-Fi Debugging để lockdownd
-     * chấp nhận phiên lockdown qua VPN loopback của SideStore/LocalDevVPN. */
-    enable_wifi_debugging("ghép nối");
+     * chấp nhận phiên lockdown qua VPN loopback của SideStore/LocalDevVPN.
+     * Pair qua USB vẫn thành công để còn cài app; nhưng xuất/nhúng file
+     * ghép nối sẽ từ chối cho tới khi cờ này bật được (cần mật mã máy). */
+    { int sk = 0; lockdownd_error_t we = ensure_wifi_debugging("ghép nối", &sk);
+      if (!sk && we != LOCKDOWN_E_SUCCESS)
+          emit_log("[wifi-debug] ⚠️ Chưa bật được Wi-Fi Debugging — file ghép nối xuất/nhúng ra sẽ BỊ TỪ CHỐI cho tới khi đặt mật mã + ghép nối lại"); }
     pthread_mutex_unlock(&g_api);
     return JNI_TRUE;
 
@@ -983,7 +1030,17 @@ JNIEXPORT jstring JNICALL
 Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFile(JNIEnv *env, jobject obj) {
     (void)obj;
     pthread_mutex_lock(&g_api);
-    if (g_device && g_paired) enable_wifi_debugging("xuất file ghép nối");
+    if (g_device && g_paired && !g_wifi_debug_ok) {
+        /* iLoader (generate_lockdown_plist): xuất file đòi SetValue thành
+         * công ngay lúc xuất — file đi kèm máy chưa bật cờ thì MiniStore
+         * không bao giờ kết nối được, nên từ chối thay vì xuất file hỏng. */
+        int sk = 0; lockdownd_error_t we = ensure_wifi_debugging("xuất file ghép nối", &sk);
+        if (!sk && we != LOCKDOWN_E_SUCCESS) {
+            emit_log("[pairing] ❌ Từ chối xuất file: Wi-Fi Debugging chưa bật trên iPhone (đặt mật mã màn hình rồi ghép nối lại)");
+            pthread_mutex_unlock(&g_api);
+            return NULL;
+        }
+    }
     char *xml = build_pairing_file_xml(NULL);
     pthread_mutex_unlock(&g_api);
     if (!xml) return NULL;
@@ -1021,11 +1078,17 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
             emit_log("[pairing] ❌ iPhone chưa kết nối / chưa ghép nối");
             break;
         }
-        /* JitterbugPair bật Wi-Fi Debugging ngay trước khi xuất file ghép
-         * nối — làm lại tại đây để file nhúng vào app luôn kèm cấu hình
-         * mà SideStore cần (bắt tay TCP trên VPN loopback sẽ bị lockdownd
-         * đóng nếu thiếu → "early eof" khi StartSession). */
-        enable_wifi_debugging("xuất file ghép nối");
+        /* iLoader (generate_lockdown_plist): SetValue thành công là điều
+         * kiện để file nhúng vào app dùng được qua VPN loopback — thiếu
+         * là lockdownd đóng bắt tay ("early eof" khi StartSession), nên
+         * từ chối nhúng file hỏng thay vì cảnh báo cho qua như trước. */
+        if (!g_wifi_debug_ok) {
+            int sk = 0; lockdownd_error_t we = ensure_wifi_debugging("xuất file ghép nối", &sk);
+            if (!sk && we != LOCKDOWN_E_SUCCESS) {
+                emit_log("[pairing] ❌ Từ chối nhúng file: Wi-Fi Debugging chưa bật trên iPhone (đặt mật mã màn hình rồi ghép nối lại)");
+                break;
+            }
+        }
         xml = build_pairing_file_xml(NULL);
         if (!xml) {
             emit_log("[pairing] ❌ Chưa có pair record — ghép nối iPhone trước");
