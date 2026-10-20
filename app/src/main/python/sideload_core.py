@@ -69,6 +69,21 @@ def _bridged_print(*args, **kwargs):
 builtins.print = _bridged_print
 
 
+# ── Lý do thất bại gần nhất (v72) ────────────────────────────────────────────
+# PythonBridge.kt gọi get_last_error() để UI hiện nguyên nhân THẬT (mã lỗi
+# Apple, tên server anisette bị từ chối...) thay vì câu chung "xem nhật ký".
+_LAST_ERROR = ""
+
+
+def set_last_error(message):
+    global _LAST_ERROR
+    _LAST_ERROR = str(message or "")
+
+
+def get_last_error() -> str:
+    return _LAST_ERROR
+
+
 class _StderrBridge:
     """Chuyển hướng sys.stderr (traceback Python) sang NativeLog để hiện trong UI."""
 
@@ -148,7 +163,18 @@ def list_anisette_servers() -> str:
             {"name": s.get("name") or "?", "address": s.get("address")}
             for s in servers if s.get("address")
         ]
-        return json.dumps(simplified)
+        # v72: server đã kiểm chứng đứng đầu (danh sách SideStore hiện toàn
+        # server bị Apple từ chối -80045). Khử trùng theo address.
+        from apple_auth import ANISETTE_SEED_SERVERS
+        head = [{"name": u.split("//")[-1] + " (đã kiểm chứng)", "address": u}
+                for u in ANISETTE_SEED_SERVERS]
+        seen, merged = set(), []
+        for item in head + simplified:
+            key = (item["address"] or "").rstrip("/")
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(item)
+        return json.dumps(merged)
     except Exception as e:
         print(f"[anisette] Lỗi khi lấy danh sách server: {e}")
         return "[]"
@@ -208,16 +234,23 @@ def _login(apple_id: str, password: str, anisette_url: str = ""):
     session = auth.authenticate(apple_id, password)
     if not session or not session.get("authenticated"):
         print("❌ Đăng nhập Apple ID thất bại.")
+        detail = getattr(auth, "last_error", "") or "Apple không cấp phiên đăng nhập."
+        set_last_error(f"{detail} (anisette: {getattr(auth, 'anisette_url', '?')})")
         return None, None, None
     if session.get("authenticated") == "2fa_completed":
         # chuỗi "2fa_completed" là truthy nhưng KHÔNG có session_token
         print("ℹ️  2FA đã xác nhận nhưng Apple chưa cấp phiên đầy đủ — bấm chạy lại một lần nữa.")
         return None, None, None
     print("✅ Đăng nhập thành công.")
+    set_last_error("")
     dev_api = DeveloperAPI(auth, session["dsid"], session["session_token"])
     teams = dev_api.list_teams()
     if not teams:
         print("❌ Không lấy được Development Team.")
+        set_last_error(
+            "Đăng nhập được nhưng không lấy được Development Team — Apple ID "
+            "chưa đồng ý điều khoản Developer hoặc phiên app-token không hợp lệ."
+        )
         return None, None, None
     team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
     dev_api.set_team(team_id)
@@ -1260,6 +1293,7 @@ def do_login(apple_id: str, password: str, anisette_url: str = "") -> bool:
         import traceback
         print(f"❌ Lỗi đăng nhập: {e}")
         traceback.print_exc()
+        set_last_error(f"Lỗi không mong đợi khi đăng nhập: {e}")
         return False
 
 
@@ -1318,19 +1352,33 @@ def do_diagnostics() -> str:
     else:
         lines.append("⚠️  Apple ID  : chưa lưu — cần nhập Apple ID và mật khẩu")
 
-    # 4. Kiểm tra Anisette URL
+    # 4. Kiểm tra Anisette URL + danh tính có được Apple chấp nhận không.
+    #
+    # v72: "server phản hồi HTTP 200" KHÔNG còn đủ. Từ 12/10/2026 Apple trả
+    # ec=-80045 ở bước init nếu machine-id của server không khớp danh tính
+    # client khai báo — server vẫn "sống" nhưng đăng nhập luôn thất bại. Vì
+    # vậy chẩn đoán phải kiểm tra đúng thứ Apple kiểm tra.
     anisette_url = get_saved_anisette_url()
-    if anisette_url:
-        lines.append(f"ℹ️  Anisette  : {anisette_url}")
-        try:
-            import urllib.request
-            with urllib.request.urlopen(anisette_url + "/", timeout=3) as r:
-                lines.append(f"✅ Anisette  : server phản hồi OK (status={r.status})")
-        except Exception as e:
-            lines.append(f"⚠️  Anisette  : server không phản hồi ({e})")
-            lines.append("   → Gợi ý: Khởi động lại Anisette server hoặc chọn server khác")
-    else:
-        lines.append("⚠️  Anisette  : chưa cài đặt URL")
+    lines.append(f"ℹ️  Anisette  : {anisette_url or 'Tự động (tự dò + kiểm chứng)'}")
+    try:
+        probe = AppleAuth(anisette_url=anisette_url or None, input_func=_ui_input)
+        ident = probe._fetch_identity(probe.anisette_url)
+        if not ident:
+            lines.append(f"⚠️  Anisette  : {probe.anisette_url} không trả headers")
+        else:
+            ok_ci, _variant, detail = probe._identity_accepted(probe.anisette_url, ident)
+            if ok_ci:
+                lines.append(f"✅ Anisette  : danh tính được Apple chấp nhận ({detail})")
+                lines.append(f"   Server đang dùng: {probe.anisette_url}")
+                lines.append(f"   Client-Info     : {ok_ci}")
+            else:
+                lines.append(f"❌ Anisette  : Apple TỪ CHỐI danh tính ({detail})")
+                lines.append("   → Đây là nguyên nhân đăng nhập thất bại. Vào Cài đặt → "
+                             "Server Anisette → chọn 'Tự động' (tool sẽ tự dò server "
+                             "còn được Apple chấp nhận).")
+    except Exception as e:
+        lines.append(f"⚠️  Anisette  : không kiểm tra được ({e})")
+        lines.append("   → Gợi ý: khởi động lại server Anisette hoặc chọn server khác")
 
     # 5. Kiểm tra dung lượng lưu trữ tạm
     try:

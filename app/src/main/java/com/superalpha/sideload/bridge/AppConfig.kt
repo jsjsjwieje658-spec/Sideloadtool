@@ -63,9 +63,16 @@ object AppConfig {
 
     fun clearSession() = prefs.edit { remove("session_token"); remove("dsid") }
 
+    /*
+     * v72 (2026-10-20): "SideStore Official" (ani.sidestore.io) KHÔNG còn dùng
+     * được để đăng nhập — Apple trả ec=-80045 vì machine-id của nó không khớp
+     * danh tính khai báo. Đưa các server Windows/ADI đã kiểm chứng lên trước;
+     * server cũ giữ lại chỉ để tham khảo (apple_auth.py tự kiểm chứng lại).
+     */
     val defaultAnisetteServers: List<AnisetteServer> = listOf(
+        AnisetteServer("mac-ani.jkcoxson.com", "https://mac-ani.jkcoxson.com"),
+        AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
         AnisetteServer("SideStore Official", "https://ani.sidestore.io"),
-        AnisetteServer("Josi's Server", "https://anisette.josi.eu"),
         AnisetteServer("Local (Sideloadly)", "http://localhost:6969"),
     )
     data class AnisetteServer(val name: String, val url: String)

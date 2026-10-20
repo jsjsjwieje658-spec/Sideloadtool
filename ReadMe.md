@@ -203,6 +203,48 @@ App ID phái sinh). App cài được giữ 7 ngày rồi phải ký lại.
 - `usesCleartextTraffic=false`; mọi kết nối Apple qua HTTPS; server Anisette
   do người dùng chọn.
 
+## 6.1 Sự cố Apple GrandSlam 10/2026 (đã sửa ở v72)
+
+Từ **12/10/2026** Apple thay đổi phía server: GrandSlam
+(`gsa.apple.com/grandslam/GsService2`) so *nguồn gốc* machine-id anisette với
+*danh tính client* mà request khai báo.
+
+| Thời điểm | Apple trả về | Ảnh hưởng |
+|---|---|---|
+| 12/10/2026 | `ec -80045` "This action cannot be completed at this time." ở bước `o=init` | machine-id do Android CoreADI sinh ra nhưng request khai macOS/iPhone |
+| 14/10/2026 ~20:50 UTC | HTTP **503 HTML** | mọi request khai client **Android** |
+| 13/10/2026 | `hsc 409` ở bước `complete` (không có `au`) | Apple tự gửi mã 2FA; client cũ tưởng "không cần 2FA" → `-22411` |
+| từ 09/2026 | HTTP **503 HTML** | danh tính còn token `com.apple.dt.Xcode` |
+| (rủi ro) | `-20209` | Apple **khoá tài khoản** khi thấy nhiều lần đăng nhập bất thường |
+
+**Nguyên nhân trong code cũ:** `apple_auth.py` tự bịa chuỗi danh tính
+`<MacBookPro18,3> <macOS;13.4.1;22F8> …` rồi **ghi đè** lên
+`X-MMe-Client-Info` do server anisette trả về; chọn server chỉ dựa vào "HTTP
+200" nên luôn rơi vào server bị chặn; khi xoay server thì danh tính cũ vẫn
+được giữ lại.
+
+**Cách sửa (v72):**
+
+1. Lấy danh tính **nguyên văn** từ server (`GET /v3/client_info` →
+   `client_info` + `user_agent`) và dùng đúng chuỗi đó cho **cả** header HTTP
+   **và** trường `cpd` trong body.
+2. **Kiểm chứng** từng server bằng một request `o=init` với Apple ID **ngẫu
+   nhiên không tồn tại** (không mật khẩu, không đụng tài khoản người dùng):
+   `-80045/-80009/-80010/-29004/503` = bị từ chối; `-20970/0/challenge` =
+   được chấp nhận. Chỉ dùng server vượt kiểm chứng (cache 6 giờ).
+3. Gặp `-80045` lúc đăng nhập → thử OTP mới trên cùng server, rồi mới đổi
+   server đã kiểm chứng khác và chạy lại SRP (tự phục hồi).
+4. `hsc 434` → đồng bộ lại anisette rồi thử lại; `hsc 409` → coi như 2FA
+   trusted-device nhưng **không** xin mã mới.
+5. UI hiện **nguyên nhân thật** (`sideload_core.get_last_error()`), kèm gợi ý
+   xử lý cho các mã `-20101/-20209/-22411/-80045/-22421`.
+
+Trạng thái kiểm chứng 20/10/2026: chỉ server nhóm Windows/macOS-ADI
+(`mac-ani.jkcoxson.com`, …) còn được GSA chấp nhận; `ani.sidestore.io`,
+`ani.npeg.us`, `omni.ethxn.xyz` và phần lớn danh sách SideStore bị từ chối.
+
+---
+
 ## 7. Ghi công
 
 Dựa trên / học từ mã nguồn mở của các dự án:

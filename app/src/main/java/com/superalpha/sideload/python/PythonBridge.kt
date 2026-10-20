@@ -1,6 +1,7 @@
 package com.superalpha.sideload.python
 
 import android.content.Context
+import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import com.superalpha.sideload.bridge.AppConfig
@@ -23,6 +24,22 @@ import org.json.JSONObject
 object PythonBridge {
     data class AnisetteServer(val name: String, val address: String)
     data class Outcome(val success: Boolean, val message: String)
+
+    /**
+     * v72: lấy lý do thật của lần thất bại gần nhất từ Python
+     * (sideload_core.get_last_error()) để UI hiện đúng nguyên nhân thay vì
+     * câu chung "xem nhật ký" — ví dụ "-80045 Apple từ chối danh tính anisette".
+     */
+    private fun pyLastError(core: PyObject): String = try {
+        core.callAttr("get_last_error").toString().trim()
+    } catch (_: Exception) {
+        ""
+    }
+
+    private fun failMessage(core: PyObject, fallback: String): String {
+        val detail = pyLastError(core)
+        return if (detail.isBlank()) fallback else "$fallback\n$detail"
+    }
 
     private val httpClient by lazy { OkHttpClient() }
 
@@ -93,7 +110,11 @@ object PythonBridge {
                 effectiveAnisetteUrl,
                 certSelector
             ).toBoolean()
-            Outcome(ok, if (ok) "Thu hồi chứng chỉ thành công." else "Thu hồi thất bại — xem nhật ký.")
+            Outcome(
+                ok,
+                if (ok) "Thu hồi chứng chỉ thành công."
+                else failMessage(core, "Thu hồi thất bại — nguyên nhân thường là đăng nhập Apple ID thất bại:")
+            )
         } catch (e: Exception) {
             emitException("[python] ❌ revokeCerts lỗi:", e)
             Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
@@ -127,7 +148,11 @@ object PythonBridge {
                 effectiveAnisetteUrl,
                 embedPairing
             ).toBoolean()
-            Outcome(ok, if (ok) "Cài đặt IPA thành công." else "Cài đặt thất bại — xem nhật ký.")
+            Outcome(
+                ok,
+                if (ok) "Cài đặt IPA thành công."
+                else failMessage(core, "Cài đặt thất bại:")
+            )
         } catch (e: Exception) {
             emitException("[python] ❌ sideload lỗi:", e)
             Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
@@ -160,7 +185,11 @@ object PythonBridge {
                 deviceName,
                 effectiveAnisetteUrl
             ).toBoolean()
-            Outcome(ok, if (ok) "Đăng ký UDID thành công." else "Đăng ký UDID thất bại — xem nhật ký.")
+            Outcome(
+                ok,
+                if (ok) "Đăng ký UDID thành công."
+                else failMessage(core, "Đăng ký UDID thất bại:")
+            )
         } catch (e: Exception) {
             emitException("[python] ❌ registerDevice lỗi:", e)
             Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
@@ -189,7 +218,11 @@ object PythonBridge {
                 password,
                 effectiveAnisetteUrl
             ).toBoolean()
-            Outcome(ok, if (ok) "Đăng nhập Apple ID thành công." else "Đăng nhập thất bại — xem nhật ký.")
+            Outcome(
+                ok,
+                if (ok) "Đăng nhập Apple ID thành công."
+                else failMessage(core, "Đăng nhập Apple ID thất bại:")
+            )
         } catch (e: Exception) {
             emitException("[python] ❌ login lỗi:", e)
             Outcome(false, e.message?.lines()?.firstOrNull { it.isNotBlank() } ?: e.toString())
@@ -197,8 +230,24 @@ object PythonBridge {
     }
 
     /**
-     * Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python.
+     * v72 (2026-10-20): server Anisette "đã biết tốt" — đứng ĐẦU danh sách.
+     *
+     * Từ 12/10/2026 GrandSlam trả ec=-80045 cho machine-id do Android CoreADI
+     * sinh ra khi request khai danh tính macOS/iPhone; từ 14/10/2026 trả 503
+     * cho client khai Android. Kết quả kiểm tra trực tiếp ngày 20/10/2026:
+     * chỉ máy chủ Windows/macOS-ADI dưới đây còn được chấp nhận. ĐÂY CHỈ LÀ
+     * THỨ TỰ ƯU TIÊN — apple_auth.py vẫn kiểm chứng lại từng server bằng một
+     * request GsService2 `o=init` vô hại (Apple ID ngẫu nhiên) trước khi dùng,
+     * nên danh sách này cũ vài tuần vẫn không làm hỏng đăng nhập.
      */
+    private val priorityAnisetteServers = listOf(
+        AnisetteServer("mac-ani.jkcoxson.com (đã kiểm chứng)", "https://mac-ani.jkcoxson.com"),
+        AnisetteServer("ani.jkcoxson.com", "https://ani.jkcoxson.com"),
+        AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
+        AnisetteServer("new.ani.sidestore.io", "https://new.ani.sidestore.io"),
+    )
+
+    /** Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python. */
     suspend fun listAnisetteServers(): List<AnisetteServer> = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
@@ -213,7 +262,9 @@ object PythonBridge {
                     val address = obj.optString("address", "")
                     if (address.isBlank()) null else AnisetteServer(obj.optString("name", "?"), address)
                 }
-                parsed.ifEmpty { defaultServers() }
+                // v72: ưu tiên server đã biết tốt, bỏ trùng theo address
+                val merged = priorityAnisetteServers + parsed
+                merged.distinctBy { it.address.trimEnd('/') }.ifEmpty { defaultServers() }
             }
         } catch (_: Exception) {
             defaultServers()
@@ -221,5 +272,7 @@ object PythonBridge {
     }
 
     private fun defaultServers(): List<AnisetteServer> =
-        AppConfig.defaultAnisetteServers.map { AnisetteServer(it.name, it.url) }
+        priorityAnisetteServers + AppConfig.defaultAnisetteServers
+            .map { AnisetteServer(it.name, it.url) }
+            .filter { d -> priorityAnisetteServers.none { it.address.trimEnd('/') == d.address.trimEnd('/') } }
 }

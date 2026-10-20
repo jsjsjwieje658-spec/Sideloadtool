@@ -16,12 +16,20 @@ HAI LỖI GIỐNG HỆT bản Termux lúc đầu đã được sửa ở đây:
      (Connection: close) và gửi lại tối đa 3 lần trên socket mới.
   2. X-MMe-Client-Info mang token com.apple.dt.Xcode bị edge chặn (503 HTML)
      từ 09/2026 → nay định danh là com.apple.akd như AltServer mới.
+  3. [v72 — 2026-10-20] Apple GrandSlam (từ 12/10/2026) trả ec=-80045 ở bước
+     `init` nếu machine-id anisette do Android CoreADI sinh ra nhưng request
+     khai danh tính macOS/iPhone; và trả 503 HTML cho mọi client khai Android
+     (từ 14/10/2026). Nguyên nhân trong code cũ: tự bịa danh tính Mac rồi ghi
+     đè lên danh tính thật của server. Nay danh tính được lấy nguyên văn từ
+     server (/v3/client_info) và KIỂM CHỨNG bằng một request init vô hại, chỉ
+     dùng server vượt kiểm chứng. Xem khối "ANISETTE + DANH TÍNH CLIENT".
 """
 
 import uuid
 import json
 import base64
 import time
+import secrets
 from datetime import datetime, timezone
 import locale
 import requests
@@ -42,6 +50,16 @@ import traceback
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+class AnisetteIdentityRejected(Exception):
+    """GSA trả -80045/-80009/-80010/-29004 ở bước `init`.
+
+    Nghĩa là machine-id (X-Apple-I-MD-M) do server anisette sinh ra không
+    khớp danh tính client khai báo, hoặc Apple đã chặn hẳn server đó. Mật
+    khẩu CHƯA được gửi nên đây không phải lỗi tài khoản — phải đổi server.
+    """
+    pass
+
+
 class GsaRateLimitedError(Exception):
     """Apple edge tra HTML 429 cho POST GsService2.
 
@@ -56,6 +74,34 @@ class GsaRateLimitedError(Exception):
 # ---------------------- Configuration ----------------------
 ANISETTE_URL = "https://ani.sidestore.io"  # fallback khi không lấy được danh sách
 OFFICIAL_SERVERS_URL = "https://servers.sidestore.io/servers.json"  # Danh sách server SideStore
+GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
+
+# Server "seed" được thử TRƯỚC danh sách SideStore. Đây chỉ là thứ tự ưu tiên
+# (thử nhanh hơn), KHÔNG phải danh sách tin cậy: mỗi server vẫn phải vượt
+# _identity_accepted() thì mới được dùng — Apple có thể chặn bất kỳ lúc nào.
+# Cập nhật 2026-10-20: chỉ mac-ani.jkcoxson.com còn được GSA chấp nhận.
+ANISETTE_SEED_SERVERS = (
+    "https://mac-ani.jkcoxson.com",
+    "https://ani.jkcoxson.com",
+    "https://ani2.stikstore.app",
+    "https://new.ani.sidestore.io",
+    "https://win.ani.sidestore.io",
+)
+
+# Mã lỗi Apple dùng để nói "machine-id này không do client đang khai báo sinh ra"
+# (hoặc thiếu/hỏng OTP) — danh tính bị từ chối, phải đổi server.
+#   -80045 hành vi không hợp lệ / mismatch nguồn gốc machine-id
+#   -80009 MID không hợp lệ      -80010 thiếu OTP
+#   -29004 machine-id hỏng       -80044 lệch giữa header và cpd
+IDENTITY_REJECT_EC = {-80045, -80009, -80010, -29004, -80044}
+IDENTITY_REJECT_HTTP = {502, 503, 504}
+
+# Số server tối đa được dò trong một lần chọn (tránh treo lâu khi mạng chậm).
+ANISETTE_MAX_CANDIDATES = 12
+
+DEFAULT_USER_AGENT = "akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0"
+
+
 def _writable_dir():
     try:
         from com.superalpha.sideload.bridge import AppPaths
@@ -97,69 +143,180 @@ class AppleAuth:
         self._cpd_pin = None
         self._pin_cpd = False
         self._gsa_init_ok = False
-        if self._anisette_pinned:
-            self.anisette_url = str(anisette_url).strip().rstrip("/")
-            print(f"[anisette] Dùng server chỉ định, không xoay: {self.anisette_url}")
-        else:
-            self.anisette_url = self.get_best_anisette_server()
         self.user_id = str(uuid.uuid4()).upper()
         self.device_id = str(uuid.uuid4()).upper()
         self.session = requests.Session()
         self.session.verify = False
 
-        # User agent and client info that Apple expects
-        self.user_agent = "akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0"
-        # [FIX 2026-09] Apple edge chan moi POST GsService2 co token com.apple.dt.Xcode
-        # trong X-MMe-Client-Info (tra ve 503 HTML thay plist GSA). Fix theo
-        # AltServer 1.7.6 / anisette-v3-server #60: identify as com.apple.akd.
-        self.client_info = "<MacBookPro18,3> <macOS;13.4.1;22F8> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        # UA giong akd that (khong con token Xcode)
-        self.xcode_ua = "akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0"
+        # Danh tính mặc định CHỈ dùng khi chưa lấy được từ server (chưa từng
+        # được gửi tới Apple nếu selection thành công — xem _set_identity).
+        self.user_agent = DEFAULT_USER_AGENT
+        self.xcode_ua = DEFAULT_USER_AGENT
+        self.client_info = ""
+        self._identity_variant = "raw"
+        self._identity_user_agent = None
+        self._identity_retries = 0
+        # Lý do thất bại gần nhất, dạng người dùng đọc được. UI (PythonBridge
+        # → sideload_core.get_last_error) hiển thị nguyên nhân thật thay vì
+        # câu chung "xem nhật ký".
+        self.last_error = ""
+
+        if self._anisette_pinned:
+            self.anisette_url = str(anisette_url).strip().rstrip("/")
+            print(f"[anisette] Dùng server chỉ định, không xoay: {self.anisette_url}")
+            ident = self._fetch_identity(self.anisette_url)
+            if ident and ident.get("client_info"):
+                # Server do người dùng tự chọn: KHÔNG kiểm chứng (tôn trọng lựa
+                # chọn), nhưng nếu danh tính còn token Xcode thì tự dùng biến
+                # thể akd — token Xcode bị edge trả 503 từ 09/2026.
+                variant = ("akd" if "com.apple.dt.Xcode" in ident["client_info"]
+                           else "raw")
+                if variant == "akd":
+                    print("[anisette] ⚠️  Server trả danh tính còn token "
+                          "com.apple.dt.Xcode (edge chặn từ 09/2026) — dùng akd.")
+                self._set_identity(self.anisette_url, ident["client_info"],
+                                   ident.get("user_agent"), variant)
+                print(f"[anisette] Danh tính client: {self.client_info}")
+                print(f"[anisette] User-Agent       : {self.user_agent}")
+            else:
+                print("[anisette] ⚠️  Không lấy được danh tính client từ server này "
+                      "(có thể vẫn chạy, sẽ thử lại khi lấy headers).")
+        else:
+            self.anisette_url = self.get_best_anisette_server()
+        if not self.client_info:
+            # Không có danh tính server: dùng chuỗi akd, nhưng vẫn giữ UA akd
+            # (KHÔNG dùng token com.apple.dt.Xcode — edge trả 503 từ 09/2026).
+            self.client_info = ("<MacBookPro18,3> <macOS;13.4.1;22F8> "
+                                "<com.apple.AuthKit/1 (com.apple.akd/1.0)>")
 
         # Configure SRP properly
         srp.rfc5054_enable()
         srp.no_username_in_x()
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ANISETTE + DANH TÍNH CLIENT (v72 — 2026-10-20)
+    #
+    # SỰ CỐ THẬT (đã kiểm chứng trực tiếp với gsa.apple.com, 2026-10-20):
+    #   Từ 2026-10-12 GrandSlam so *nguồn gốc* của machine-id (X-Apple-I-MD-M)
+    #   với *danh tính client khai báo* (X-MMe-Client-Info). Machine-id do
+    #   Android CoreADI / anisette-v3 sinh ra mà request lại khai là Mac →
+    #   HTTP 200 + Status.ec = -80045 "This action cannot be completed at this
+    #   time." ngay ở bước `o=init`, TRƯỚC khi kiểm tra mật khẩu.
+    #   Từ 2026-10-14 ~20:50 UTC: mọi request khai client Android bị edge trả
+    #   503 HTML. Client-info chứa com.apple.dt.Xcode bị 503 từ 09/2026.
+    #
+    # LỖI CỦA BẢN CŨ (chính là nguyên nhân log -80045):
+    #   Code tự BỊA danh tính "<MacBookPro18,3> <macOS;13.4.1;22F8> ..." rồi
+    #   ghi đè lên X-MMe-Client-Info mà server anisette trả về. Server trả
+    #   machine-id Android nhưng request khai Mac → mismatch → -80045.
+    #   Ngoài ra khi xoay server, client_info cũ vẫn được giữ lại (thêm một
+    #   nguồn mismatch nữa), và chỉ "probe" server bằng HTTP 200 chứ không
+    #   kiểm tra Apple có chấp nhận machine-id đó hay không.
+    #
+    # CÁCH SỬA (không phụ thuộc tên server, tự thích ứng khi Apple đổi tiếp):
+    #   1. Lấy danh tính THẬT từ server: GET /v3/client_info →
+    #      {client_info, user_agent}. Dùng ĐÚNG chuỗi đó cho cả header HTTP
+    #      lẫn trường "cpd" trong body, và dùng đúng user_agent của server.
+    #   2. Kiểm chứng danh tính bằng một lần `o=init` với Apple ID NGẪU NHIÊN
+    #      KHÔNG TỒN TẠI (chỉ init, không gửi mật khẩu, không đụng tài khoản
+    #      người dùng). Apple trả ec = -80045/-80009/-80010/-29004 (hoặc 503)
+    #      = danh tính bị từ chối; trả -20970/-22421/0/challenge = danh tính
+    #      ĐƯỢC CHẤP NHẬN (lỗi còn lại chỉ là "tài khoản không tồn tại").
+    #   3. Chỉ chọn server vượt bước 2, cache 6 giờ kèm client_info/user_agent.
+    #   4. Khi GSA trả -80045 lúc đăng nhập thật → tự động bỏ server đó, chọn
+    #      server đã kiểm chứng khác và chạy lại SRP một lần (provider chết
+    #      giữa phiên vẫn tự phục hồi).
+    #   5. hsc 434 → Apple yêu cầu đồng bộ lại anisette: lấy OTP mới, thử lại.
+    #
+    # Nguồn: Dadoum/anisette-v3-server#61, rileytestut/AltSign#61,
+    #        altstoreio/AltStore#1834, xtool-org/xtool#337, nab138/iloader#859.
+    # ══════════════════════════════════════════════════════════════════════════
+
     def get_best_anisette_server(self):
-        """Tự động chọn server Anisette từ danh sách SideStore.
+        """Chọn server Anisette có danh tính được Apple CHẤP NHẬN (đã kiểm chứng).
 
-        - Tải danh sách từ https://servers.sidestore.io/servers.json
-        - Duyệt từ server CUỐI danh sách LÊN TRÊN (bottom-up), lấy server ĐẦU TIÊN
-          phản hồi hợp lệ (HTTP 200 qua /v3/client_info hoặc /)
-        - Nếu server đang dùng lỗi khi fetch anisette, nó bị thêm vào
-          self._failed_servers và lần chọn tiếp theo sẽ bỏ qua, nhảy lên server
-          phía trên trong danh sách
-        - Cache server đã chọn 6 giờ (.anisette_cache.json)
-        - Không server nào sống -> fallback ANISETTE_URL (local)
+        Trả về URL server; đồng thời đặt self._identity / self.client_info /
+        self.user_agent khớp với machine-id của server đó.
         """
-        failed = getattr(self, "_failed_servers", set())
+        return self._select_anisette()
 
-        cached = self._load_anisette_cache()
-        if cached and cached not in failed:
-            print(f"[anisette] Dùng server đã cache: {cached}")
-            return cached
-        if cached and cached in failed:
-            # Server cache đã chết -> bỏ cache để dò lại
-            self._invalidate_anisette_cache()
+    @staticmethod
+    def _candidate_servers():
+        """Danh sách URL ứng viên: seed đã biết tốt trước, rồi servers.json."""
+        seen = []
+        for url in ANISETTE_SEED_SERVERS:
+            u = (url or "").rstrip("/")
+            if u and u not in seen:
+                seen.append(u)
+        for s in AppleAuth._fetch_server_list():
+            u = (s.get("address") or "").rstrip("/")
+            if u and u not in seen:
+                seen.append(u)
+        if ANISETTE_URL.rstrip("/") not in seen:
+            seen.append(ANISETTE_URL.rstrip("/"))
+        return seen
 
-        print("[anisette] Đang tìm server từ danh sách SideStore (duyệt từ dưới lên)...")
-        servers = self._fetch_server_list()
-        if not servers:
-            print(f"[anisette] ⚠️  Không tải được danh sách server — dùng mặc định: {ANISETTE_URL}")
-            return ANISETTE_URL
+    def _select_anisette(self, ignore_cache=False):
+        failed = self._failed_servers
 
-        # Duyệt từ server dưới đáy danh sách lên trên
-        for server in reversed(servers):
-            addr = (server.get("address") or "").rstrip("/")
-            if not addr or addr in failed:
+        if not ignore_cache:
+            cached = self._load_anisette_cache()
+            if cached and cached.get("url") and cached["url"] not in failed:
+                if cached.get("client_info"):
+                    self._set_identity(cached["url"], cached["client_info"],
+                                       cached.get("user_agent"),
+                                       cached.get("variant", "raw"))
+                    print(f"[anisette] Dùng server đã kiểm chứng (cache): {cached['url']}")
+                    return cached["url"]
+                # cache kiểu cũ (chỉ có url) → phải kiểm chứng lại
+                print("[anisette] Cache cũ không có danh tính client — kiểm chứng lại.")
+
+        print("[anisette] Dò server Anisette: kiểm tra machine-id có được Apple chấp nhận...")
+        candidates = self._candidate_servers()
+        print(f"[anisette] Có {len(candidates)} server ứng viên (seed + SideStore list).")
+        # Chặn trên: mỗi ứng viên tốn 1-2 HTTP GET + 1 POST tới Apple. Seed
+        # (server đã biết tốt) đứng đầu nên thực tế chỉ thử 1-3 cái là xong.
+        candidates = candidates[:ANISETTE_MAX_CANDIDATES]
+
+        unknown = None
+        net_fail = 0
+        for addr in candidates:
+            if addr in failed:
                 continue
-            name = server.get("name", addr)
-            latency = self._probe_anisette_server(addr)
-            if latency is not None:
-                print(f"[anisette] ✅ Chọn server: {name} ({addr}) — {latency*1000:.0f}ms")
-                self._save_anisette_cache(addr)
+            ident = self._fetch_identity(addr)
+            if not ident:
+                net_fail += 1
+                print(f"[anisette]   ✗ {addr} — không lấy được headers")
+                # 3 server liên tiếp không trả lời = gần như chắc chắn mất mạng
+                # → dừng sớm thay vì treo lâu (12 ứng viên × timeout).
+                if net_fail >= 3:
+                    print("[anisette] ⚠️  Nhiều server không phản hồi — có thể mất mạng. "
+                          "Dừng dò sớm.")
+                    break
+                continue
+            net_fail = 0
+            ci_ok, variant, detail = self._identity_accepted(addr, ident)
+            if ci_ok:
+                self._set_identity(addr, ci_ok, ident.get("user_agent"), variant)
+                self._save_anisette_cache(addr, ci_ok, ident.get("user_agent"), variant)
+                print(f"[anisette] ✅ Chọn server: {addr} — danh tính được GSA chấp nhận "
+                      f"({detail})")
                 return addr
-            print(f"[anisette]   ✗ {name} ({addr}) — không phản hồi, thử server phía trên...")
+            if detail == "unknown" and unknown is None:
+                unknown = (addr, ident)
+            print(f"[anisette]   ✗ {addr} — Apple từ chối danh tính ({detail})")
+
+        # Không server nào kiểm chứng được (vd. GSA 429 do thử quá nhiều):
+        # dùng server đầu tiên còn sống để không chặn người dùng, nhưng KHÔNG
+        # cache nó là "đã kiểm chứng".
+        if unknown:
+            addr, ident = unknown
+            ci = ident.get("client_info") or ""
+            self._set_identity(addr, ci, ident.get("user_agent"),
+                               "akd" if "com.apple.dt.Xcode" in ci else "raw")
+            print(f"[anisette] ⚠️  Không kiểm chứng được server nào (GSA bận) — "
+                  f"tạm dùng {addr}.")
+            return addr
 
         print(f"[anisette] ⚠️  Không có server nào hoạt động — dùng mặc định: {ANISETTE_URL}")
         return ANISETTE_URL
@@ -178,20 +335,126 @@ class AppleAuth:
             return []
 
     @staticmethod
-    def _probe_anisette_server(addr, timeout=6):
-        """Kiểm tra server có sống không. Trả về latency (giây) nếu HTTP 200, ngược lại None."""
-        for path in ("/v3/client_info", ""):
-            url = addr + path
+    def _fetch_identity(addr, timeout=8):
+        """Lấy danh tính THẬT của một server anisette.
+
+        Trả về dict {headers, client_info, user_agent} hoặc None nếu server chết.
+        client_info/user_agent lấy từ /v3/client_info (anisette v3 trở lên);
+        nếu server cũ không có endpoint đó thì suy ra từ headers trả về ở "/".
+        """
+        client_info, user_agent = None, None
+        try:
+            r = requests.get(addr + "/v3/client_info", timeout=timeout, verify=False)
+            if r.ok:
+                j = r.json()
+                client_info = j.get("client_info") or j.get("clientInfo")
+                user_agent = j.get("user_agent") or j.get("userAgent")
+        except Exception:
+            pass
+
+        headers = None
+        for path in ("/", "/v3/get_headers"):
             try:
-                start = time.monotonic()
-                resp = requests.get(url, timeout=timeout, verify=False)
-                latency = time.monotonic() - start
-                if resp.ok:
-                    return latency
+                r = requests.get(addr + path, timeout=timeout, verify=False)
+                if not r.ok:
+                    continue
+                j = r.json()
+                if isinstance(j, dict) and j.get("X-Apple-I-MD-M"):
+                    headers = j
+                    break
             except Exception:
                 continue
-        return None
+        if not headers:
+            return None
 
+        if not client_info:
+            client_info = headers.get("X-MMe-Client-Info") or headers.get("X-Mme-Client-Info")
+        if not user_agent:
+            user_agent = headers.get("User-Agent") or DEFAULT_USER_AGENT
+        return {"headers": headers, "client_info": client_info,
+                "user_agent": user_agent}
+
+    @staticmethod
+    def _identity_variants(client_info):
+        """Các biến thể danh tính có thể gửi cho Apple.
+
+        (raw, "raw")  — đúng nguyên văn server trả về (ưu tiên: khớp machine-id)
+        (akd, "akd")  — chỉ khi chuỗi gốc còn token com.apple.dt.Xcode, vốn bị
+                        edge trả 503 từ 09/2026 → thay bằng com.apple.akd như
+                        bản vá cũ. Đây chỉ là phương án dự phòng, KHÔNG phải
+                        mặc định, vì sửa danh tính là tạo mismatch mới.
+        """
+        if not client_info:
+            return []
+        out = [(client_info, "raw")]
+        if "com.apple.dt.Xcode" in client_info:
+            out.append((client_info.replace("com.apple.dt.Xcode", "com.apple.akd"), "akd"))
+        return out
+
+    def _identity_accepted(self, addr, ident):
+        """Hỏi Apple xem machine-id của `addr` có được chấp nhận không.
+
+        Dùng một Apple ID NGẪU NHIÊN KHÔNG TỒN TẠI và chỉ gửi `o=init` (không
+        mật khẩu, không đụng tài khoản người dùng) — như vậy kiểm chứng được
+        đúng điều Apple đang kiểm: nguồn gốc machine-id so với danh tính khai
+        báo. Trả về (client_info_nên_dùng, variant, detail).
+        """
+        user = "probe%s@icloud.com" % secrets.token_hex(5)
+        last_detail = "unknown"
+        for client_info, variant in self._identity_variants(ident.get("client_info")):
+            try:
+                res = self._gsa_init_probe(user, ident["headers"], client_info,
+                                           ident.get("user_agent"))
+            except Exception as e:
+                last_detail = f"lỗi mạng: {e}"
+                continue
+            http = res.get("http")
+            ec = res.get("ec")
+            if http in IDENTITY_REJECT_HTTP:
+                last_detail = f"HTTP {http}"
+                continue
+            if ec in IDENTITY_REJECT_EC:
+                last_detail = f"ec {ec}"
+                continue
+            if http == 429:
+                last_detail = "unknown"
+                continue
+            if ec is None:
+                last_detail = f"HTTP {http} không phải plist"
+                continue
+            detail = "ec 0 + SRP challenge" if res.get("has_challenge") else f"ec {ec}"
+            return client_info, variant, detail
+        return None, None, last_detail
+
+    def _gsa_init_probe(self, user, anisette_headers, client_info, user_agent):
+        """Một request GsService2 `o=init` duy nhất (dùng cho kiểm chứng)."""
+        cpd = self._build_cpd(anisette_headers, client_info, variant="raw")
+        body = {
+            "Header": {"Version": "1.0.1"},
+            "Request": {"cpd": cpd, "A2k": secrets.token_bytes(384),
+                        "ps": ["s2k", "s2k_fo"], "u": user, "o": "init"},
+        }
+        headers = {
+            "Content-Type": "text/x-xml-plist",
+            "Accept": "text/x-xml-plist",
+            "User-Agent": user_agent or DEFAULT_USER_AGENT,
+            "X-MMe-Client-Info": client_info or "",
+            "X-Apple-App-Info": "com.apple.gs.xcode.auth",
+            "X-Xcode-Version": "14.2 (14C18)",
+            "Connection": "close",
+        }
+        r = requests.post(GSA_URL, data=plist.dumps(body), headers=headers,
+                          timeout=20, verify=False)
+        out = {"http": r.status_code, "ec": None, "has_challenge": False}
+        try:
+            res = plist.loads(r.content).get("Response", {})
+            out["ec"] = (res.get("Status") or {}).get("ec", 0)
+            out["has_challenge"] = "sp" in res
+        except Exception:
+            pass
+        return out
+
+    # ── Cache ────────────────────────────────────────────────────────────────
     @staticmethod
     def _load_anisette_cache():
         try:
@@ -200,16 +463,18 @@ class AppleAuth:
             with open(ANISETTE_CACHE_FILE) as f:
                 data = json.load(f)
             if data.get("url") and time.time() - data.get("ts", 0) < ANISETTE_CACHE_TTL:
-                return data["url"]
+                return data
         except Exception:
             pass
         return None
 
     @staticmethod
-    def _save_anisette_cache(url):
+    def _save_anisette_cache(url, client_info, user_agent, variant="raw"):
         try:
             with open(ANISETTE_CACHE_FILE, "w") as f:
-                json.dump({"url": url, "ts": time.time()}, f)
+                json.dump({"url": url, "client_info": client_info,
+                           "user_agent": user_agent, "variant": variant,
+                           "ts": time.time()}, f)
         except Exception:
             pass
 
@@ -221,60 +486,131 @@ class AppleAuth:
         except Exception:
             pass
 
+    # ── Danh tính đang dùng ─────────────────────────────────────────────────
+    def _set_identity(self, url, client_info, user_agent=None, variant="raw"):
+        """Đặt danh tính client khớp ĐÚNG server đang dùng (không bịa)."""
+        self.anisette_url = url.rstrip("/")
+        if client_info:
+            if variant == "akd":
+                client_info = client_info.replace("com.apple.dt.Xcode", "com.apple.akd")
+            self.client_info = client_info
+        self.user_agent = user_agent or self.user_agent or DEFAULT_USER_AGENT
+        self._identity_user_agent = self.user_agent
+        self._identity_variant = variant
+
     def generate_anisette_headers(self):
-        """Generate Anisette headers required for Apple authentication."""
-        # Thử lại tối đa 3 lần nếu fetch anisette lỗi
+        """Lấy headers anisette (machine-id + OTP) từ server đang chọn.
+
+        Đồng thời ĐỒNG BỘ self.client_info/self.user_agent với server đó: nếu
+        server được đổi (do lỗi) mà danh tính vẫn là của server cũ thì Apple
+        lại trả -80045 đúng như lỗi gốc.
+        """
         for attempt in range(3):
             try:
                 print(f"[anisette] Fetching headers from {self.anisette_url} (lần {attempt+1}/3)...")
                 response = self.session.get(self.anisette_url, timeout=10)
                 response.raise_for_status()
                 data = response.json()
-                
-                # Kiểm tra xem có đủ key quan trọng không
+
                 if "X-Apple-I-MD-M" not in data:
                     print("[anisette] Cảnh báo: Thiếu X-Apple-I-MD-M trong response.")
-                
+                if "X-Mme-Device-Id" in data:
+                    self.device_id = data["X-Mme-Device-Id"]
+
+                # Server có thể xoay/đổi danh tính → luôn lấy lại từ server,
+                # chỉ áp biến thể (raw/akd) đã chọn lúc kiểm chứng.
+                server_ci = data.get("X-MMe-Client-Info") or data.get("X-Mme-Client-Info")
+                if server_ci:
+                    self._set_identity(self.anisette_url, server_ci,
+                                       getattr(self, "_identity_user_agent", None)
+                                       or self.user_agent,
+                                       getattr(self, "_identity_variant", "raw"))
                 return data
             except Exception as e:
                 print(f"[anisette] Lỗi fetch anisette từ {self.anisette_url}: {e}")
-                if not hasattr(self, "_failed_servers"):
-                    self._failed_servers = set()
                 if attempt < 2:
                     time.sleep(1)
-                    # Server private do nguoi dung chi dinh: loi fetch la loi mang,
-                    # khong duoc nhay sang server cong cong.
                     if getattr(self, "_anisette_pinned", False):
                         print(f"[anisette] Giữ server private {self.anisette_url}, thử lại...")
                     else:
                         self._failed_servers.add(self.anisette_url.rstrip("/"))
-                        self.anisette_url = self.get_best_anisette_server()
+                        self._select_anisette(ignore_cache=True)
                 else:
                     raise Exception("Không thể lấy dữ liệu Anisette sau 3 lần thử.")
 
+    def _build_cpd(self, anisette_data, client_info=None, variant=None):
+        """Dựng trường `cpd` của GSA.
+
+        QUAN TRỌNG: X-MMe-Client-Info trong body phải TRÙNG KHỚP với header
+        HTTP và với machine-id. Bản cũ chỉ sửa header, hoặc sửa cả hai thành
+        một chuỗi Mac bịa ra → Apple trả -80044/-80045.
+        """
+        cpd = {
+            "bootstrap": True,
+            "icscrec": True,
+            "pbe": False,
+            "prkgen": True,
+            "svct": "iCloud",
+        }
+        cpd.update(self.generate_meta_headers())
+        cpd.update(anisette_data or {})
+
+        ci = client_info or self._apply_identity_variant(self.client_info)
+        effective_variant = variant if variant is not None else \
+            getattr(self, "_identity_variant", "raw")
+        if effective_variant == "akd" and ci:
+            ci = ci.replace("com.apple.dt.Xcode", "com.apple.akd")
+        if ci:
+            cpd["X-MMe-Client-Info"] = ci
+        if not cpd.get("X-Mme-Device-Id"):
+            cpd["X-Mme-Device-Id"] = self.device_id
+        return cpd
+
+    def _apply_identity_variant(self, info):
+        """Áp biến thể danh tính đã chọn (raw/akd) lên chuỗi client-info."""
+        if not info:
+            return info
+        if getattr(self, "_identity_variant", "raw") == "akd":
+            return info.replace("com.apple.dt.Xcode", "com.apple.akd")
+        return info
+
     @staticmethod
     def _sanitize_client_info(info):
-        """[FIX 2026-09] Apple edge (tu ~08/09/2026) drop ngay moi POST toi
-        https://gsa.apple.com/grandslam/GsService2 neu header X-MMe-Client-Info
-        chua token 'com.apple.dt.Xcode' — tra ve trang HTML 190 byte (Server: Apple)
-        thay vi plist GSA, client doc thanh '503 Service Temporarily Unavailable'.
-        Day la block o EDGE truoc khi xu ly credential nen doi Apple ID/server/
-        mang deu khong anh huong. Fix theo AltStore (altstoreio/AltStore#1790,
-        AltServer 1.7.6) va Dadoum/anisette-v3-server #60: thay token bang
-        'com.apple.akd' — daemon thuc su thuc hien request tren macOS.
-        Luu y: phai sanitize O MOI DIEM GUI, ke ca khi anisette server tu tra
-        ve client-info chua token Xcode (nhieu server con cu)."""
+        """(Giữ lại cho tương thích) thay token Xcode bằng akd.
+
+        Từ v72 hàm này KHÔNG còn được dùng ở đường chính: sửa danh tính là
+        tạo ra mismatch mới với machine-id (chính là lỗi -80045). Danh tính
+        được lấy nguyên văn từ server và kiểm chứng bằng _identity_accepted().
+        """
         if not info:
             return info
         return info.replace("com.apple.dt.Xcode", "com.apple.akd")
 
+    @staticmethod
+    def _locale_id():
+        """Locale dạng en_US. locale.getdefaultlocale() bị deprecated (Python
+        3.15 sẽ bỏ) — log người dùng đầy DeprecationWarning vì hàm này được
+        gọi 2 lần cho mỗi CPD. Dùng getlocale() trước, chỉ fallback khi rỗng."""
+        value = None
+        try:
+            value = locale.getlocale()[0]
+        except Exception:
+            value = None
+        if not value:
+            try:
+                value = locale.getdefaultlocale()[0]
+            except Exception:
+                value = None
+        return value or "en_US"
+
     def generate_meta_headers(self):
         """Generate meta headers for Apple requests."""
+        loc = self._locale_id()
         return {
             "X-Apple-I-Client-Time": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
             "X-Apple-I-TimeZone": str(datetime.utcnow().astimezone().tzinfo),
-            "loc": locale.getdefaultlocale()[0] or "en_US",
-            "X-Apple-Locale": locale.getdefaultlocale()[0] or "en_US",
+            "loc": loc,
+            "X-Apple-Locale": loc,
             "X-Apple-I-MD-RINFO": "17106176",
             "X-Apple-I-MD-LU": base64.b64encode(self.user_id.encode()).decode(),
             "X-Mme-Device-Id": self.device_id,
@@ -296,24 +632,14 @@ class AppleAuth:
 
         anisette_data = self.generate_anisette_headers()
 
-        # Update internal device info to match anisette server
+        # Update internal device info to match anisette server (machine-id của
+        # server phải khớp device-id gửi đi, nếu không Apple trả ec=-80045).
         if "X-Mme-Device-Id" in anisette_data:
             self.device_id = anisette_data["X-Mme-Device-Id"]
-        if "X-MMe-Client-Info" in anisette_data:
-            self.client_info = self._sanitize_client_info(anisette_data["X-MMe-Client-Info"])
 
-        cpd = {
-            "bootstrap": True,
-            "icscrec": True,
-            "pbe": False,
-            "prkgen": True,
-            "svct": "iCloud",
-        }
-
-        cpd.update(self.generate_meta_headers())
-        cpd.update(anisette_data)
-        if "X-MMe-Client-Info" in cpd:
-            cpd["X-MMe-Client-Info"] = self._sanitize_client_info(cpd["X-MMe-Client-Info"])
+        # v72: KHÔNG tự bịa/thay danh tính ở đây nữa — _build_cpd() dùng
+        # nguyên văn danh tính đã kiểm chứng của server (self.client_info).
+        cpd = self._build_cpd(anisette_data)
 
         print("[cpd] Client platform data generated successfully")
         if getattr(self, "_pin_cpd", False):
@@ -473,11 +799,18 @@ class AppleAuth:
         }
         body["Request"].update(parameters)
 
+        # v72: danh tính gửi đi = danh tính của server đã sinh machine-id.
+        # Lệch nhau (Mac bịa ra + machine-id Android) chính là -80045.
+        ci = self.client_info or ""
+        if getattr(self, "_identity_variant", "raw") == "akd" and ci:
+            ci = ci.replace("com.apple.dt.Xcode", "com.apple.akd")
         headers = {
             "Content-Type": "text/x-xml-plist",
-            "Accept": "*/*",
+            "Accept": "text/x-xml-plist",
             "User-Agent": self.user_agent,
-            "X-MMe-Client-Info": self._sanitize_client_info(self.client_info),
+            "X-MMe-Client-Info": ci,
+            "X-Apple-App-Info": "com.apple.gs.xcode.auth",
+            "X-Xcode-Version": "14.2 (14C18)",
         }
         payload = plist.dumps(body)
         op = parameters.get("o", "unknown")
@@ -521,6 +854,18 @@ class AppleAuth:
                 if response.status_code == 404:
                     raise Exception("GSA endpoint not found (404)")
 
+                # v72: hết 3 lần vẫn là 5xx HTML → nhiều khả năng edge chặn
+                # DANH TÍNH (vd. server anisette đổi client-info sang token
+                # com.apple.dt.Xcode, bị chặn từ 09/2026) chứ không phải
+                # "server anisette chết". Phân loại đúng để luồng tự phục hồi
+                # (_recover_identity) xử lý thay vì báo lỗi 429 sai đường.
+                if response.status_code in (502, 503, 504):
+                    snippet = response.content[:120].decode("utf-8", "replace").replace("\n", " ")
+                    raise AnisetteIdentityRejected(
+                        f"Apple edge trả HTTP {response.status_code} cho danh tính "
+                        f"'{self._apply_identity_variant(self.client_info)}' ({snippet})"
+                    )
+
                 response.raise_for_status()
 
                 response_data = plist.loads(response.content)
@@ -534,6 +879,17 @@ class AppleAuth:
 
                 result = response_data["Response"]
                 result["_headers"] = response.headers
+
+                status = result.get("Status") or {}
+                ec = status.get("ec")
+                if ec in IDENTITY_REJECT_EC and op in ("init", "complete"):
+                    # Apple từ chối NGAY ở bước init vì machine-id không khớp
+                    # danh tính khai báo → đổi server anisette, không phải
+                    # sai mật khẩu (mật khẩu chưa hề được gửi).
+                    raise AnisetteIdentityRejected(
+                        f"Apple từ chối danh tính anisette (ec {ec}) ở bước init — "
+                        f"server {self.anisette_url} không còn dùng được với GSA."
+                    )
                 return result
 
             except GsaRateLimitedError:
@@ -552,14 +908,16 @@ class AppleAuth:
         identity_token = base64.b64encode(f"{dsid}:{idms_token}".encode()).decode()
 
         h = {
-            "User-Agent": self.xcode_ua,
+            # v72: UA phải là UA của client đã sinh machine-id (server trả ở
+            # /v3/client_info), nếu không Apple coi là hai client khác nhau.
+            "User-Agent": self.user_agent,
             "Accept": "text/x-xml-plist",
             "Accept-Language": "en-us",
             "X-Apple-Identity-Token": identity_token,
             "X-Apple-I-Identity-Token": identity_token,
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
             "X-Xcode-Version": "14.2 (14C18)",
-            "X-Mme-Client-Info": self._sanitize_client_info(self.client_info),
+            "X-MMe-Client-Info": self._apply_identity_variant(self.client_info),
             "X-Apple-I-DSID": str(dsid),
         }
 
@@ -571,12 +929,18 @@ class AppleAuth:
                 h.update(anisette)
                 # anisette server co the tra ve client-info chua token Xcode -> sanitize
                 if "X-MMe-Client-Info" in h:
-                    h["X-MMe-Client-Info"] = self._sanitize_client_info(h["X-MMe-Client-Info"])
+                    h["X-MMe-Client-Info"] = self._apply_identity_variant(h["X-MMe-Client-Info"])
                 print(f"[2fa] Fresh anisette fetched (MD-M present: {'X-Apple-I-MD-M' in anisette})")
             except Exception as e:
                 print(f"[2fa] ⚠️  Anisette fetch thất bại: {e}")
 
-        h["X-Apple-I-MD-LU"] = base64.b64encode(str(dsid).encode()).decode()
+        # X-Apple-I-MD-LU: pypush đặt base64(dsid), NHƯNG từ 10/2026 Apple so
+        # khớp chặt header với machine-id đã cấp OTP. LU là "local user" được
+        # dùng lúc provision — ghi đè bằng dsid có thể làm OTP không còn hợp lệ
+        # với LU đó. Nay giữ LU do server cấp, chỉ fallback base64(dsid) khi
+        # server không trả (server cũ).
+        if not h.get("X-Apple-I-MD-LU"):
+            h["X-Apple-I-MD-LU"] = base64.b64encode(str(dsid).encode()).decode()
         # Đảm bảo X-Apple-I-MD-RINFO được cập nhật từ anisette nếu có
         if "X-Apple-I-MD-RINFO" not in h:
             h["X-Apple-I-MD-RINFO"] = "17106176"
@@ -586,9 +950,17 @@ class AppleAuth:
     # =========================================================================
     # handle_2fa_trusted_device — đã fix stale-anisette + POST fallback
     # =========================================================================
-    def handle_2fa_trusted_device(self, dsid, idms_token):
-        """Handle trusted device 2FA."""
-        print("[2fa] Triggering trusted device authentication...")
+    def handle_2fa_trusted_device(self, dsid, idms_token, already_pushed=False):
+        """Handle trusted device 2FA.
+
+        already_pushed=True: Apple vừa tự gửi mã (hsc 409) — KHÔNG gọi endpoint
+        trigger nữa, vì gọi lại sẽ vô hiệu hoá mã người dùng vừa nhận được và
+        khiến họ nhập mã đúng mà vẫn bị từ chối.
+        """
+        if already_pushed:
+            print("[2fa] Mã đã được Apple gửi sẵn — bỏ qua bước trigger.")
+        else:
+            print("[2fa] Triggering trusted device authentication...")
 
         try:
             # ── BƯỚC 1: Gửi trigger ──────────────────────
@@ -600,8 +972,8 @@ class AppleAuth:
             # trigger thật với anisette mới mỗi lần.
             trigger_url = "https://gsa.apple.com/auth/verify/trusteddevice"
 
-            triggered = False
-            for t_attempt in range(3):
+            triggered = bool(already_pushed)
+            for t_attempt in range(0 if already_pushed else 3):
                 print(f"[2fa] Fetching fresh anisette for trigger (GET {trigger_url}, lần {t_attempt + 1}/3)...")
                 trigger_headers = self._build_2fa_base_headers(dsid, idms_token)
                 trigger_headers["Content-Type"] = "text/x-xml-plist"
@@ -833,34 +1205,67 @@ class AppleAuth:
             traceback.print_exc()
             return False
 
-    def authenticate(self, apple_id, password, _depth=0, _gsa_retries=0):
+    def authenticate(self, apple_id, password, _depth=0, _gsa_retries=0,
+                     _identity_retries=0, _resync_retries=0):
         """Main authentication method - GSA SRP + 2FA.
 
         _gsa_retries: so lan thu lai ca chuoi SRP sau khi edge van tra 429
         tren socket moi. Khong xoay anisette server vi 429 nay khong phu thuoc
         vao server anisette (init da 200 voi cung header).
+
+        _identity_retries: [v72] so lan đã tự đổi server anisette sau khi
+        Apple trả -80045 (danh tính bị từ chối). Tối đa 2 để không vòng lặp.
+
+        _resync_retries: [v72] so lan đã đồng bộ lại anisette sau hsc 434.
         """
         self._gsa_init_ok = False
         self._cpd_pin = None
         self._pin_cpd = True
         try:
             print(f"[icloud] Starting authentication for {apple_id}")
+            print(f"[icloud] Anisette: {self.anisette_url}")
+            print(f"[icloud] Client -Info: {self._apply_identity_variant(self.client_info)}")
+            print(f"[icloud] User-Agent   : {self.user_agent}")
 
             usr = srp.User(apple_id, bytes(), hash_alg=srp.SHA256, ng_type=srp.NG_2048)
             _, A = usr.start_authentication()
 
             print("[srp] SRP initialized successfully")
 
-            response = self.gsa_request({
-                "A2k": A,
-                "ps": ["s2k", "s2k_fo"],
-                "u": apple_id,
-                "o": "init"
-            })
+            try:
+                response = self.gsa_request({
+                    "A2k": A,
+                    "ps": ["s2k", "s2k_fo"],
+                    "u": apple_id,
+                    "o": "init"
+                })
+            except AnisetteIdentityRejected as e:
+                return self._recover_identity(apple_id, password, _depth,
+                                              _identity_retries, e)
             # init da toi GrandSlam: profile anisette dang dung khong bi edge chan.
             self._gsa_init_ok = True
 
+            status = response.get("Status") or {}
+            hsc = status.get("hsc")
+
+            # [v72] hsc 434: Apple yêu cầu đồng bộ lại anisette (machine-id
+            # được cấp cho danh tính khác). Lấy OTP mới và thử lại 1 lần.
+            if hsc == 434 and _resync_retries < 1:
+                print("[icloud] Apple yêu cầu đồng bộ lại anisette (hsc 434) — "
+                      "lấy dữ liệu anisette mới và thử lại...")
+                self._pin_cpd = False
+                self._cpd_pin = None
+                try:
+                    self.generate_anisette_headers()
+                except Exception as exc:
+                    print(f"[icloud] Không lấy được anisette mới: {exc}")
+                return self.authenticate(apple_id, password, _depth=_depth,
+                                         _gsa_retries=_gsa_retries,
+                                         _identity_retries=_identity_retries,
+                                         _resync_retries=_resync_retries + 1)
+
             if "sp" not in response:
+                self._explain_gsa_status(status, response)
                 print(f"[icloud] Failed to authenticate: {response}")
                 return None
 
@@ -887,15 +1292,34 @@ class AppleAuth:
 
             print("[srp] SRP challenge processed successfully")
 
-            response = self.gsa_request({
-                "c": c,
-                "M1": M,
-                "u": apple_id,
-                "o": "complete"
-            })
+            try:
+                response = self.gsa_request({
+                    "c": c,
+                    "M1": M,
+                    "u": apple_id,
+                    "o": "complete"
+                })
+            except AnisetteIdentityRejected as e:
+                # Machine-id bị Apple từ chối ngay ở bước complete (đổi giữa
+                # phiên / edge chặn danh tính) → coi như lỗi danh tính.
+                return self._recover_identity(apple_id, password, _depth,
+                                              _identity_retries, e)
 
             status = response.get("Status", {})
             auth_type = status.get("au")
+            hsc = status.get("hsc")
+            already_pushed = False
+
+            # [v72] Từ 13/10/2026 Apple thường TỰ gửi mã xác thực tới thiết bị
+            # tin cậy ngay sau bước mật khẩu: response `complete` có hsc=409 và
+            # KHÔNG có "au". Bản cũ coi đây là "không cần 2FA" → đi thẳng xin
+            # app token → Apple trả -22411. Nay coi 409 như trustedDevice, chỉ
+            # khác là KHÔNG xin mã mới (xin lại sẽ làm mã vừa gửi mất hiệu lực).
+            if hsc == 409 and not auth_type:
+                print("[2fa] Apple đã tự gửi mã xác thực tới thiết bị tin cậy "
+                      "(hsc 409, không có \"au\") — nhập mã đã nhận, không xin lại.")
+                auth_type = "trustedDeviceSecondaryAuth"
+                already_pushed = True
 
             # Xác minh M2 từ Apple
             m2_verified = False
@@ -932,6 +1356,10 @@ class AppleAuth:
                     spd_data.get("GsIdmsToken")
                     or spd_data.get("idmsToken")
                     or status.get("idmsToken")
+                    # hsc 409 (Apple tự gửi mã) không kèm spd giải mã được:
+                    # token phiên nằm trong header trả về.
+                    or headers_dict.get("x-apple-idms-token")
+                    or headers_dict.get("x-apple-i-idms-token")
                 )
 
                 if not dsid or not idms_token:
@@ -945,7 +1373,8 @@ class AppleAuth:
                 # Thử trusted device trước, SMS làm fallback
                 two_fa_ok = False
                 if auth_type in ["trustedDeviceSecondaryAuth", "secondaryAuth"]:
-                    two_fa_ok = self.handle_2fa_trusted_device(dsid, idms_token)
+                    two_fa_ok = self.handle_2fa_trusted_device(
+                        dsid, idms_token, already_pushed=already_pushed)
                     if not two_fa_ok:
                         print("[2fa] Trusted device thất bại. Thử SMS fallback...")
                         two_fa_ok = self.handle_2fa_sms(dsid, idms_token)
@@ -954,7 +1383,8 @@ class AppleAuth:
                     two_fa_ok = self.handle_2fa_sms(dsid, idms_token)
                     if not two_fa_ok:
                         print("[2fa] SMS thất bại. Thử trusted device...")
-                        two_fa_ok = self.handle_2fa_trusted_device(dsid, idms_token)
+                        two_fa_ok = self.handle_2fa_trusted_device(
+                            dsid, idms_token, already_pushed=already_pushed)
 
                 if two_fa_ok:
                     if _depth >= 1:
@@ -968,11 +1398,14 @@ class AppleAuth:
                     print("[icloud] 2FA thành công! Đang xác thực lại để lấy token phiên đầy đủ...")
                     return self.authenticate(apple_id, password, _depth=_depth + 1)
                 else:
+                    self.last_error = "Xác thực 2FA thất bại hoặc bị huỷ."
                     return None
 
             # ---- Không cần 2FA ----
             if not m2_verified:
                 print(f"[icloud] Authentication failed: {response}")
+                if not self.last_error:
+                    self.last_error = "Apple không xác nhận phiên SRP (M2 sai) — thử lại."
                 return None
 
             print("[icloud] Authentication successful!")
@@ -1032,6 +1465,96 @@ class AppleAuth:
         finally:
             self._pin_cpd = False
             self._cpd_pin = None
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v72: tự phục hồi khi Apple từ chối danh tính anisette (-80045) và
+    # giải thích mã lỗi GSA cho người dùng thay vì chỉ in dictionary thô.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    GSA_ERROR_HINTS = {
+        -80045: ("Apple từ chối danh tính anisette (machine-id không khớp client "
+                 "khai báo). Tool sẽ tự đổi server anisette."),
+        -80009: "Apple không nhận machine-id (X-Apple-I-MD-M) — anisette server trả thiếu/hỏng.",
+        -80010: "Thiếu one-time password (X-Apple-I-MD-M) trong request.",
+        -29004: "machine-id anisette bị Apple coi là hỏng (malformed).",
+        -80044: "Danh tính trong header HTTP và trong body (cpd) không khớp nhau.",
+        -20101: "Sai Apple ID hoặc mật khẩu.",
+        -20102: "Tài khoản Apple ID không tồn tại hoặc sai định dạng.",
+        -20209: ("TÀI KHOẢN BỊ KHOÁ vì lý do an ninh (Apple khoá khi thấy nhiều lần "
+                 "đăng nhập bất thường). Mở https://iforgot.apple.com để mở khoá, "
+                 "đừng thử lại liên tục."),
+        -22411: ("Apple không cấp token phiên ở bước lấy app token — thường do 2FA "
+                 "chưa hoàn tất (hsc 409) hoặc phiên đã bị thay thế."),
+        -22421: "Apple tạm từ chối (thử lại sau ít phút; thường do rate-limit theo IP).",
+        -20970: "Apple nói thông tin tài khoản không đúng (kiểm tra lại Apple ID).",
+    }
+
+    def _explain_gsa_status(self, status, response=None):
+        """In ra lời giải thích dễ hiểu cho Status.ec/hsc của GSA."""
+        ec = (status or {}).get("ec")
+        hsc = (status or {}).get("hsc")
+        if ec in self.GSA_ERROR_HINTS:
+            print(f"[gsa] ⚠️  ec {ec}: {self.GSA_ERROR_HINTS[ec]}")
+            self.last_error = f"Apple trả lỗi {ec}: {self.GSA_ERROR_HINTS[ec]}"
+        elif ec not in (None, 0):
+            msg = (status or {}).get("em") or "Apple từ chối request."
+            print(f"[gsa] ⚠️  ec {ec}: {msg}")
+            self.last_error = f"Apple trả lỗi {ec}: {msg}"
+        if hsc not in (None, 200):
+            print(f"[gsa] ⚠️  hsc {hsc}")
+
+    def _recover_identity(self, apple_id, password, _depth, attempts, exc):
+        """Apple từ chối machine-id của server đang dùng → đổi server và thử lại.
+
+        Chỉ đổi khi người dùng KHÔNG ghim server (ghim = họ tự chọn, tôn trọng
+        lựa chọn nhưng báo rõ). Tối đa 2 lần để không vòng lặp vô hạn.
+        """
+        print(f"[icloud] ❌ {exc}")
+        self._explain_gsa_status({"ec": -80045})
+
+        if getattr(self, "_anisette_pinned", False):
+            self.last_error = (
+                f"Server anisette đang ghim ({self.anisette_url}) bị Apple từ chối "
+                "(-80045). Vào Cài đặt → Server Anisette → chọn 'Tự động'.")
+            print(f"[icloud] Server đang ghim ({self.anisette_url}) bị Apple từ chối.")
+            print("[icloud] → Vào Cài đặt > Server Anisette, chọn 'Tự động' hoặc một "
+                  "server khác (ví dụ mac-ani.jkcoxson.com).")
+            return None
+
+        self._pin_cpd = False
+        self._cpd_pin = None
+
+        # Lần 1: cùng server nhưng xin OTP/machine-id mới. Apple từ chối
+        # thường vì OTP đã cũ hoặc machine-id vừa bị luân chuyển — chưa cần
+        # đổi server (tránh mất server đang tốt).
+        if attempts == 0:
+            print("[icloud] → Thử lại với dữ liệu anisette mới trên cùng server...")
+            try:
+                self.generate_anisette_headers()
+            except Exception as e:
+                print(f"[icloud] Không lấy được anisette mới: {e}")
+            return self.authenticate(apple_id, password, _depth=_depth,
+                                     _identity_retries=1)
+
+        # Lần 2: server này thật sự bị chặn → loại và chọn server đã kiểm chứng khác.
+        if attempts == 1:
+            print("[icloud] → Server này bị chặn: tự động chọn server anisette khác "
+                  "đã kiểm chứng và thử lại...")
+            self._failed_servers.add(self.anisette_url.rstrip("/"))
+            self._invalidate_anisette_cache()
+            self._select_anisette(ignore_cache=True)
+            return self.authenticate(apple_id, password, _depth=_depth,
+                                     _identity_retries=2)
+
+        self.last_error = (
+            "Apple từ chối mọi danh tính anisette đã thử (-80045). Thử: "
+            "(1) chọn server khác trong Cài đặt, (2) đổi mạng/VPN, "
+            "(3) tự host anisette-v3-server.")
+        print("[icloud] Đã thử OTP mới + đổi server mà Apple vẫn từ chối. "
+              "Nguyên nhân có thể: (1) mọi server công khai đang bị chặn, "
+              "(2) mạng/VPN đang bị Apple đánh dấu, (3) cần tự host "
+              "anisette-v3-server. Thử lại sau vài phút.")
+        return None
 
     def _handle_gsa_429(self, apple_id, password, _depth, _gsa_retries, exc):
         """429 con lai sau khi gsa_request da thu 3 socket moi.
