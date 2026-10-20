@@ -49,6 +49,13 @@ jobs:
       - name: "🐍 Python: luồng ký & cài (App ID / extension / UDID)"
         run: python3 tests/python/test_sideload_core.py
 
+      # v72: lớp danh tính anisette (nguyên nhân lỗi đăng nhập -80045 từ
+      # 12/10/2026). Test này KHÔNG gọi mạng — tự giả lập GSA/anisette server.
+      - name: "🔐 Python: danh tính anisette vs GSA (-80045)"
+        run: |
+          python3 -m pip install --quiet srp cryptography
+          python3 tests/python/test_anisette_identity.py
+
       - name: "🏗️  Build libplist/libusbmuxd/libimobiledevice cho host"
         run: HOSTDEPS="$RUNNER_TEMP/hostdeps" SRC="$RUNNER_TEMP/hostsrc" bash tests/native-host/build_host_deps.sh
 
