@@ -241,10 +241,10 @@ object PythonBridge {
      * nên danh sách này cũ vài tuần vẫn không làm hỏng đăng nhập.
      */
     private val priorityAnisetteServers = listOf(
-        AnisetteServer("mac-ani.jkcoxson.com (đã kiểm chứng)", "https://mac-ani.jkcoxson.com"),
-        AnisetteServer("ani.jkcoxson.com", "https://ani.jkcoxson.com"),
+        AnisetteServer("new.ani.sidestore.io (danh tính mới mỗi lần)", "https://new.ani.sidestore.io"),
+        AnisetteServer("ani3.stikstore.app", "https://ani3.stikstore.app"),
         AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
-        AnisetteServer("new.ani.sidestore.io", "https://new.ani.sidestore.io"),
+        AnisetteServer("mac-ani.jkcoxson.com", "https://mac-ani.jkcoxson.com"),
     )
 
     /** Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python. */

@@ -245,6 +245,39 @@ Trạng thái kiểm chứng 20/10/2026: chỉ server nhóm Windows/macOS-ADI
 
 ---
 
+## 6.2 Sự cố 21–25/10/2026: -36607 và -23782 (đã sửa ở v73)
+
+Ngay sau khi v72 vá `-80045`, Apple mở thêm hai cửa chặn **ở bước `complete`**
+(tức SAU khi mật khẩu đã đúng — không phải sai mật khẩu):
+
+| Mã | Thông điệp Apple | Nghĩa thật |
+|---|---|---|
+| `-36607` | *Unable to sign you in to your Apple Account. Try again later.* | "fake Mac" (danh tính anisette) đã bị **quá nhiều tài khoản** đăng nhập trong thời gian ngắn → Apple tạm chặn **danh tính đó** ít nhất 24 giờ |
+| `-23782` | *A Mac with macOS version 10.13 or later is required…* | danh tính khai macOS **quá cũ** cho tài khoản này |
+| `-20209` | *This Apple Account has been locked…* | tài khoản bị khoá — **dừng thử**, mở iforgot.apple.com |
+
+Đo trực tiếp ngày 25/10/2026: `mac-ani.jkcoxson.com` và `ani.jkcoxson.com`
+dùng **chung một** `X-Mme-Device-Id` (`49A2FCC7…`) — đây là danh tính bị dùng
+nhiều nhất sau đợt `-80045`, nên `-36607` xuất hiện nhiều nhất ở đó.
+`new.ani.sidestore.io` cấp **danh tính mới theo từng phiên**, còn các server
+`macOS;13.1` (sidestore.io, npeg.us, …) vẫn bị **503**.
+
+**v73 sửa gì:**
+
+1. Danh tính được quản lý theo **`X-Mme-Device-Id`**, không theo URL. Các URL
+   dùng chung một device-id bị coi là **một** ứng viên (xoay giữa chúng vô ích).
+2. `-36607` → **đốt danh tính đó 24 giờ** (lưu `.anisette_burned.json`) và tự
+   chọn danh tính **khác device-id** rồi chạy lại SRP (tối đa 3 lần). Hết lựa
+   chọn thì báo rõ: chờ ≥ 24h hoặc tự host anisette server.
+3. `-23782` → ưu tiên danh tính khai **macOS ≥ 10.13**; không có thì cảnh báo.
+4. `-20209` → **không thử lại** (tránh khoá nặng thêm), chỉ dẫn mở khoá.
+5. Thứ tự server ưu tiên đổi: `new.ani.sidestore.io` → `ani3/ani2.stikstore.app`
+   → `mac-ani.jkcoxson.com` (jkcoxson xuống cuối vì danh tính dùng chung).
+6. Màn **Chẩn đoán** hiện thêm danh tính (device-id), phiên bản macOS của danh
+   tính và cảnh báo nếu danh tính đó đã từng bị Apple từ chối.
+
+---
+
 ## 7. Ghi công
 
 Dựa trên / học từ mã nguồn mở của các dự án:

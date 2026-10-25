@@ -70,8 +70,13 @@ object AppConfig {
      * server cũ giữ lại chỉ để tham khảo (apple_auth.py tự kiểm chứng lại).
      */
     val defaultAnisetteServers: List<AnisetteServer> = listOf(
-        AnisetteServer("mac-ani.jkcoxson.com", "https://mac-ani.jkcoxson.com"),
+        // v73: ưu tiên server cấp DANH TÍNH MỚI (tránh -36607 "fake Mac" bị quá
+        // nhiều tài khoản dùng). ani.sidestore.io (danh tính macOS;13.1) bị
+        // Apple trả 503 từ 14/10/2026 nên chỉ để tham khảo, không đặt lên đầu.
+        AnisetteServer("new.ani.sidestore.io", "https://new.ani.sidestore.io"),
+        AnisetteServer("ani3.stikstore.app", "https://ani3.stikstore.app"),
         AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
+        AnisetteServer("mac-ani.jkcoxson.com", "https://mac-ani.jkcoxson.com"),
         AnisetteServer("SideStore Official", "https://ani.sidestore.io"),
         AnisetteServer("Local (Sideloadly)", "http://localhost:6969"),
     )

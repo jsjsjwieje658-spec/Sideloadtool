@@ -47,12 +47,23 @@ XCODE_CI = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.
 
 SERVERS = {
     "https://srv-xcode.test": {"ci": XCODE_CI, "ua": "akd/1.0 CFNetwork/808.1.4",
+                               "dev": "DEV-XCODE-0001", "os": "13.1",
                                "init": {"http": 503, "ec": None}},
     "https://srv-android.test": {"ci": ANDROID_UNDER_MAC_CI, "ua": "akd/1.0 CFNetwork/808.1.4",
+                                 "dev": "DEV-ANDROID-0001", "os": "13.1",
                                  "init": {"http": 200, "ec": -80045}},
     "https://srv-good.test": {"ci": GOOD_CI, "ua": GOOD_UA,
+                              "dev": "DEV-GOOD-0001", "os": "10.12.6",
                               "init": {"http": 200, "ec": 0, "challenge": True}},
     "https://srv-good2.test": {"ci": GOOD2_CI, "ua": GOOD2_UA,
+                               "dev": "DEV-GOOD-0002", "os": "10.12.6",
+                               "init": {"http": 200, "ec": 0, "challenge": True}},
+    "https://srv-good3.test": {"ci": GOOD_CI, "ua": GOOD_UA,
+                               "dev": "DEV-GOOD-0003", "os": "10.12.6",
+                               "init": {"http": 200, "ec": 0, "challenge": True}},
+    # [v73] danh tính khai macOS mới (>= 10.13) — dùng cho nhánh -23782
+    "https://srv-newos.test": {"ci": "<MacBookPro16,1> <macOS;13.5;22G74> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+                               "ua": GOOD_UA, "dev": "DEV-NEWOS-0001", "os": "13.5",
                                "init": {"http": 200, "ec": 0, "challenge": True}},
 }
 
@@ -135,7 +146,7 @@ class FakeNet:
             "X-Apple-I-Client-Time": "2026-10-20T12:00:00Z",
             "X-Apple-I-MD-RINFO": "17106176",
             "X-Apple-I-SRL-NO": "0",
-            "X-Mme-Device-Id": "37B05E5F-5E3A-8FFB-0B95-00DEC93F1423",
+            "X-Mme-Device-Id": cfg.get("dev") or "DEV-DEFAULT",
         })
 
     def post(self, url, data=None, headers=None, **kw):
@@ -181,16 +192,19 @@ sys.modules["requests"] = requests_mod
 import apple_auth  # noqa: E402
 
 apple_auth.requests = requests_mod
-apple_auth.ANISETTE_CACHE_FILE = os.path.join(tempfile.mkdtemp(prefix="anisette_test_"),
-                                              ".anisette_cache.json")
+_TEST_DIR = tempfile.mkdtemp(prefix="anisette_test_")
+apple_auth.ANISETTE_CACHE_FILE = os.path.join(_TEST_DIR, ".anisette_cache.json")
+apple_auth.BURNED_DEVICES_FILE = os.path.join(_TEST_DIR, ".anisette_burned.json")
 apple_auth.ANISETTE_SEED_SERVERS = ("https://srv-xcode.test", "https://srv-android.test",
-                                    "https://srv-good.test")
+                                    "https://srv-good.test", "https://srv-good2.test",
+                                    "https://srv-good3.test")
 apple_auth.AppleAuth._fetch_server_list = staticmethod(lambda: [])
 
 
 def new_auth(pinned=None):
-    if os.path.exists(apple_auth.ANISETTE_CACHE_FILE):
-        os.remove(apple_auth.ANISETTE_CACHE_FILE)
+    for f in (apple_auth.ANISETTE_CACHE_FILE, apple_auth.BURNED_DEVICES_FILE):
+        if os.path.exists(f):
+            os.remove(f)
     state["posts"].clear()
     state["init_calls"] = 0
     state["dead"].clear()
@@ -211,7 +225,7 @@ print("2) Header HTTP và cpd phải TRÙNG nhau")
 cpd = auth.generate_cpd()
 check(cpd["X-MMe-Client-Info"] == auth.client_info,
       "cpd X-MMe-Client-Info == client_info của server")
-check(cpd["X-Mme-Device-Id"] == "37B05E5F-5E3A-8FFB-0B95-00DEC93F1423",
+check(cpd["X-Mme-Device-Id"] == "DEV-GOOD-0001",
       "device-id khớp machine-id của anisette server")
 
 print()
@@ -281,6 +295,87 @@ code_requests = []
 auth5.input_func = lambda prompt: (code_requests.append(prompt), "123456")[1]
 auth5.handle_2fa_trusted_device(1, "tok", already_pushed=True)
 check(called["trigger"] == 0, "already_pushed=True → bỏ qua trigger")
+
+print()
+print("7) [v73] -36607 ở bước complete → đốt danh tính đó và xoay sang danh tính KHÁC")
+auth6 = new_auth()
+auth6._burn_device("DEV-GOOD-0001", "exhausted (-36607)")   # giả lập danh tính đã cháy
+if auth6._identity_device_id == "DEV-GOOD-0001":            # đang cầm danh tính đã cháy → đổi
+    auth6._invalidate_anisette_cache()
+    auth6._select_anisette(ignore_cache=True)
+first_dev = auth6._identity_device_id
+tried_devices = []
+
+
+def fake_auth_call(self, apple_id, password, _depth=0, _identity_retries=0, _resync_retries=0):
+    tried_devices.append(getattr(self, "_identity_device_id", ""))
+    if len(tried_devices) == 1:      # lần đầu: Apple trả -36607
+        return self._recover_identity(apple_id, password, _depth, _identity_retries,
+                                      "ec -36607 (fake)", reason="exhausted", ec=-36607)
+    return {"authenticated": True, "dsid": "1"}
+
+
+saved_auth = apple_auth.AppleAuth.authenticate
+apple_auth.AppleAuth.authenticate = fake_auth_call
+try:
+    res = auth6.authenticate("user@example.com", "pw")
+finally:
+    apple_auth.AppleAuth.authenticate = saved_auth
+check(res and res.get("authenticated"), "đăng nhập lại thành công sau khi đổi danh tính")
+check(len(tried_devices) >= 2 and tried_devices[0] != tried_devices[1],
+      f"danh tính ĐÃ ĐỔI ({tried_devices[0]} → {tried_devices[1]})")
+check(auth6._is_burned("DEV-GOOD-0001"), "danh tính bị -36607 được ghi vào danh sách đốt")
+check(os.path.exists(apple_auth.BURNED_DEVICES_FILE), "danh sách đốt được LƯU ra file (nhớ 24h)")
+
+# Hết danh tính dự phòng → phải báo lỗi có thể hành động, KHÔNG lặp vô ích
+auth6b = new_auth()
+for d in ("DEV-GOOD-0001", "DEV-GOOD-0002", "DEV-GOOD-0003"):
+    auth6b._burn_device(d, "exhausted (-36607)")
+auth6b._invalidate_anisette_cache()
+auth6b._select_anisette(ignore_cache=True)
+out = auth6b._recover_identity("user@example.com", "pw", 0, 3,
+                               "ec -36607 (fake)", reason="exhausted", ec=-36607)
+check(out is None, "khi hết danh tính → trả None (không lặp vô hạn)")
+check("24" in (auth6b.last_error or "") or "tự host" in (auth6b.last_error or ""),
+      f"thông báo có thể hành động: {auth6b.last_error[:60]}…")
+
+print()
+print("8) [v73] -23782 → ưu tiên danh tính khai macOS >= 10.13")
+auth7 = new_auth()
+apple_auth.ANISETTE_SEED_SERVERS = ("https://srv-good.test", "https://srv-newos.test")
+try:
+    auth7._invalidate_anisette_cache()
+    picked = auth7._select_anisette(ignore_cache=True, prefer_new_os=True)
+    check(auth7._identity_os_version.startswith("13.") or auth7._identity_os_version >= "10.13",
+          f"chọn danh tính macOS {auth7._identity_os_version} (server {picked})")
+finally:
+    apple_auth.ANISETTE_SEED_SERVERS = ("https://srv-xcode.test", "https://srv-android.test",
+                                       "https://srv-good.test", "https://srv-good2.test",
+                                       "https://srv-good3.test")
+
+print()
+print("9) [v73] các server dùng CHUNG device-id bị coi là một danh tính")
+auth8 = new_auth()
+shared = {"https://srv-shared-a.test": None}
+dupes = []
+orig_fetch = apple_auth.AppleAuth._fetch_identity
+
+
+def fetch_with_dup(addr, timeout=8):
+    ident = orig_fetch(addr, timeout=timeout)
+    if ident:
+        dupes.append(ident.get("device_id"))
+    return ident
+
+
+apple_auth.AppleAuth._fetch_identity = staticmethod(fetch_with_dup)
+try:
+    auth8._invalidate_anisette_cache()
+    auth8._select_anisette(ignore_cache=True)
+finally:
+    apple_auth.AppleAuth._fetch_identity = staticmethod(orig_fetch)
+check(len(dupes) == len(set(dupes)),
+      f"không thử 2 server cùng device-id ({dupes})")
 
 print()
 print("=" * 70)

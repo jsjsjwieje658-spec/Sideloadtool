@@ -16,6 +16,21 @@ HAI LỖI GIỐNG HỆT bản Termux lúc đầu đã được sửa ở đây:
      (Connection: close) và gửi lại tối đa 3 lần trên socket mới.
   2. X-MMe-Client-Info mang token com.apple.dt.Xcode bị edge chặn (503 HTML)
      từ 09/2026 → nay định danh là com.apple.akd như AltServer mới.
+  4. [v73 — 2026-10-25] Từ ~21/10/2026 Apple thêm 2 cửa chặn MỚI, đều xảy ra
+     ở bước `complete` (SAU khi mật khẩu đã đúng):
+       • ec -36607 "Unable to sign you in to your Apple Account. Try again
+         later." — "fake Mac" của anisette server đã bị quá nhiều tài khoản
+         dùng (đúng Apple Support: quá nhiều tài khoản đăng nhập trên cùng một
+         thiết bị trong thời gian ngắn; phải chờ ≥ 24h). Server công cộng càng
+         phổ biến càng nhanh bị. ⇒ Phải ĐỔI SANG DANH TÍNH KHÁC (device-id
+         khác), không phải đổi URL.
+       • ec -23782 "A Mac with macOS version 10.13 or later is required to
+         sign in with this Apple Account." ⇒ danh tính khai macOS quá cũ.
+     Nay mỗi danh tính (X-Mme-Device-Id) được theo dõi riêng, "đốt" 24h khi
+     Apple từ chối, và chỉ xoay sang danh tính KHÁC device-id — xoay giữa các
+     URL dùng chung một device-id (vd. mac-ani.jkcoxson.com và
+     ani.jkcoxson.com) là vô ích.
+
   3. [v72 — 2026-10-20] Apple GrandSlam (từ 12/10/2026) trả ec=-80045 ở bước
      `init` nếu machine-id anisette do Android CoreADI sinh ra nhưng request
      khai danh tính macOS/iPhone; và trả 503 HTML cho mọi client khai Android
@@ -80,12 +95,19 @@ GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
 # (thử nhanh hơn), KHÔNG phải danh sách tin cậy: mỗi server vẫn phải vượt
 # _identity_accepted() thì mới được dùng — Apple có thể chặn bất kỳ lúc nào.
 # Cập nhật 2026-10-20: chỉ mac-ani.jkcoxson.com còn được GSA chấp nhận.
+#
+# Đo ngày 2026-10-25 (init với Apple ID ngẫu nhiên, KHÔNG gửi mật khẩu):
+#   new.ani.sidestore.io  → device C8DC6508… (đổi theo phiên) → ĐƯỢC chấp nhận
+#   ani3/ani2.stikstore.app → device 4546C3FB…  → ĐƯỢC chấp nhận
+#   mac-ani.jkcoxson.com / ani.jkcoxson.com → CÙNG device 49A2FCC7… → được
+#       chấp nhận nhưng đây là danh tính bị dùng nhiều nhất ⇒ hay gặp -36607
+#   mọi server còn lại (macOS;13.1, machine-id Android CoreADI) → HTTP 503
 ANISETTE_SEED_SERVERS = (
+    "https://new.ani.sidestore.io",
+    "https://ani3.stikstore.app",
+    "https://ani2.stikstore.app",
     "https://mac-ani.jkcoxson.com",
     "https://ani.jkcoxson.com",
-    "https://ani2.stikstore.app",
-    "https://new.ani.sidestore.io",
-    "https://win.ani.sidestore.io",
 )
 
 # Mã lỗi Apple dùng để nói "machine-id này không do client đang khai báo sinh ra"
@@ -95,6 +117,19 @@ ANISETTE_SEED_SERVERS = (
 #   -29004 machine-id hỏng       -80044 lệch giữa header và cpd
 IDENTITY_REJECT_EC = {-80045, -80009, -80010, -29004, -80044}
 IDENTITY_REJECT_HTTP = {502, 503, 504}
+
+# [v73] Từ ~21/10/2026 — hai cửa chặn mới, đều xảy ra ở bước `complete`
+# (mật khẩu đã đúng, nên TUYỆT ĐỐI không được báo "sai mật khẩu"):
+#   -36607 danh tính anisette ("fake Mac") đã bị quá nhiều tài khoản dùng trong
+#          thời gian ngắn → phải dùng DEVICE-ID KHÁC (hoặc chờ ≥ 24h).
+#   -23782 danh tính khai macOS < 10.13 trong khi tài khoản yêu cầu mới hơn.
+IDENTITY_EXHAUSTED_EC = {-36607}
+IDENTITY_OLD_OS_EC = {-23782}
+# -20209: Apple KHOÁ tài khoản vì an ninh → thử lại chỉ làm nặng thêm.
+ACCOUNT_FATAL_EC = {-20209}
+
+# Apple: "phải chờ ít nhất 24 giờ" cho một thiết bị bị -36607.
+BURNED_DEVICE_TTL = 24 * 3600
 
 # Số server tối đa được dò trong một lần chọn (tránh treo lâu khi mạng chậm).
 ANISETTE_MAX_CANDIDATES = 12
@@ -118,6 +153,7 @@ def _writable_dir():
 
 
 ANISETTE_CACHE_FILE = os.path.join(_writable_dir(), ".anisette_cache.json")
+BURNED_DEVICES_FILE = os.path.join(_writable_dir(), ".anisette_burned.json")
 ANISETTE_CACHE_TTL = 6 * 3600  # Cache server đã chọn trong 6 giờ
 
 
@@ -156,6 +192,9 @@ class AppleAuth:
         self._identity_variant = "raw"
         self._identity_user_agent = None
         self._identity_retries = 0
+        self._identity_device_id = ""
+        self._identity_os_version = ""
+        self._burned_devices = set()
         # Lý do thất bại gần nhất, dạng người dùng đọc được. UI (PythonBridge
         # → sideload_core.get_last_error) hiển thị nguyên nhân thật thay vì
         # câu chung "xem nhật ký".
@@ -256,17 +295,32 @@ class AppleAuth:
             seen.append(ANISETTE_URL.rstrip("/"))
         return seen
 
-    def _select_anisette(self, ignore_cache=False):
+    def _select_anisette(self, ignore_cache=False, exclude_devices=None,
+                         prefer_new_os=False):
+        """Chọn một DANH TÍNH anisette dùng được (không chỉ là URL).
+
+        exclude_devices: các device-id không được dùng lại (vd. vừa bị -36607).
+        prefer_new_os  : ưu tiên danh tính khai macOS >= 10.13 (Apple trả
+                         -23782 cho tài khoản yêu cầu bản mới hơn).
+        """
         failed = self._failed_servers
+        exclude = set(exclude_devices or ())
 
         if not ignore_cache:
             cached = self._load_anisette_cache()
             if cached and cached.get("url") and cached["url"] not in failed:
-                if cached.get("client_info"):
+                cached_dev = cached.get("device_id") or ""
+                if cached_dev and (cached_dev in exclude or self._is_burned(cached_dev)):
+                    print(f"[anisette] Cache trỏ tới danh tính {cached_dev[:8]}… đã bị từ chối "
+                          f"→ bỏ cache, dò lại.")
+                elif cached.get("client_info"):
                     self._set_identity(cached["url"], cached["client_info"],
                                        cached.get("user_agent"),
-                                       cached.get("variant", "raw"))
-                    print(f"[anisette] Dùng server đã kiểm chứng (cache): {cached['url']}")
+                                       cached.get("variant", "raw"),
+                                       device_id=cached_dev or None,
+                                       os_version=cached.get("os_version"))
+                    print(f"[anisette] Dùng server đã kiểm chứng (cache): {cached['url']}"
+                          f"  [danh tính {cached_dev[:8]}…]")
                     return cached["url"]
                 # cache kiểu cũ (chỉ có url) → phải kiểm chứng lại
                 print("[anisette] Cache cũ không có danh tính client — kiểm chứng lại.")
@@ -280,6 +334,8 @@ class AppleAuth:
 
         unknown = None
         net_fail = 0
+        seen_devices = {}
+        verified = []
         for addr in candidates:
             if addr in failed:
                 continue
@@ -295,16 +351,56 @@ class AppleAuth:
                     break
                 continue
             net_fail = 0
+
+            dev = ident.get("device_id") or ""
+            if dev and dev in exclude:
+                print(f"[anisette]   ✗ {addr} — dùng chung danh tính {dev[:8]}… vừa bị "
+                      f"Apple từ chối, bỏ qua")
+                continue
+            if dev and self._is_burned(dev):
+                print(f"[anisette]   ✗ {addr} — danh tính {dev[:8]}… đã bị đốt (24h)")
+                continue
+            if dev and dev in seen_devices:
+                # Cùng một "fake Mac" thì Apple tính chung hạn mức → thử cũng vô ích.
+                print(f"[anisette]   · {addr} — trùng danh tính {dev[:8]}… với "
+                      f"{seen_devices[dev]}, bỏ qua")
+                continue
+            if dev:
+                seen_devices[dev] = addr
+
             ci_ok, variant, detail = self._identity_accepted(addr, ident)
             if ci_ok:
-                self._set_identity(addr, ci_ok, ident.get("user_agent"), variant)
-                self._save_anisette_cache(addr, ci_ok, ident.get("user_agent"), variant)
-                print(f"[anisette] ✅ Chọn server: {addr} — danh tính được GSA chấp nhận "
-                      f"({detail})")
-                return addr
+                verified.append((addr, ci_ok, variant, detail, ident))
+                os_ok = self._os_at_least(ident.get("os_version"))
+                print(f"[anisette]   ✓ {addr} — danh tính {dev[:8]}… được GSA chấp nhận "
+                      f"({detail}, macOS {ident.get('os_version') or '?'})")
+                # Nếu không cần macOS mới → dùng ngay danh tính đầu tiên hợp lệ.
+                if not prefer_new_os or os_ok:
+                    self._set_identity(addr, ci_ok, ident.get("user_agent"), variant,
+                                       device_id=dev, os_version=ident.get("os_version"))
+                    self._save_anisette_cache(addr, ci_ok, ident.get("user_agent"),
+                                              variant, device_id=dev,
+                                              os_version=ident.get("os_version"))
+                    print(f"[anisette] ✅ Chọn server: {addr} — danh tính được GSA chấp nhận "
+                          f"({detail})")
+                    return addr
             if detail == "unknown" and unknown is None:
                 unknown = (addr, ident)
             print(f"[anisette]   ✗ {addr} — Apple từ chối danh tính ({detail})")
+
+        if verified:
+            # prefer_new_os=True nhưng không danh tính nào khai macOS >= 10.13:
+            # vẫn phải dùng cái tốt nhất hiện có (kèm cảnh báo), không chặn người dùng.
+            addr, ci_ok, variant, detail, ident = verified[0]
+            dev = ident.get("device_id") or ""
+            self._set_identity(addr, ci_ok, ident.get("user_agent"), variant,
+                               device_id=dev, os_version=ident.get("os_version"))
+            self._save_anisette_cache(addr, ci_ok, ident.get("user_agent"), variant,
+                                      device_id=dev, os_version=ident.get("os_version"))
+            print(f"[anisette] ⚠️  Không có danh tính khai macOS >= 10.13 — dùng {addr} "
+                  f"(macOS {ident.get('os_version') or '?'}). Nếu Apple trả -23782, hãy "
+                  f"dùng server khác hoặc tự host anisette.")
+            return addr
 
         # Không server nào kiểm chứng được (vd. GSA 429 do thử quá nhiều):
         # dùng server đầu tiên còn sống để không chặn người dùng, nhưng KHÔNG
@@ -312,13 +408,27 @@ class AppleAuth:
         if unknown:
             addr, ident = unknown
             ci = ident.get("client_info") or ""
+            dev = ident.get("device_id") or ""
+            if dev and (dev in exclude or self._is_burned(dev)):
+                print(f"[anisette] ⚠️  Danh tính dự phòng {dev[:8]}… cũng đã bị đốt — "
+                      f"vẫn dùng vì không còn lựa chọn nào khác.")
             self._set_identity(addr, ci, ident.get("user_agent"),
-                               "akd" if "com.apple.dt.Xcode" in ci else "raw")
+                               "akd" if "com.apple.dt.Xcode" in ci else "raw",
+                               device_id=dev, os_version=ident.get("os_version"))
             print(f"[anisette] ⚠️  Không kiểm chứng được server nào (GSA bận) — "
                   f"tạm dùng {addr}.")
             return addr
 
         print(f"[anisette] ⚠️  Không có server nào hoạt động — dùng mặc định: {ANISETTE_URL}")
+        # Đừng để danh tính cũ (của server vừa bị từ chối) sót lại — đó chính là
+        # nguồn mismatch. Lấy danh tính thật của server mặc định nếu lấy được.
+        self._identity_device_id = ""
+        ident = self._fetch_identity(ANISETTE_URL.rstrip("/"))
+        if ident and ident.get("client_info"):
+            self._set_identity(ANISETTE_URL, ident["client_info"],
+                               ident.get("user_agent"), "raw",
+                               device_id=ident.get("device_id"),
+                               os_version=ident.get("os_version"))
         return ANISETTE_URL
 
     @staticmethod
@@ -371,8 +481,43 @@ class AppleAuth:
             client_info = headers.get("X-MMe-Client-Info") or headers.get("X-Mme-Client-Info")
         if not user_agent:
             user_agent = headers.get("User-Agent") or DEFAULT_USER_AGENT
-        return {"headers": headers, "client_info": client_info,
-                "user_agent": user_agent}
+        return {
+            "headers": headers,
+            "client_info": client_info,
+            "user_agent": user_agent,
+            # [v73] "Danh tính" thật sự mà Apple nhìn thấy KHÔNG phải URL server
+            # mà là cặp (X-Mme-Device-Id, machine-id). Nhiều URL khác nhau có
+            # thể dùng CHUNG một device-id (vd. mac-ani.jkcoxson.com và
+            # ani.jkcoxson.com) → xoay giữa chúng không giúp gì khi Apple trả
+            # -36607. Vì vậy selection/rotation đều bám vào device_id.
+            "device_id": headers.get("X-Mme-Device-Id") or "",
+            "machine_id": headers.get("X-Apple-I-MD-LU") or "",
+            "os_version": AppleAuth._parse_os_version(client_info),
+        }
+
+    @staticmethod
+    def _parse_os_version(client_info):
+        """Lấy số phiên bản macOS trong client-info ('' nếu không phải macOS)."""
+        if not client_info:
+            return ""
+        import re as _re
+        m = _re.search(r"<(?:macOS|Mac OS X);([0-9]+(?:\.[0-9]+)*);", client_info)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _os_at_least(version, minimum=(10, 13)):
+        """So sánh phiên bản macOS dạng '10.12.6'. True nếu >= minimum."""
+        if not version:
+            return False
+        try:
+            parts = [int(x) for x in version.split(".") if x.isdigit()]
+        except Exception:
+            return False
+        if not parts:
+            return False
+        while len(parts) < len(minimum):
+            parts.append(0)
+        return tuple(parts[:len(minimum)]) >= tuple(minimum)
 
     @staticmethod
     def _identity_variants(client_info):
@@ -454,6 +599,49 @@ class AppleAuth:
             pass
         return out
 
+    # ── Danh tính đã bị Apple từ chối ("đốt" 24h) ───────────────────────────
+    @staticmethod
+    def _load_burned():
+        """{device_id: {"ts": epoch, "reason": str}} — bỏ mục quá 24h."""
+        try:
+            if not os.path.exists(BURNED_DEVICES_FILE):
+                return {}
+            with open(BURNED_DEVICES_FILE) as f:
+                raw = json.load(f)
+            now = time.time()
+            return {k: v for k, v in raw.items()
+                    if isinstance(v, dict) and now - v.get("ts", 0) < BURNED_DEVICE_TTL}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_burned(data):
+        try:
+            with open(BURNED_DEVICES_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def _burn_device(self, device_id, reason="rejected"):
+        """Đánh dấu một danh tính (device-id) không dùng lại trong 24h."""
+        if not device_id:
+            return
+        data = self._load_burned()
+        data[device_id] = {"ts": time.time(), "reason": str(reason)[:120]}
+        self._save_burned(data)
+        self._burned_devices.add(device_id)
+        print(f"[anisette] 🔥 Đốt danh tính {device_id[:8]}… 24h (lý do: {reason})")
+
+    def _is_burned(self, device_id):
+        if not device_id:
+            return False
+        if device_id in self._burned_devices:
+            return True
+        if self._load_burned().get(device_id):
+            self._burned_devices.add(device_id)
+            return True
+        return False
+
     # ── Cache ────────────────────────────────────────────────────────────────
     @staticmethod
     def _load_anisette_cache():
@@ -469,11 +657,13 @@ class AppleAuth:
         return None
 
     @staticmethod
-    def _save_anisette_cache(url, client_info, user_agent, variant="raw"):
+    def _save_anisette_cache(url, client_info, user_agent, variant="raw",
+                             device_id=None, os_version=None):
         try:
             with open(ANISETTE_CACHE_FILE, "w") as f:
                 json.dump({"url": url, "client_info": client_info,
                            "user_agent": user_agent, "variant": variant,
+                           "device_id": device_id, "os_version": os_version,
                            "ts": time.time()}, f)
         except Exception:
             pass
@@ -487,9 +677,14 @@ class AppleAuth:
             pass
 
     # ── Danh tính đang dùng ─────────────────────────────────────────────────
-    def _set_identity(self, url, client_info, user_agent=None, variant="raw"):
+    def _set_identity(self, url, client_info, user_agent=None, variant="raw",
+                      device_id=None, os_version=None):
         """Đặt danh tính client khớp ĐÚNG server đang dùng (không bịa)."""
         self.anisette_url = url.rstrip("/")
+        if device_id:
+            self._identity_device_id = device_id
+        if os_version is not None:
+            self._identity_os_version = os_version
         if client_info:
             if variant == "akd":
                 client_info = client_info.replace("com.apple.dt.Xcode", "com.apple.akd")
@@ -524,7 +719,9 @@ class AppleAuth:
                     self._set_identity(self.anisette_url, server_ci,
                                        getattr(self, "_identity_user_agent", None)
                                        or self.user_agent,
-                                       getattr(self, "_identity_variant", "raw"))
+                                       getattr(self, "_identity_variant", "raw"),
+                                       device_id=data.get("X-Mme-Device-Id"),
+                                       os_version=self._parse_os_version(server_ci))
                 return data
             except Exception as e:
                 print(f"[anisette] Lỗi fetch anisette từ {self.anisette_url}: {e}")
@@ -1306,9 +1503,31 @@ class AppleAuth:
                                               _identity_retries, e)
 
             status = response.get("Status", {})
+            ec = status.get("ec")
             auth_type = status.get("au")
             hsc = status.get("hsc")
             already_pushed = False
+
+            # [v73] Hai cửa chặn mới của Apple xuất hiện Ở ĐÂY (complete): mật
+            # khẩu đã đúng, nên KHÔNG được báo "sai mật khẩu" hay "lỗi tài khoản".
+            if ec in ACCOUNT_FATAL_EC:
+                # -20209: tài khoản bị khoá. Thử lại chỉ làm nặng thêm.
+                self._explain_gsa_status(status)
+                self.last_error = self.GSA_ERROR_HINTS.get(
+                    ec, f"Apple trả lỗi {ec}") + " (không thử lại để tránh khoá thêm)"
+                print("[icloud] ⛔ Apple khoá tài khoản vì an ninh — DỪNG, không thử lại. "
+                      "Mở https://iforgot.apple.com để mở khoá rồi đăng nhập lại.")
+                return None
+
+            if ec in IDENTITY_EXHAUSTED_EC or ec in IDENTITY_OLD_OS_EC:
+                reason = ("exhausted" if ec in IDENTITY_EXHAUSTED_EC else "old_os")
+                return self._recover_identity(
+                    apple_id, password, _depth, _identity_retries,
+                    f"Apple trả ec {ec} ở bước complete với danh tính "
+                    f"{getattr(self, '_identity_device_id', '')[:8]}… "
+                    f"({status.get('em') or ''})",
+                    reason=reason, ec=ec)
+
 
             # [v72] Từ 13/10/2026 Apple thường TỰ gửi mã xác thực tới thiết bị
             # tin cậy ngay sau bước mật khẩu: response `complete` có hsc=409 và
@@ -1480,12 +1699,19 @@ class AppleAuth:
         -80044: "Danh tính trong header HTTP và trong body (cpd) không khớp nhau.",
         -20101: "Sai Apple ID hoặc mật khẩu.",
         -20102: "Tài khoản Apple ID không tồn tại hoặc sai định dạng.",
-        -20209: ("TÀI KHOẢN BỊ KHOÁ vì lý do an ninh (Apple khoá khi thấy nhiều lần "
-                 "đăng nhập bất thường). Mở https://iforgot.apple.com để mở khoá, "
-                 "đừng thử lại liên tục."),
         -22411: ("Apple không cấp token phiên ở bước lấy app token — thường do 2FA "
                  "chưa hoàn tất (hsc 409) hoặc phiên đã bị thay thế."),
         -22421: "Apple tạm từ chối (thử lại sau ít phút; thường do rate-limit theo IP).",
+        -36607: ("Danh tính anisette (\"fake Mac\") đã bị quá nhiều tài khoản dùng trong "
+                 "thời gian ngắn nên Apple tạm chặn nó. Mật khẩu KHÔNG sai. Tool sẽ tự "
+                 "đổi sang danh tính khác; nếu vẫn lỗi, chờ ≥ 24 giờ hoặc tự host "
+                 "anisette server riêng."),
+        -23782: ("Danh tính anisette khai macOS cũ hơn 10.13 trong khi Apple yêu cầu bản "
+                 "mới hơn cho tài khoản này. Tool sẽ thử danh tính khai macOS mới hơn."),
+        -20209: ("TÀI KHOẢN BỊ KHOÁ vì lý do an ninh. Mở https://iforgot.apple.com để mở "
+                 "khoá, đừng thử lại liên tục."),
+        -80046: ("Apple từ chối sau bước 2FA — phiên SRP bị thay thế. Thử lại; nếu lặp "
+                 "lại, đổi danh tính anisette (server khác)."),
         -20970: "Apple nói thông tin tài khoản không đúng (kiểm tra lại Apple ID).",
     }
 
@@ -1503,14 +1729,46 @@ class AppleAuth:
         if hsc not in (None, 200):
             print(f"[gsa] ⚠️  hsc {hsc}")
 
-    def _recover_identity(self, apple_id, password, _depth, attempts, exc):
-        """Apple từ chối machine-id của server đang dùng → đổi server và thử lại.
+    def _recover_identity(self, apple_id, password, _depth, attempts, exc,
+                          reason="reject", ec=None):
+        """Danh tính anisette hiện tại không dùng được → đổi DANH TÍNH và thử lại.
 
-        Chỉ đổi khi người dùng KHÔNG ghim server (ghim = họ tự chọn, tôn trọng
-        lựa chọn nhưng báo rõ). Tối đa 2 lần để không vòng lặp vô hạn.
+        reason:
+          "reject"    – Apple từ chối machine-id lúc `init` (-80045…): xin OTP
+                        mới trên cùng server trước, rồi mới đổi server.
+          "exhausted" – -36607 ở `complete`: "fake Mac" của danh tính này đã bị
+                        quá nhiều tài khoản dùng → PHẢI đổi device-id khác.
+          "old_os"    – -23782 ở `complete`: danh tính khai macOS < 10.13 →
+                        đổi sang danh tính khai macOS mới hơn (nếu có).
+        Chỉ đổi khi người dùng KHÔNG ghim server. Tối đa 3 lần để không vòng lặp.
         """
         print(f"[icloud] ❌ {exc}")
-        self._explain_gsa_status({"ec": -80045})
+        self._explain_gsa_status({"ec": ec if ec is not None else -80045})
+
+        dev = getattr(self, "_identity_device_id", "") or ""
+
+        # -36607 / -23782: danh tính này "cháy" cho MỌI tài khoản → đốt 24h và
+        # buộc đổi sang device-id khác. Đốt cả khi người dùng ghim server, vì
+        # giữ lại chỉ lặp lại đúng lỗi đó; nhưng vẫn báo rõ để họ tự chọn server.
+        if reason in ("exhausted", "old_os"):
+            self._burn_device(dev, reason)
+            if getattr(self, "_anisette_pinned", False):
+                self.last_error = (
+                    f"Danh tính của server đang ghim ({self.anisette_url}) bị Apple từ chối "
+                    f"({ec}). Vào Cài đặt → Server Anisette → chọn 'Tự động' để tool tự "
+                    f"dò danh tính khác.")
+                print("[icloud] Server đang ghim có danh tính bị Apple từ chối "
+                      f"({ec}). Đổi sang 'Tự động' hoặc server khác.")
+                return None
+
+        if getattr(self, "_anisette_pinned", False):
+            self.last_error = (
+                f"Server anisette đang ghim ({self.anisette_url}) bị Apple từ chối "
+                "(-80045). Vào Cài đặt → Server Anisette → chọn 'Tự động'.")
+            print(f"[icloud] Server đang ghim ({self.anisette_url}) bị Apple từ chối.")
+            print("[icloud] → Vào Cài đặt > Server Anisette, chọn 'Tự động' hoặc một "
+                  "server khác (ví dụ mac-ani.jkcoxson.com).")
+            return None
 
         if getattr(self, "_anisette_pinned", False):
             self.last_error = (
@@ -1523,6 +1781,44 @@ class AppleAuth:
 
         self._pin_cpd = False
         self._cpd_pin = None
+
+        # -36607 / -23782: đổi ngay sang danh tính khác (không thử lại OTP trên
+        # cùng device-id: hạn mức tính theo device-id, thử lại là vô nghĩa).
+        if reason in ("exhausted", "old_os"):
+            if attempts >= 3:
+                self.last_error = (
+                    f"Đã thử {attempts} danh tính anisette khác nhau nhưng Apple vẫn từ chối "
+                    f"({ec}). "
+                    + ("Đây là hạn mức 24h theo TỪNG danh tính: chờ ≥ 24 giờ, hoặc tự host "
+                       "anisette server riêng để có danh tính riêng."
+                       if reason == "exhausted" else
+                       "Không server công khai nào khai macOS ≥ 10.13: hãy tự host anisette "
+                       "server trên macOS thật, hoặc dùng Apple ID khác."))
+                print(f"[icloud] Đã đổi {attempts} danh tính vẫn lỗi {ec}. "
+                      + ("Chờ ≥ 24h hoặc tự host anisette." if reason == "exhausted"
+                         else "Không còn danh tính macOS ≥ 10.13."))
+                return None
+            print(f"[icloud] → Đổi sang danh tính anisette KHÁC (device-id khác) và thử lại "
+                  f"[{attempts + 1}/3]...")
+            self._invalidate_anisette_cache()
+            self._select_anisette(ignore_cache=True,
+                                  exclude_devices={dev} if dev else None,
+                                  prefer_new_os=(reason == "old_os"))
+            new_dev = getattr(self, "_identity_device_id", "") or ""
+            if dev and new_dev == dev:
+                # Không còn danh tính nào KHÁC → thử lại chỉ lặp đúng lỗi này.
+                self.last_error = (
+                    f"Không còn danh tính anisette nào khác dùng được (Apple trả {ec}). "
+                    + ("Hạn mức -36607 tính theo TỪNG danh tính và kéo dài ≥ 24 giờ: hãy chờ, "
+                       "hoặc tự host anisette-v3-server để có danh tính riêng."
+                       if reason == "exhausted" else
+                       "Không server công khai nào khai macOS ≥ 10.13: hãy tự host anisette "
+                       "trên máy macOS thật, hoặc dùng Apple ID khác."))
+                print("[icloud] ⚠️  Không tìm được danh tính khác — dừng (thử lại sẽ lặp "
+                      "đúng lỗi này). " + self.last_error)
+                return None
+            return self.authenticate(apple_id, password, _depth=_depth,
+                                     _identity_retries=attempts + 1)
 
         # Lần 1: cùng server nhưng xin OTP/machine-id mới. Apple từ chối
         # thường vì OTP đã cũ hoặc machine-id vừa bị luân chuyển — chưa cần

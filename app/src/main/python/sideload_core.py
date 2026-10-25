@@ -1368,11 +1368,20 @@ def do_diagnostics() -> str:
         else:
             ok_ci, _variant, detail = probe._identity_accepted(probe.anisette_url, ident)
             if ok_ci:
+                dev = ident.get("device_id") or "?"
                 lines.append(f"✅ Anisette  : danh tính được Apple chấp nhận ({detail})")
                 lines.append(f"   Server đang dùng: {probe.anisette_url}")
                 lines.append(f"   Client-Info     : {ok_ci}")
+                lines.append(f"   Danh tính (dev) : {dev[:8]}…  macOS {ident.get('os_version') or '?'}")
+                burned = probe._load_burned()
+                if dev in burned:
+                    lines.append(f"   ⚠️  Danh tính này đã bị Apple từ chối trước đó "
+                                 f"({burned[dev].get('reason')}) — Apple tính hạn mức 24h "
+                                 f"theo từng danh tính.")
             else:
                 lines.append(f"❌ Anisette  : Apple TỪ CHỐI danh tính ({detail})")
+                lines.append("   → Nếu lỗi lúc đăng nhập là -36607: danh tính \"fake Mac\" này đã "
+                             "bị quá nhiều tài khoản dùng; đổi server hoặc chờ ≥ 24h.")
                 lines.append("   → Đây là nguyên nhân đăng nhập thất bại. Vào Cài đặt → "
                              "Server Anisette → chọn 'Tự động' (tool sẽ tự dò server "
                              "còn được Apple chấp nhận).")
