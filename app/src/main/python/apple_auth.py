@@ -194,6 +194,10 @@ class AppleAuth:
         self._identity_retries = 0
         self._identity_device_id = ""
         self._identity_os_version = ""
+        # [v74] True khi GSA đã trả về plist hợp lệ với danh tính hiện tại
+        # (init/complete/validate 200). Khi đó 5xx chỉ có thể là edge chặn
+        # theo đợt, KHÔNG được coi là "danh tính bị Apple từ chối".
+        self._identity_proven = False
         self._burned_devices = set()
         # Lý do thất bại gần nhất, dạng người dùng đọc được. UI (PythonBridge
         # → sideload_core.get_last_error) hiển thị nguyên nhân thật thay vì
@@ -679,6 +683,8 @@ class AppleAuth:
     # ── Danh tính đang dùng ─────────────────────────────────────────────────
     def _set_identity(self, url, client_info, user_agent=None, variant="raw",
                       device_id=None, os_version=None):
+        # [v74] danh tính mới => chưa có bằng chứng nó sống với GSA
+        self._identity_proven = False
         """Đặt danh tính client khớp ĐÚNG server đang dùng (không bịa)."""
         self.anisette_url = url.rstrip("/")
         if device_id:
@@ -1065,6 +1071,15 @@ class AppleAuth:
                 # (_recover_identity) xử lý thay vì báo lỗi 429 sai đường.
                 if response.status_code in (502, 503, 504):
                     snippet = response.content[:120].decode("utf-8", "replace").replace("\n", " ")
+                    if getattr(self, "_identity_proven", False):
+                        # [v74] Danh tính đã được GrandSlam nhận trong chính phiên
+                        # này (init/complete/validate 200) => 5xx này là edge
+                        # chặn theo đợt, phải RETRY chứ không được đổi server /
+                        # báo -80045 sai.
+                        raise GsaRateLimitedError(
+                            f"edge {response.status_code} sau {EDGE_RETRIES} lần thử "
+                            f"(danh tính đã được GSA chấp nhận trong phiên này)"
+                        )
                     raise AnisetteIdentityRejected(
                         f"Apple edge trả HTTP {response.status_code} cho danh tính "
                         f"'{self._apply_identity_variant(self.client_info)}' ({snippet})"
@@ -1080,6 +1095,9 @@ class AppleAuth:
 
                 if "Response" not in response_data:
                     raise Exception("Invalid response format from GSA service")
+
+                # [v74] GSA đã trả plist hợp lệ => danh tính anisette này SỐNG.
+                self._identity_proven = True
 
                 result = response_data["Response"]
                 result["_headers"] = response.headers
@@ -1753,7 +1771,9 @@ class AppleAuth:
         Chỉ đổi khi người dùng KHÔNG ghim server. Tối đa 3 lần để không vòng lặp.
         """
         print(f"[icloud] ❌ {exc}")
-        self._explain_gsa_status({"ec": ec if ec is not None else -80045})
+        # [v74] chỉ giải thích ec khi Apple THẬT SỰ trả ec; trước đây mặc định
+        # -80045 nên log báo "-80045" cả khi Apple chỉ trả HTML 503.
+        self._explain_gsa_status({"ec": ec} if ec is not None else {})
 
         dev = getattr(self, "_identity_device_id", "") or ""
 
@@ -1878,14 +1898,13 @@ class AppleAuth:
         except (TypeError, ValueError):
             pass
 
-        if _gsa_retries < 1:
-            print("[icloud] ⚠️  Apple vẫn trả 429 sau kết nối mới. "
-                  "Giữ nguyên anisette, thử lại SRP một lần...")
-            if wait > 0:
-                print(f"[icloud] Chờ {min(wait, 30)}s theo Retry-After...")
-                time.sleep(min(wait, 30))
-            else:
-                time.sleep(1)
+        if _gsa_retries < 2:
+            # [v74] đợt chặn của edge Apple kéo dài 10-40s -> 3 lần thử cách
+            # nhau 0.25s là quá ngắn và rơi hết vào cùng một đợt.
+            pause = min(wait, 30) if wait > 0 else 45
+            print(f"[icloud] ⚠️  Apple edge vẫn trả {exc} — giữ nguyên anisette, "
+                  f"chờ {pause}s rồi thử lại SRP (lần {_gsa_retries + 2}/3)...")
+            time.sleep(pause)
             return self.authenticate(apple_id, password, _depth=_depth,
                                      _gsa_retries=_gsa_retries + 1)
 
