@@ -60,6 +60,17 @@ class AnisetteIdentityRejected(Exception):
     pass
 
 
+class AnisetteServerUnavailable(Exception):
+    """Server anisette khong song / tra du lieu sai.
+
+    Khac voi AnisetteIdentityRejected (Apple chap nhan request nhung tu choi
+    machine-id), day la loi TANG SERVER. Phai doi server NGAY, khong duoc
+    coi nhu loi dang nhap va dung ca chuoi (dung la bug nguoi dung bao:
+    "server dau loi la dung luon, khong chuyen sang server duoi").
+    """
+    pass
+
+
 class GsaRateLimitedError(Exception):
     """Apple edge tra HTML 429 cho POST GsService2.
 
@@ -80,13 +91,37 @@ GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
 # (thử nhanh hơn), KHÔNG phải danh sách tin cậy: mỗi server vẫn phải vượt
 # _identity_accepted() thì mới được dùng — Apple có thể chặn bất kỳ lúc nào.
 # Cập nhật 2026-10-20: chỉ mac-ani.jkcoxson.com còn được GSA chấp nhận.
+# v73 (2026-10-26): do TRUC TIEP cac server cong khai. Ket qua:
+#   mac-ani / ani.jkcoxson / ani3.stikstore / new.ani / ani2 / ani.sidestore = HTTP 200
+#   win.ani.sidestore.io                                                  = HTTP 502 (chet)
+# Nguon danh sach Mac-ADI: iPASide 1.2.9 (2026-10-23) va iloader 2.4.0.
+# Day chi la THU TU UU TIEN; moi server van duoc kiem chung lai luc chay.
 ANISETTE_SEED_SERVERS = (
     "https://mac-ani.jkcoxson.com",
     "https://ani.jkcoxson.com",
-    "https://ani2.stikstore.app",
+    "https://ani3.stikstore.app",
     "https://new.ani.sidestore.io",
-    "https://win.ani.sidestore.io",
+    "https://ani2.stikstore.app",
+    "https://ani.sidestore.io",
 )
+
+# Tu 22/10/2026 Apple tra -80046 o buoc `apptokens` neu request khai danh
+# tinh khong phai Mac (Android/Windows) du SRP da thanh cong. Cach sua cua
+# Apparition 0.3.0 / iPASide 1.2.9: gui request apptokens (va cac request
+# developer services sau do) voi MOT danh tinh Mac nhat quan.
+# Nguon: https://blog.illixion.com/2026/10/sideloading-error-80046/
+#        https://github.com/pwnapplehat/iPASide/issues/9
+MAC_TOKEN_IDENTITIES = (
+    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+    "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+    "<iMacPro1,1> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+)
+MAC_TOKEN_USER_AGENTS = (
+    "akd/1.0 CFNetwork/808.1.4",
+    "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)",
+    "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0",
+)
+APP_TOKEN_REJECT_EC = {-80046, -45061}
 
 # Mã lỗi Apple dùng để nói "machine-id này không do client đang khai báo sinh ra"
 # (hoặc thiếu/hỏng OTP) — danh tính bị từ chối, phải đổi server.
@@ -97,9 +132,13 @@ IDENTITY_REJECT_EC = {-80045, -80009, -80010, -29004, -80044}
 IDENTITY_REJECT_HTTP = {502, 503, 504}
 
 # Số server tối đa được dò trong một lần chọn (tránh treo lâu khi mạng chậm).
-ANISETTE_MAX_CANDIDATES = 12
+ANISETTE_MAX_CANDIDATES = 24     # v73: duyet toan bo danh sach, khong bo server o duoi
 
 DEFAULT_USER_AGENT = "akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0"
+
+# GSA probe toi da 6 lan trong mot luot chon server. Neu Apple edge dang 429/503
+# thi van phai chon duoc 1 server con song (khong duoc dung ca chuoi).
+ANISETTE_MAX_GSA_PROBES = 6
 
 
 def _writable_dir():
@@ -118,14 +157,14 @@ def _writable_dir():
 
 
 ANISETTE_CACHE_FILE = os.path.join(_writable_dir(), ".anisette_cache.json")
-ANISETTE_CACHE_TTL = 6 * 3600  # Cache server đã chọn trong 6 giờ
+ANISETTE_CACHE_TTL = 30 * 60  # v73: 30 phut (truoc 6h — server chet van duoc tin dung ca ngay)
 
 
 def fetch_official_servers():
     """Danh sách server Anisette công khai của SideStore (list[dict]) — [] nếu lỗi.
     Dùng cho màn Cài đặt (sideload_core.list_anisette_servers)."""
     try:
-        resp = requests.get(OFFICIAL_SERVERS_URL, timeout=10, verify=False)
+        resp = requests.get(OFFICIAL_SERVERS_URL, timeout=10, verify=True)
         resp.raise_for_status()
         return resp.json().get("servers", [])
     except Exception as e:
@@ -146,7 +185,19 @@ class AppleAuth:
         self.user_id = str(uuid.uuid4()).upper()
         self.device_id = str(uuid.uuid4()).upper()
         self.session = requests.Session()
-        self.session.verify = False
+        # v73: BAT LAI xac thuc TLS. Do truc tiep 2026-10-26: toan bo server
+        # anisette cong khai + gsa.apple.com deu co cert hop le (curl ssl=0),
+        # nen verify=False truoc day chi tao them nguy co MITM mat khau Apple ID
+        # ma chang duoc loi gi. Server local http:// tu ky van duoc phep.
+        self.session.verify = True
+        # Danh tinh dung cho `apptokens` + developer services (xem -80046).
+        self.developer_client_info = None
+        self.developer_user_agent = None
+        self.token_identity = None
+        self.token_user_agent = None
+        self._token_identity_next = False
+        self._token_identity_index = 0
+        self._server_switches = 0
 
         # Danh tính mặc định CHỈ dùng khi chưa lấy được từ server (chưa từng
         # được gửi tới Apple nếu selection thành công — xem _set_identity).
@@ -163,8 +214,17 @@ class AppleAuth:
 
         if self._anisette_pinned:
             self.anisette_url = str(anisette_url).strip().rstrip("/")
-            print(f"[anisette] Dùng server chỉ định, không xoay: {self.anisette_url}")
+            print(f"[anisette] Server chỉ định: {self.anisette_url} (vẫn tự đổi nếu server chết)")
             ident = self._fetch_identity(self.anisette_url)
+            if not ident:
+                # v73: server ghim chet ngay luc khoi tao -> chon server song
+                # khac ngay, thay vi doi toi luc generate_cpd() roi vang exception.
+                print(f"[anisette] ⚠️  Server chỉ định {self.anisette_url} không phản hồi — tự chọn server khác.")
+                self._failed_servers.add(self.anisette_url)
+                alt = self._pick_live_server(exclude=set(self._failed_servers))
+                if alt:
+                    self._apply_server_identity(alt)
+                    ident = alt[1]
             if ident and ident.get("client_info"):
                 # Server do người dùng tự chọn: KHÔNG kiểm chứng (tôn trọng lựa
                 # chọn), nhưng nếu danh tính còn token Xcode thì tự dùng biến
@@ -188,6 +248,10 @@ class AppleAuth:
             # (KHÔNG dùng token com.apple.dt.Xcode — edge trả 503 từ 09/2026).
             self.client_info = ("<MacBookPro18,3> <macOS;13.4.1;22F8> "
                                 "<com.apple.AuthKit/1 (com.apple.akd/1.0)>")
+
+        # Danh tinh Mac cho apptokens: neu server da tra danh tinh Mac thi dung
+        # lai chinh no (khop machine-id), neu khong thi dung Mac fallback.
+        self._refresh_token_identity()
 
         # Configure SRP properly
         srp.rfc5054_enable()
@@ -232,6 +296,93 @@ class AppleAuth:
     #        altstoreio/AltStore#1834, xtool-org/xtool#337, nab138/iloader#859.
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── v73: tach biet "server con song" va "Apple chap nhan danh tinh" ──────
+    @staticmethod
+    def _tls_verify(addr):
+        """Chi bo qua xac thuc TLS cho server local do nguoi dung tu host."""
+        a = (addr or "").lower()
+        return not (a.startswith("http://") or "localhost" in a or "127.0.0.1" in a)
+
+    @staticmethod
+    def _identity_score(client_info):
+        """Diem uu tien khi KHONG kiem chung duoc voi Apple (Apple edge 429/503).
+
+        0 = Mac-ADI (dang duoc Apple chap nhan tu 22/10/2026)
+        1 = Windows/PC iTunes identity    2 = Android (503 tu 14/10/2026)
+        3 = con token com.apple.dt.Xcode (503 tu 09/2026)
+        """
+        ci = client_info or ""
+        if "com.apple.dt.Xcode" in ci:
+            return 3
+        if "<PC>" in ci or "Windows" in ci:
+            return 1
+        if "<Mac" in ci or "Mac OS X" in ci or "macOS;" in ci:
+            return 0
+        if "<" in ci and ("Android" in ci or "<Pixel" in ci or "<PC" in ci):
+            return 2
+        return 2
+
+    def _refresh_token_identity(self):
+        """Dat danh tinh Mac cho `apptokens` va developer services (-80046).
+
+        Lan 0: neu server da tra danh tinh Mac thi dung lai chinh no (khop
+        machine-id). Lan 1/2 (retry sau -80046): bat buoc doi sang Mac khac,
+        neu khong se gui lai dung request vua bi tu choi.
+        """
+        ci = self._apply_identity_variant(self.client_info)
+        retry = getattr(self, "_token_identity_index", 0)
+        server_is_mac = (self._identity_score(ci) == 0)
+        if retry == 0 and server_is_mac:
+            self.token_identity = ci
+            self.token_user_agent = self.user_agent
+        else:
+            # Server Mac: retry 0 = danh tinh server, 1 = fallback[0], 2 = fallback[1].
+            # Server khong phai Mac: retry 0 = fallback[0], 1 = [1], 2 = [2].
+            # MOI lan retry phai KHAC danh tinh lan truoc, neu khong Apple lai
+            # tra -80046 y het (da bi test_apple_oct2026 bat duoc).
+            base = 1 if server_is_mac else 0
+            idx = min(max(retry - base, 0), len(MAC_TOKEN_IDENTITIES) - 1)
+            self.token_identity = MAC_TOKEN_IDENTITIES[idx]
+            self.token_user_agent = MAC_TOKEN_USER_AGENTS[idx]
+        # Apple "tie" developer token vao danh tinh ma no cap: moi request
+        # developerservices2 phai dung DUNG danh tinh nay, neu khong se bao
+        # "session has expired" (iPASide 1.2.8 / AltSign #61).
+        self.developer_client_info = self.token_identity
+        self.developer_user_agent = self.token_user_agent
+
+    def _pick_live_server(self, exclude=None):
+        """Tim server CON SONG (chi GET, khong can Apple). Tra (url, ident) hoac None.
+
+        Day la diem mau chot cua loi "server dau chet la dung luon": viec chon
+        server KHONG BAO GIO duoc phu thuoc vao viec gsa.apple.com co tra loi
+        hay khong. Neu Apple dang 429/503, ta van chon duoc server tot nhat.
+        """
+        exclude = set(exclude or ())
+        for addr in self._candidate_servers()[:ANISETTE_MAX_CANDIDATES]:
+            if addr in exclude or addr in self._failed_servers:
+                continue
+            try:
+                ident = self._fetch_identity(addr, timeout=5)
+            except Exception:
+                ident = None
+            if not ident:
+                self._failed_servers.add(addr)
+                print(f"[anisette]   ✗ {addr} — server không phản hồi / sai dữ liệu")
+                continue
+            return addr, ident
+        return None
+
+    def _apply_server_identity(self, picked):
+        """Ap dung server moi + danh tinh cua chinh server do (khong bi giu lai ci cu)."""
+        addr, ident = picked
+        ci = ident.get("client_info") or ""
+        variant = "akd" if "com.apple.dt.Xcode" in ci else "raw"
+        self._set_identity(addr, ci, ident.get("user_agent"), variant)
+        self._server_switches += 1
+        print(f"[anisette] 🔄 Đổi sang server #{self._server_switches}: {addr}")
+        print(f"[anisette]    Danh tính mới: {self.client_info}")
+        return addr
+
     def get_best_anisette_server(self):
         """Chọn server Anisette có danh tính được Apple CHẤP NHẬN (đã kiểm chứng).
 
@@ -257,69 +408,104 @@ class AppleAuth:
         return seen
 
     def _select_anisette(self, ignore_cache=False):
-        failed = self._failed_servers
+        """v73: chon server theo 2 lop DOC LAP.
 
+        Lop 1 (bat buoc): server con song va tra headers anisette hop le.
+        Lop 2 (tot co thi co): Apple chap nhan danh tinh cua server do.
+
+        LOI CU: chi can mot server dau tien chet, hoac GSA probe khong tra loi,
+        thi _select_anisette roi vao nhanh "khong co server nao hoat dong" va
+        tra ve ANISETTE_URL co dinh -> tool DUNG LUON, khong thu cac server o
+        duoi. Bay gio lop 1 luon duoc quet toan bo danh sach (toi 24 server),
+        va that bai cua lop 2 KHONG BAO GIO xoa ket qua cua lop 1.
+        """
         if not ignore_cache:
             cached = self._load_anisette_cache()
-            if cached and cached.get("url") and cached["url"] not in failed:
-                if cached.get("client_info"):
-                    self._set_identity(cached["url"], cached["client_info"],
-                                       cached.get("user_agent"),
+            if cached and cached.get("url") and cached["url"] not in self._failed_servers:
+                # v73: cache phai duoc kiem chung lai con song. TTL 6h cua ban
+                # cu khien server da 502 van duoc tin dung ca ngay.
+                try:
+                    live = self._fetch_identity(cached["url"], timeout=5)
+                except Exception:
+                    live = None
+                if live and cached.get("client_info"):
+                    ci = live.get("client_info") or cached["client_info"]
+                    self._set_identity(cached["url"], ci,
+                                       live.get("user_agent") or cached.get("user_agent"),
                                        cached.get("variant", "raw"))
-                    print(f"[anisette] Dùng server đã kiểm chứng (cache): {cached['url']}")
+                    print(f"[anisette] Dùng server đã kiểm chứng (cache, còn sống): {cached['url']}")
                     return cached["url"]
-                # cache kiểu cũ (chỉ có url) → phải kiểm chứng lại
-                print("[anisette] Cache cũ không có danh tính client — kiểm chứng lại.")
+                print("[anisette] ⚠️  Server trong cache đã chết / đổi danh tính — dò lại.")
+                self._failed_servers.add(cached["url"])
+                self._invalidate_anisette_cache()
 
-        print("[anisette] Dò server Anisette: kiểm tra machine-id có được Apple chấp nhận...")
-        candidates = self._candidate_servers()
-        print(f"[anisette] Có {len(candidates)} server ứng viên (seed + SideStore list).")
-        # Chặn trên: mỗi ứng viên tốn 1-2 HTTP GET + 1 POST tới Apple. Seed
-        # (server đã biết tốt) đứng đầu nên thực tế chỉ thử 1-3 cái là xong.
-        candidates = candidates[:ANISETTE_MAX_CANDIDATES]
+        print("[anisette] Dò server Anisette: (1) còn sống? (2) Apple có chấp nhận danh tính?")
+        candidates = self._candidate_servers()[:ANISETTE_MAX_CANDIDATES]
+        print(f"[anisette] Có {len(candidates)} server ứng viên.")
 
-        unknown = None
-        net_fail = 0
+        # ── Lop 1: quet TAT CA, khong break sau 3 server chet ──────────────
+        live_list = []
         for addr in candidates:
-            if addr in failed:
+            if addr in self._failed_servers:
                 continue
-            ident = self._fetch_identity(addr)
+            try:
+                ident = self._fetch_identity(addr, timeout=6)
+            except Exception:
+                ident = None
             if not ident:
-                net_fail += 1
-                print(f"[anisette]   ✗ {addr} — không lấy được headers")
-                # 3 server liên tiếp không trả lời = gần như chắc chắn mất mạng
-                # → dừng sớm thay vì treo lâu (12 ứng viên × timeout).
-                if net_fail >= 3:
-                    print("[anisette] ⚠️  Nhiều server không phản hồi — có thể mất mạng. "
-                          "Dừng dò sớm.")
-                    break
+                self._failed_servers.add(addr)
+                print(f"[anisette]   ✗ {addr} — server không phản hồi / headers hỏng")
                 continue
-            net_fail = 0
-            ci_ok, variant, detail = self._identity_accepted(addr, ident)
+            live_list.append((addr, ident))
+            print(f"[anisette]   ✓ {addr} — sống (điểm danh tính {self._identity_score(ident.get('client_info'))})")
+
+        if not live_list:
+            # Khong con gi de thu: bao loi RO RANG thay vi am tham tra ve 1 URL chet.
+            print("[anisette] ❌ Không còn server anisette nào sống trong danh sách.")
+            self.last_error = ("Không kết nối được server Anisette nào (mạng/VPN hoặc toàn bộ "
+                               "server công khai đang chết). Kiểm tra mạng rồi thử lại.")
+            return ANISETTE_URL
+
+        # ── Lop 2: hoi Apple (co ngan sach, co the that bai hoan toan) ─────
+        gsa_probes = 0
+        probe_unknown = set()
+        for addr, ident in live_list:
+            if gsa_probes >= ANISETTE_MAX_GSA_PROBES:
+                print("[anisette] ⚠️  Đã đạt giới hạn probe GSA — dùng server sống tốt nhất.")
+                break
+            gsa_probes += 1
+            try:
+                ci_ok, variant, detail = self._identity_accepted(addr, ident)
+            except Exception as e:
+                print(f"[anisette]   ? {addr} — không kiểm chứng được với Apple: {e}")
+                probe_unknown.add(addr)
+                continue
             if ci_ok:
                 self._set_identity(addr, ci_ok, ident.get("user_agent"), variant)
                 self._save_anisette_cache(addr, ci_ok, ident.get("user_agent"), variant)
-                print(f"[anisette] ✅ Chọn server: {addr} — danh tính được GSA chấp nhận "
-                      f"({detail})")
+                print(f"[anisette] ✅ Chọn server: {addr} — danh tính được GSA chấp nhận ({detail})")
                 return addr
-            if detail == "unknown" and unknown is None:
-                unknown = (addr, ident)
+            if ("không kiểm chứng" in str(detail) or "429" in str(detail)
+                    or "lỗi mạng" in str(detail) or detail == "unknown"
+                    or str(detail).startswith("HTTP 5")):
+                print("[anisette] ⚠️  Apple edge không trả lời — bỏ qua kiểm chứng, "
+                      "chọn server sống theo danh tính Mac-ADI.")
+                probe_unknown.add(addr)
+                break
             print(f"[anisette]   ✗ {addr} — Apple từ chối danh tính ({detail})")
 
-        # Không server nào kiểm chứng được (vd. GSA 429 do thử quá nhiều):
-        # dùng server đầu tiên còn sống để không chặn người dùng, nhưng KHÔNG
-        # cache nó là "đã kiểm chứng".
-        if unknown:
-            addr, ident = unknown
-            ci = ident.get("client_info") or ""
-            self._set_identity(addr, ci, ident.get("user_agent"),
-                               "akd" if "com.apple.dt.Xcode" in ci else "raw")
-            print(f"[anisette] ⚠️  Không kiểm chứng được server nào (GSA bận) — "
-                  f"tạm dùng {addr}.")
-            return addr
-
-        print(f"[anisette] ⚠️  Không có server nào hoạt động — dùng mặc định: {ANISETTE_URL}")
-        return ANISETTE_URL
+        # Apple khong tra loi (429/503/mat mang) -> van chon 1 server SONG.
+        # Uu tien server ma Apple CHUA kip tu choi (probe "unknown") hon la
+        # server da bi tra -80045 ro rang.
+        ordered = ([it for it in live_list if it[0] in probe_unknown] + live_list)
+        ordered.sort(key=lambda it: self._identity_score(it[1].get("client_info")))
+        addr, ident = ordered[0]
+        ci = ident.get("client_info") or ""
+        self._set_identity(addr, ci, ident.get("user_agent"),
+                           "akd" if "com.apple.dt.Xcode" in ci else "raw")
+        # KHONG luu cache "da kiem chung" khi chua kiem chung duoc.
+        print(f"[anisette] ⚠️  Chưa kiểm chứng được với Apple — tạm dùng server sống: {addr}")
+        return addr
 
     @staticmethod
     def _fetch_server_list():
@@ -336,15 +522,17 @@ class AppleAuth:
 
     @staticmethod
     def _fetch_identity(addr, timeout=8):
-        """Lấy danh tính THẬT của một server anisette.
+        """Lấy danh tính THẬT + headers của một server anisette.
 
-        Trả về dict {headers, client_info, user_agent} hoặc None nếu server chết.
-        client_info/user_agent lấy từ /v3/client_info (anisette v3 trở lên);
-        nếu server cũ không có endpoint đó thì suy ra từ headers trả về ở "/".
+        v73: (1) TLS verify ON cho server cong khai; (2) chap nhan ca
+        X-Apple-I-MD-M viet thuong/khac hoa; (3) 429/5xx bi coi la chet de
+        co the failover; (4) tra None ngay neu headers khong hop le thay vi
+        de generate_cpd() nhan dict thieu OTP roi bi Apple tra -80010.
         """
+        verify = AppleAuth._tls_verify(addr)
         client_info, user_agent = None, None
         try:
-            r = requests.get(addr + "/v3/client_info", timeout=timeout, verify=False)
+            r = requests.get(addr + "/v3/client_info", timeout=timeout, verify=verify)
             if r.ok:
                 j = r.json()
                 client_info = j.get("client_info") or j.get("clientInfo")
@@ -355,11 +543,12 @@ class AppleAuth:
         headers = None
         for path in ("/", "/v3/get_headers"):
             try:
-                r = requests.get(addr + path, timeout=timeout, verify=False)
-                if not r.ok:
+                r = requests.get(addr + path, timeout=timeout, verify=verify)
+                if not r.ok or r.status_code in (429, 502, 503, 504):
                     continue
                 j = r.json()
-                if isinstance(j, dict) and j.get("X-Apple-I-MD-M"):
+                if isinstance(j, dict) and any(
+                        k in j for k in ("X-Apple-I-MD-M", "x-apple-i-md-m", "X-Apple-I-MD")):
                     headers = j
                     break
             except Exception:
@@ -367,8 +556,17 @@ class AppleAuth:
         if not headers:
             return None
 
+        # Chuan hoa key: mot so server tra X-Apple-I-MD-M, so khac chi co
+        # X-Apple-I-MD (local provision). Can ca hai de GSA khong tu choi.
+        if "X-Apple-I-MD-M" not in headers:
+            for k in list(headers.keys()):
+                if k.lower() == "x-apple-i-md-m":
+                    headers["X-Apple-I-MD-M"] = headers[k]
+                    break
         if not client_info:
-            client_info = headers.get("X-MMe-Client-Info") or headers.get("X-Mme-Client-Info")
+            client_info = (headers.get("X-MMe-Client-Info")
+                           or headers.get("X-Mme-Client-Info")
+                           or headers.get("X-MMe-CLIENT-INFO"))
         if not user_agent:
             user_agent = headers.get("User-Agent") or DEFAULT_USER_AGENT
         return {"headers": headers, "client_info": client_info,
@@ -444,7 +642,7 @@ class AppleAuth:
             "Connection": "close",
         }
         r = requests.post(GSA_URL, data=plist.dumps(body), headers=headers,
-                          timeout=20, verify=False)
+                          timeout=20, verify=True)
         out = {"http": r.status_code, "ec": None, "has_challenge": False}
         try:
             res = plist.loads(r.content).get("Response", {})
@@ -497,46 +695,80 @@ class AppleAuth:
         self.user_agent = user_agent or self.user_agent or DEFAULT_USER_AGENT
         self._identity_user_agent = self.user_agent
         self._identity_variant = variant
+        # Danh tinh apptokens/developer phai doi theo server moi.
+        if hasattr(self, "developer_client_info"):
+            self._token_identity_index = 0
+            self._refresh_token_identity()
+
+    def _fetch_headers_once(self, addr):
+        """MOT lan GET headers tu server. Moi loi deu la AnisetteServerUnavailable."""
+        verify = self._tls_verify(addr)
+        response = self.session.get(addr, timeout=10, verify=verify)
+        if response.status_code in (429, 502, 503, 504):
+            raise AnisetteServerUnavailable(f"HTTP {response.status_code}")
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except Exception as e:
+            raise AnisetteServerUnavailable(f"JSON hỏng: {e}")
+        if not isinstance(data, dict):
+            raise AnisetteServerUnavailable("response không phải object")
+        if not any(k in data for k in ("X-Apple-I-MD-M", "x-apple-i-md-m", "X-Apple-I-MD")):
+            raise AnisetteServerUnavailable("thiếu X-Apple-I-MD-M (server trả sai định dạng)")
+        if "X-Mme-Device-Id" in data:
+            self.device_id = data["X-Mme-Device-Id"]
+        server_ci = data.get("X-MMe-Client-Info") or data.get("X-Mme-Client-Info")
+        if server_ci:
+            self._set_identity(addr, server_ci,
+                               getattr(self, "_identity_user_agent", None) or self.user_agent,
+                               getattr(self, "_identity_variant", "raw"))
+        return data
 
     def generate_anisette_headers(self):
-        """Lấy headers anisette (machine-id + OTP) từ server đang chọn.
+        """Lấy headers anisette — TỰ ĐỔI SANG SERVER KHÁC khi server hiện tại lỗi.
 
-        Đồng thời ĐỒNG BỘ self.client_info/self.user_agent với server đó: nếu
-        server được đổi (do lỗi) mà danh tính vẫn là của server cũ thì Apple
-        lại trả -80045 đúng như lỗi gốc.
+        v73 (root cause bug #1): ban cu chi xoay server o lan thu 2 cua 3 lan
+        thu tren CUNG MOT URL, va _select_anisette() co the tra ve mot URL chet
+        (hoac URL mac dinh) neu GSA probe that bai. Moi loi khac (timeout, 502,
+        JSON hong, thieu OTP) deu lot vao `except Exception -> raise` roi
+        authenticate() bat lay va return None -> DUNG LUON.
+
+        Bay gio: moi lan lay headers that bai = loai server do ngay lap tuc,
+        chon server tiep theo CON SONG (da kiem chung bang chinh GET headers),
+        cap nhat lai client_info/user_agent theo server moi, va thu lai trong
+        CUNG lan goi. Chi dung lai khi da thu het danh sach.
         """
-        for attempt in range(3):
+        max_servers = max(1, min(len(self._candidate_servers()), ANISETTE_MAX_CANDIDATES))
+        tried = set()
+        last_exc = None
+
+        for step in range(max_servers):
+            addr = (self.anisette_url or "").rstrip("/")
+            if not addr:
+                picked = self._pick_live_server(exclude=tried)
+                if not picked:
+                    break
+                self._apply_server_identity(picked)
+                addr = self.anisette_url.rstrip("/")
             try:
-                print(f"[anisette] Fetching headers from {self.anisette_url} (lần {attempt+1}/3)...")
-                response = self.session.get(self.anisette_url, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-
-                if "X-Apple-I-MD-M" not in data:
-                    print("[anisette] Cảnh báo: Thiếu X-Apple-I-MD-M trong response.")
-                if "X-Mme-Device-Id" in data:
-                    self.device_id = data["X-Mme-Device-Id"]
-
-                # Server có thể xoay/đổi danh tính → luôn lấy lại từ server,
-                # chỉ áp biến thể (raw/akd) đã chọn lúc kiểm chứng.
-                server_ci = data.get("X-MMe-Client-Info") or data.get("X-Mme-Client-Info")
-                if server_ci:
-                    self._set_identity(self.anisette_url, server_ci,
-                                       getattr(self, "_identity_user_agent", None)
-                                       or self.user_agent,
-                                       getattr(self, "_identity_variant", "raw"))
-                return data
+                print(f"[anisette] Fetching headers từ {addr} (server #{step + 1}/{max_servers})...")
+                return self._fetch_headers_once(addr)
             except Exception as e:
-                print(f"[anisette] Lỗi fetch anisette từ {self.anisette_url}: {e}")
-                if attempt < 2:
-                    time.sleep(1)
-                    if getattr(self, "_anisette_pinned", False):
-                        print(f"[anisette] Giữ server private {self.anisette_url}, thử lại...")
-                    else:
-                        self._failed_servers.add(self.anisette_url.rstrip("/"))
-                        self._select_anisette(ignore_cache=True)
-                else:
-                    raise Exception("Không thể lấy dữ liệu Anisette sau 3 lần thử.")
+                last_exc = e
+                print(f"[anisette] ❌ {addr} lỗi: {e}")
+                self._failed_servers.add(addr)
+                tried.add(addr)
+                self._invalidate_anisette_cache()
+                # Chon server tiep theo CON SONG (khong goi GSA o day — doi khi
+                # Apple dang 503 thi viec doi server van phai chay duoc).
+                picked = self._pick_live_server(exclude=tried)
+                if not picked:
+                    break
+                self._apply_server_identity(picked)
+
+        self.last_error = ("Không lấy được dữ liệu Anisette từ bất kỳ server nào "
+                           f"(đã thử {len(tried)} server). Lỗi cuối: {last_exc}")
+        raise AnisetteServerUnavailable(self.last_error)
 
     def _build_cpd(self, anisette_data, client_info=None, variant=None):
         """Dựng trường `cpd` của GSA.
@@ -658,7 +890,7 @@ class AppleAuth:
         if "gsa.apple.com" in url:
             headers["Connection"] = "close"
             sess = requests.Session()
-            sess.verify = False
+            sess.verify = True
             try:
                 return sess.request(method, url, headers=headers, timeout=timeout, **kwargs)
             finally:
@@ -754,14 +986,39 @@ class AppleAuth:
             checksum_hmac.update(app.encode("utf-8"))
             checksum = checksum_hmac.digest()
 
-            response = self.gsa_request({
+            params = {
                 "u": adsid,
                 "app": [app],
                 "c": c,
                 "t": idms_token,
                 "checksum": checksum,
                 "o": "apptokens",
-            })
+            }
+            response = None
+            # Thu toi da 3 danh tinh Mac (server Mac -> Mac 27 -> Mac 26.6).
+            # Moi lan that bai bang -80046/-45061 thi doi danh tinh, KHONG
+            # dang nhap lai SRP (session con nguyen) — theo probe cua Apparition.
+            for attempt in range(3):
+                self._token_identity_index = min(attempt, len(MAC_TOKEN_IDENTITIES) - 1)
+                self._refresh_token_identity()
+                self._token_identity_next = True
+                try:
+                    response = self.gsa_request(params)
+                finally:
+                    self._token_identity_next = False
+                status = (response or {}).get("Status") or {}
+                ec = status.get("ec")
+                if ec in APP_TOKEN_REJECT_EC:
+                    print(f"[apptoken] ⚠️  Apple từ chối cấp developer token (ec {ec}) — "
+                          f"thử danh tính Mac khác (lần {attempt + 1}/3)...")
+                    self._explain_gsa_status(status)
+                    continue
+                if ec not in (None, 0):
+                    self._explain_gsa_status(status)
+                break
+
+            if not response:
+                return None
 
             encrypted_token = response.get("et")
             if not encrypted_token:
@@ -780,6 +1037,8 @@ class AppleAuth:
             print(f"[apptoken] Lấy app token cho '{app}' thành công.")
             return token_info["token"]
 
+        except AnisetteServerUnavailable:
+            raise
         except Exception as e:
             print(f"[apptoken] Lỗi khi lấy app token: {e}")
             return None
@@ -799,19 +1058,26 @@ class AppleAuth:
         }
         body["Request"].update(parameters)
 
-        # v72: danh tính gửi đi = danh tính của server đã sinh machine-id.
-        # Lệch nhau (Mac bịa ra + machine-id Android) chính là -80045.
-        ci = self.client_info or ""
-        if getattr(self, "_identity_variant", "raw") == "akd" and ci:
+        # v73: request `apptokens` (va cac request developer services sau do)
+        # PHAI khai mot danh tinh Mac, neu khong Apple tra -80046 tu 22/10/2026.
+        # Cac buoc init/complete van dung danh tinh cua server sinh machine-id
+        # (chong -80045). Day la 2 lop kiem tra KHAC NHAU cua Apple.
+        use_token = bool(getattr(self, "_token_identity_next", False))
+        ci = (self.token_identity if use_token else self.client_info) or ""
+        ua = (self.token_user_agent if use_token else self.user_agent) or DEFAULT_USER_AGENT
+        if not use_token and getattr(self, "_identity_variant", "raw") == "akd" and ci:
             ci = ci.replace("com.apple.dt.Xcode", "com.apple.akd")
+        cpd_data["X-MMe-Client-Info"] = ci      # header va cpd PHAI trung nhau (-80044)
         headers = {
             "Content-Type": "text/x-xml-plist",
             "Accept": "text/x-xml-plist",
-            "User-Agent": self.user_agent,
+            "User-Agent": ua,
             "X-MMe-Client-Info": ci,
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
             "X-Xcode-Version": "14.2 (14C18)",
         }
+        if use_token:
+            print(f"[gsa] apptokens dùng danh tính Mac: {ci}")
         payload = plist.dumps(body)
         op = parameters.get("o", "unknown")
         # 429 HTML va 5xx HTML deu la edge, khong phai plist GSA.
@@ -892,7 +1158,7 @@ class AppleAuth:
                     )
                 return result
 
-            except GsaRateLimitedError:
+            except (GsaRateLimitedError, AnisetteIdentityRejected, AnisetteServerUnavailable):
                 raise
             except Exception as e:
                 print(f"[gsa] Request failed: {e}")
@@ -1459,6 +1725,11 @@ class AppleAuth:
 
         except GsaRateLimitedError as e:
             return self._handle_gsa_429(apple_id, password, _depth, _gsa_retries, e)
+        except (AnisetteIdentityRejected, AnisetteServerUnavailable) as e:
+            # v73: loi server chet / Apple tu choi danh tinh khong duoc ket
+            # thuc ca chuoi dang nhap. Doi server da kiem chung roi chay lai SRP.
+            return self._recover_identity(apple_id, password, _depth,
+                                          _identity_retries, e)
         except Exception as e:
             print(f"[icloud] Authentication error: {e}")
             return None
@@ -1478,6 +1749,11 @@ class AppleAuth:
         -80010: "Thiếu one-time password (X-Apple-I-MD-M) trong request.",
         -29004: "machine-id anisette bị Apple coi là hỏng (malformed).",
         -80044: "Danh tính trong header HTTP và trong body (cpd) không khớp nhau.",
+        -80046: ("Apple TỪ CHỐI CẤP DEVELOPER TOKEN (từ 22/10/2026) vì request khai "
+                 "client không phải Mac. Tool tự gửi lại apptokens với danh tính Mac. "
+                 "Nếu vẫn lỗi: đổi sang server Mac-ADI (mac-ani.jkcoxson.com)."),
+        -45061: ("Dữ liệu provisioning anisette bị Apple từ chối — cần server Mac-ADI "
+                 "mới (xoá .anisette_cache.json, chọn 'Tự động')."),
         -20101: "Sai Apple ID hoặc mật khẩu.",
         -20102: "Tài khoản Apple ID không tồn tại hoặc sai định dạng.",
         -20209: ("TÀI KHOẢN BỊ KHOÁ vì lý do an ninh (Apple khoá khi thấy nhiều lần "
@@ -1510,9 +1786,18 @@ class AppleAuth:
         lựa chọn nhưng báo rõ). Tối đa 2 lần để không vòng lặp vô hạn.
         """
         print(f"[icloud] ❌ {exc}")
-        self._explain_gsa_status({"ec": -80045})
+        server_dead = isinstance(exc, AnisetteServerUnavailable)
+        if server_dead:
+            self.last_error = f"Server anisette không dùng được: {exc}"
+            print(f"[icloud] → Lỗi TẦNG SERVER ({exc}) — đổi server ngay, không thử lại server này.")
+        else:
+            self._explain_gsa_status({"ec": -80045})
 
-        if getattr(self, "_anisette_pinned", False):
+        # v73: server do nguoi dung ghim VAN DUOC PHEP failover khi no chet
+        # (yeu cau truc tiep cua nguoi dung). Chi giung ghim khi Apple van
+        # nhan request nhung tu choi danh tinh (-80045) — luc do can nguoi
+        # dung chon server khac co y thuc.
+        if getattr(self, "_anisette_pinned", False) and not server_dead:
             self.last_error = (
                 f"Server anisette đang ghim ({self.anisette_url}) bị Apple từ chối "
                 "(-80045). Vào Cài đặt → Server Anisette → chọn 'Tự động'.")
@@ -1523,6 +1808,27 @@ class AppleAuth:
 
         self._pin_cpd = False
         self._cpd_pin = None
+
+        if server_dead:
+            # Khong xin OTP lai tren server da chet. Loai no, chon server song
+            # tiep theo (khong can GSA probe), roi chay lai SRP.
+            self._failed_servers.add((self.anisette_url or "").rstrip("/"))
+            self._invalidate_anisette_cache()
+            picked = self._pick_live_server(exclude=set(self._failed_servers))
+            if not picked:
+                self.last_error = ("Mọi server anisette đều không phản hồi — kiểm tra mạng/VPN "
+                                   "rồi thử lại (không tự thử lại vô hạn).")
+                print(f"[icloud] ❌ {self.last_error}")
+                return None
+            self._apply_server_identity(picked)
+            self._save_anisette_cache(picked[0], picked[1].get("client_info") or "",
+                                      picked[1].get("user_agent"), "raw")
+            if attempts >= 4:
+                self.last_error = "Đã đổi server nhiều lần nhưng đăng nhập vẫn lỗi — dừng để tránh khoá tài khoản."
+                print(f"[icloud] ❌ {self.last_error}")
+                return None
+            return self.authenticate(apple_id, password, _depth=_depth,
+                                     _identity_retries=attempts + 1)
 
         # Lần 1: cùng server nhưng xin OTP/machine-id mới. Apple từ chối
         # thường vì OTP đã cũ hoặc machine-id vừa bị luân chuyển — chưa cần
@@ -1537,14 +1843,20 @@ class AppleAuth:
                                      _identity_retries=1)
 
         # Lần 2: server này thật sự bị chặn → loại và chọn server đã kiểm chứng khác.
-        if attempts == 1:
-            print("[icloud] → Server này bị chặn: tự động chọn server anisette khác "
-                  "đã kiểm chứng và thử lại...")
+        if 1 <= attempts < 4:
+            print(f"[icloud] → Server này bị chặn: tự động chọn server anisette khác "
+                  f"(lần {attempts}) và thử lại...")
             self._failed_servers.add(self.anisette_url.rstrip("/"))
             self._invalidate_anisette_cache()
-            self._select_anisette(ignore_cache=True)
+            picked = self._pick_live_server(exclude=set(self._failed_servers))
+            if picked:
+                self._apply_server_identity(picked)
+                self._save_anisette_cache(picked[0], picked[1].get("client_info") or "",
+                                          picked[1].get("user_agent"), "raw")
+            else:
+                self._select_anisette(ignore_cache=True)
             return self.authenticate(apple_id, password, _depth=_depth,
-                                     _identity_retries=2)
+                                     _identity_retries=attempts + 1)
 
         self.last_error = (
             "Apple từ chối mọi danh tính anisette đã thử (-80045). Thử: "

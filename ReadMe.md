@@ -5,7 +5,7 @@ không cần máy tính, không cần Termux, không cần root. Toàn bộ chu�
 `usbmuxd → lockdownd → AFC → installation_proxy` của máy tính được tái hiện
 ngay trong một chiếc điện thoại Android.
 
-> Version hiện tại: **1.6.0 (v54)** · Android 8.0+ (API 26) · arm64-v8a & x86_64
+> Version hiện tại: **1.7.0 (v73)** · Android 8.0+ (API 26) · arm64-v8a & x86_64
 
 ---
 
@@ -242,6 +242,47 @@ Từ **12/10/2026** Apple thay đổi phía server: GrandSlam
 Trạng thái kiểm chứng 20/10/2026: chỉ server nhóm Windows/macOS-ADI
 (`mac-ani.jkcoxson.com`, …) còn được GSA chấp nhận; `ani.sidestore.io`,
 `ani.npeg.us`, `omni.ethxn.xyz` và phần lớn danh sách SideStore bị từ chối.
+
+---
+
+## 6.2 Bản v73 (2026-10-26) — 3 lỗi lớn + tương thích Apple 10/2026
+
+Chi tiết đầy đủ (research, root cause, bằng chứng, giới hạn) nằm trong
+[`FIX_REPORT_v73.md`](./FIX_REPORT_v73.md). Tóm tắt:
+
+1. **Tự đổi server Anisette thật sự.** Trước đây server đầu tiên chết
+   (502/timeout/JSON hỏng) là tool dừng hẳn, do `generate_anisette_headers()`
+   chỉ thử lại trên cùng URL và `_select_anisette()` lại phụ thuộc vào việc
+   `gsa.apple.com` trả lời. v73 tách riêng "server còn sống" và "Apple chấp
+   nhận danh tính": quét tới 24 server, đổi server ngay trong cùng lần gọi,
+   kể cả khi server do người dùng ghim bị chết. Cache chỉ còn 30 phút và được
+   kiểm chứng lại. Danh sách seed cập nhật theo đo thực tế
+   (`win.ani.sidestore.io` đang 502 → loại; thêm `ani3.stikstore.app`).
+2. **File ghép nối dùng được thật.** Bản cũ chỉ thêm `UDID` vào pair record
+   rồi ghi ra, trong khi SideStore/minimuxer cần đủ
+   `WiFiMACAddress / EscrowBag / RootPrivateKey / SystemBUID / …`. v73 bổ sung
+   `WiFiMACAddress` bằng `lockdownd GetValue("WiFiAddress")`, `SystemBUID` từ
+   `ReadBUID`, chuẩn hoá cert về `<data>`, **kiểm chứng 8 key bắt buộc**
+   (fail-closed, có log rõ), thử cả `VendContainer` + `VendDocuments` và 2 kiểu
+   đường dẫn, **đọc lại file sau khi ghi**, gộp thêm RPPairing nếu có
+   `rp_pairing_file.plist`, và ghi UserDefaults đúng chỗ cho cả SideStore trong
+   LiveContainer.
+3. **Apple 10/2026.** Xử lý **-80046** (Apple không cấp developer token cho
+   client không phải Mac, từ 22/10/2026): `apptokens` + mọi request developer
+   services dùng **một danh tính Mac nhất quán**, tự thử lại 3 danh tính Mac
+   khác nhau. Bật lại **TLS verification** (đo thật 6/6 server anisette có cert
+   hợp lệ). Thêm nhận diện phiên bản iOS và cảnh báo RemotePairing cho
+   iOS 17.4+/26+.
+
+**Test mới (CI chạy tự động):** `test_anisette_failover.py`,
+`test_apple_oct2026.py`, `test_pairing_validation.py`,
+`tests/host/check_native_syntax.sh`, `tests/host/test_pairing_helpers.py`
+(biên dịch C thật với libplist 2.6.0).
+
+> Lưu ý trung thực: chưa có iPhone thật + Apple ID để chạy end-to-end trong
+> môi trường build; và tool **không tự sinh RPPairing** — xem mục 6 và 8 của
+> `FIX_REPORT_v73.md` để biết cách tạo bằng `idevice_pair` nếu SideStore
+> nightly trên iOS 17.4+ đòi file RP.
 
 ---
 

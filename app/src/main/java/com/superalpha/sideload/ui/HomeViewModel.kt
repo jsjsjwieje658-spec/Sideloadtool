@@ -247,6 +247,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _pairingFileReady = MutableStateFlow(false)
     val pairingFileReady: StateFlow<Boolean> = _pairingFileReady
 
+    /** v73: báo cáo thật từ native (iOS, Wi-Fi Debugging, danh sách key…). */
+    private val _pairingReport = MutableStateFlow("")
+    val pairingReport: StateFlow<String> = _pairingReport
+
     private val _pairingApps = MutableStateFlow<List<PairingAppInfo>>(emptyList())
     val pairingApps: StateFlow<List<PairingAppInfo>> = _pairingApps
 
@@ -260,7 +264,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
      * đã cài cần file ghép nối (SideStore/LiveContainer…).
      */
     fun refreshPairingState() {
-        viewModelScope.launch {
+        // v73: pairingFileReport()/getPairingFile() đọc pair record VÀ có thể
+        // gọi lockdownd GetValue qua USB — chạy trên IO, không chặn main thread.
+        viewModelScope.launch(Dispatchers.IO) {
+            _pairingReport.value = nativeBridge.pairingFileReport().orEmpty()
             _pairingFileReady.value = nativeBridge.getPairingFile() != null
             val entries = nativeBridge.listInstalledAppEntries()
             _pairingApps.value = matchPairingApps(entries)

@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y autoconf automake libtool libtool-bin pkg-config \
-            libssl-dev python3 curl git default-jdk-headless
+            libssl-dev python3 curl git default-jdk-headless libusb-1.0-0-dev
 
       - name: "🐍 Python: luồng ký & cài (App ID / extension / UDID)"
         run: python3 tests/python/test_sideload_core.py
@@ -56,8 +56,25 @@ jobs:
           python3 -m pip install --quiet srp cryptography
           python3 tests/python/test_anisette_identity.py
 
+      # v73: 3 lỗi người dùng báo — tự đổi server, file ghép nối, Apple 10/2026.
+      - name: "🔁 Python: tự đổi server khi server đầu lỗi (bug #1)"
+        run: python3 tests/python/test_anisette_failover.py
+
+      - name: "🍎 Python: Apple 10/2026 — -80046 / danh tính developer / TLS (bug #3)"
+        run: python3 tests/python/test_apple_oct2026.py
+
+      - name: "🔗 Python: kiểm chứng file ghép nối trước khi nhúng (bug #2)"
+        run: python3 tests/python/test_pairing_validation.py
+
       - name: "🏗️  Build libplist/libusbmuxd/libimobiledevice cho host"
         run: HOSTDEPS="$RUNNER_TEMP/hostdeps" SRC="$RUNNER_TEMP/hostsrc" bash tests/native-host/build_host_deps.sh
+
+      # v73: compile-check C thật (libplist 2.6.0 vừa build) + functional test
+      # các hàm làm giàu pair record — bắt sai sót C trước khi build APK.
+      - name: "🧩 C: compile-check native + pair record helpers"
+        run: |
+          HOSTDEPS="$RUNNER_TEMP/hostdeps" bash tests/host/check_native_syntax.sh
+          HOSTDEPS="$RUNNER_TEMP/hostdeps" python3 tests/host/test_pairing_helpers.py
 
       - name: "🔌 usbmuxd nội bộ ↔ iPhone giả lập"
         run: HOSTDEPS="$RUNNER_TEMP/hostdeps" bash tests/native-host/run.sh

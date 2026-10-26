@@ -111,7 +111,17 @@ class DeveloperAPI:
         return self._cached_anisette
 
     def _auth_headers(self, content_type, accept):
-        """Header xác thực chuẩn theo AltSign."""
+        """Header xác thực chuẩn theo AltSign.
+
+        v73 (Apple 22/10/2026): developer token duoc Apple cap CHO MOT DANH
+        TINH cu the (danh tinh Mac dung o buoc `apptokens`). Neu request
+        developerservices2 khai danh tinh khac (vi du Windows/Android cua
+        server anisette), Apple tra "session has expired" / resultCode 1100.
+        Vi vay X-MMe-Client-Info o day phai lay tu auth.developer_client_info,
+        KHONG lay nguyen tu headers anisette.
+        Nguon: AltSign#61, iPASide 1.2.8, blog.illixion.com (-80046).
+        """
+        dev_ci = getattr(self.auth, "developer_client_info", None)
         headers = {
             "Content-Type": content_type,
             "User-Agent": "Xcode",
@@ -122,7 +132,13 @@ class DeveloperAPI:
             "X-Apple-I-Identity-Id": str(self.dsid) if self.dsid else "",
             "X-Apple-GS-Token": str(self.session_token) if self.session_token else "",
         }
-        headers.update(self._get_anisette())
+        anisette = dict(self._get_anisette() or {})
+        headers.update(anisette)
+        if dev_ci:
+            headers["X-MMe-Client-Info"] = dev_ci
+        # User-Agent: Xcode la header rieng cua developerservices2 (AltSign),
+        # khong phai User-Agent cua GSA; giu nguyen de khong doi protocol.
+        headers["User-Agent"] = "Xcode"
         return headers
 
     def _make_developer_request(self, action_path, extra_params=None, require_team=True):
@@ -169,7 +185,9 @@ class DeveloperAPI:
                 result_code = result.get("resultCode") or result.get("resultcode")
                 if result_code == 1100 and attempt == 0:
                     print(f"[developer_api] resultCode 1100 (session expired) trên "
-                          f"'{action_path}' — làm mới anisette và thử lại...")
+                          f"'{action_path}' — danh tính developer hiện tại: "
+                          f"{getattr(self.auth, 'developer_client_info', '?')}. "
+                          "Làm mới anisette và thử lại...")
                     self._get_anisette(force=True)
                     continue  # retry
 

@@ -89,6 +89,16 @@ object DeviceNative {
         bridge?.getUdid() ?: AppConfig.lastUdid.ifBlank { null }
     }
 
+    /** v73: Python gọi để kiểm chứng file ghép nối trước khi nhúng. */
+    @JvmStatic
+    fun getPairingFileXml(): String? = runBlocking { bridge?.getPairingFile() }
+
+    @JvmStatic
+    fun getPairingFileReport(): String? = bridge?.pairingFileReport()
+
+    @JvmStatic
+    fun getIosVersion(): String? = bridge?.iosVersion()
+
     @JvmStatic
     fun sideloadIpa(localIpaPath: String): Boolean = runBlocking {
         val b = bridge ?: run {

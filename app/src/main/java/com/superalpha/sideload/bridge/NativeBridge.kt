@@ -307,6 +307,10 @@ class NativeBridge(private val context: Context) {
         try { nativeGetPairingFile() } catch (_: Exception) { null }
     }
 
+    /** v73: báo cáo nội dung file ghép nối + iOS version (hiện trong tab File ghép nối). */
+    fun pairingFileReport(): String? = try { nativeGetPairingFileReport() } catch (_: Exception) { null }
+    fun iosVersion(): String? = try { nativeGetIosVersion() } catch (_: Exception) { null }
+
     /**
      * Ghi file ghép nối vào Documents của app đã cài (house_arrest →
      * VendDocuments → AFC) — SideStore/LiveContainer dùng ngay không cần
@@ -417,6 +421,8 @@ class NativeBridge(private val context: Context) {
     private external fun nativeIsPaired(): Boolean
     private external fun nativeGetPairingPlist(): String?
     private external fun nativeGetPairingFile(): String?
+    private external fun nativeGetPairingFileReport(): String?
+    private external fun nativeGetIosVersion(): String?
     private external fun nativeWritePairingFileToApp(bundleId: String, relPath: String): Boolean
     private external fun nativeWriteSideStorePrefs(bundleId: String): Boolean
     private external fun nativeReset()

@@ -69,8 +69,13 @@ object AppConfig {
      * danh tính khai báo. Đưa các server Windows/ADI đã kiểm chứng lên trước;
      * server cũ giữ lại chỉ để tham khảo (apple_auth.py tự kiểm chứng lại).
      */
+    // v73 (2026-10-26): đo trực tiếp — win.ani.sidestore.io đang HTTP 502,
+    // các server Mac-ADI dưới đây đều 200. apple_auth.py vẫn tự kiểm chứng lại.
     val defaultAnisetteServers: List<AnisetteServer> = listOf(
-        AnisetteServer("mac-ani.jkcoxson.com", "https://mac-ani.jkcoxson.com"),
+        AnisetteServer("mac-ani.jkcoxson.com (Mac ADI)", "https://mac-ani.jkcoxson.com"),
+        AnisetteServer("ani.jkcoxson.com (Mac ADI)", "https://ani.jkcoxson.com"),
+        AnisetteServer("ani3.stikstore.app", "https://ani3.stikstore.app"),
+        AnisetteServer("new.ani.sidestore.io", "https://new.ani.sidestore.io"),
         AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
         AnisetteServer("SideStore Official", "https://ani.sidestore.io"),
         AnisetteServer("Local (Sideloadly)", "http://localhost:6969"),

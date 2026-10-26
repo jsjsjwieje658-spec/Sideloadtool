@@ -33,6 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <ctype.h>
 #include <android/log.h>
 
 #include <libimobiledevice/libimobiledevice.h>
@@ -291,6 +292,14 @@ static lockdownd_error_t ensure_wifi_debugging(const char *ctx, int *skipped_out
         e = lockdownd_set_value(ld, "com.apple.mobile.wireless_lockdown",
                                 "EnableWifiDebugging", val);
         if (e == LOCKDOWN_E_SUCCESS) break;
+        /* v73: mot so ban iOS 26/27 chi nhan khoa EnableWifiConnections.
+         * Thu them lan nua truoc khi ket luan "khong bat duoc". */
+        {
+            plist_t val2 = plist_new_bool(1);
+            lockdownd_error_t e2 = lockdownd_set_value(
+                ld, "com.apple.mobile.wireless_lockdown", "EnableWifiConnections", val2);
+            if (e2 == LOCKDOWN_E_SUCCESS) { e = e2; break; }
+        }
         /* Phiên cũ rớt giữa chừng (dùng tool nhiều ngày) → bắt tay lại 1 lần. */
         if (!tmp && attempt == 0 &&
             (e == LOCKDOWN_E_SESSION_INACTIVE || e == LOCKDOWN_E_NO_RUNNING_SESSION ||
@@ -904,32 +913,249 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingPlist(JNIEnv *e
  * file vào Documents của app (iLoader place_file()).
  * ═════════════════════════════════════════════════════════════════════════ */
 
-static char *build_pairing_file_xml(uint32_t *out_len) {
-    if (!is_real_udid(g_udid)) return NULL;
-    char *data = NULL;
-    uint32_t size = 0;
+/* ═══════════════════════════════════════════════════════════════════════════
+ * v73 — FILE GHÉP NỐI: LÀM GIÀU + KIỂM CHỨNG TRƯỚC KHI GHI
+ *
+ * Bản cũ chỉ thêm khoá "UDID" rồi ghi thẳng pair record ra file. SideStore /
+ * minimuxer đọc file bằng parser thật sự và YÊU CẦU đủ bộ khoá:
+ *   WiFiMACAddress, HostCertificate, UDID, HostID, HostPrivateKey, EscrowBag,
+ *   DeviceCertificate, SystemBUID, RootPrivateKey, RootCertificate
+ * (SideStore#1532, ipaforge PR#26, SideInstaller NOTES.md).
+ *
+ * libimobiledevice CHỈ lưu WiFiMACAddress/EscrowBag khi lockdownd trả được
+ * value lúc pair (src/lockdown.c: lockdownd_get_value("WiFiAddress")). Trên
+ * iOS 26/27 value này có thể bị từ chối (Private Wi-Fi Address / quyền mới)
+ * → pair record THIẾU key → tool vẫn ghi file, app vẫn báo lỗi mà không ai
+ * biết tại sao. Ở đây ta:
+ *   - bổ sung UDID, SystemBUID (từ usbmuxd ReadBUID), WiFiMACAddress (đọc lại
+ *     trực tiếp từ lockdownd: WiFiAddress / EthernetAddress),
+ *   - chuẩn hoá 6 khoá cert/key về <data> nếu server lưu dạng <string>,
+ *   - gộp thêm file RP (nếu người dùng cung cấp rp_pairing_file.plist),
+ *   - KIỂM TRA đủ key bắt buộc; thiếu → trả NULL + log rõ (fail-closed),
+ *     không tạo file "có mà không dùng được".
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static const char *PAIRING_DATA_KEYS[] = {
+    "DeviceCertificate", "HostCertificate", "HostPrivateKey",
+    "RootCertificate", "RootPrivateKey", "EscrowBag", "DevicePublicKey", NULL
+};
+static const char *PAIRING_REQUIRED_KEYS[] = {
+    "DeviceCertificate", "HostCertificate", "HostPrivateKey", "RootCertificate",
+    "RootPrivateKey", "HostID", "SystemBUID", "UDID", NULL
+};
+static const char *PAIRING_RP_KEYS[] = {"alt_irk", "private_key", "public_key", "identifier", NULL};
+static const char *PAIRING_RECOMMENDED_HINT_KEYS[] = {"WiFiMACAddress", "EscrowBag", NULL};
+
+static bool plist_item_usable(plist_t pl, const char *key) {
+    plist_t n = pl ? plist_dict_get_item(pl, key) : NULL;
+    if (!n) return false;
+    plist_type t = plist_get_node_type(n);
+    if (t == PLIST_DATA) {
+        char *v = NULL; uint64_t l = 0;
+        plist_get_data_val(n, &v, &l);
+        free(v);
+        return l > 0;
+    }
+    if (t == PLIST_STRING) {
+        char *v = NULL;
+        plist_get_string_val(n, &v);
+        bool ok = (v && v[0]);
+        free(v);
+        return ok;
+    }
+    return false;
+}
+
+/* Một số pair record lưu PEM base64 dưới dạng <string>. SideStore đọc <data>. */
+static void plist_normalise_data_keys(plist_t pl) {
+    for (int i = 0; PAIRING_DATA_KEYS[i]; i++) {
+        const char *key = PAIRING_DATA_KEYS[i];
+        plist_t n = plist_dict_get_item(pl, key);
+        if (!n || plist_get_node_type(n) != PLIST_STRING) continue;
+        char *v = NULL;
+        plist_get_string_val(n, &v);
+        if (v && v[0]) {
+            plist_dict_set_item(pl, key, plist_new_data(v, (uint64_t)strlen(v)));
+            emitf("[pairing] Chuyển khoá %s từ <string> sang <data>", key);
+        }
+        free(v);
+    }
+}
+
+/* Đọc WiFi MAC trực tiếp từ lockdownd (upstream: key "WiFiAddress"). */
+static char *lockdown_wifi_mac(void) {
+    if (!g_device) return NULL;
+    lockdownd_client_t ld = g_lockdown, tmp = NULL;
+    if (!ld) {
+        if (lockdownd_client_new_with_handshake(g_device, &tmp, CLIENT_LABEL) != LOCKDOWN_E_SUCCESS || !tmp)
+            return NULL;
+        ld = tmp;
+    }
+    static const char *keys[] = {"WiFiAddress", "EthernetAddress", "WiFiMACAddress", NULL};
+    char *out = NULL;
+    for (int i = 0; keys[i] && !out; i++) {
+        plist_t v = NULL;
+        if (lockdownd_get_value(ld, NULL, keys[i], &v) == LOCKDOWN_E_SUCCESS && v &&
+            plist_get_node_type(v) == PLIST_STRING) {
+            char *s = NULL;
+            plist_get_string_val(v, &s);
+            if (s && s[0]) out = s; else free(s);
+        }
+        if (v) plist_free(v);
+    }
+    if (tmp) lockdownd_client_free(tmp);
+    return out;
+}
+
+/* Gộp RPPairing do công cụ ngoài (idevice_pair / StikPair) tạo ra.
+ * Người dùng chép file vào <filesDir>/rp_pairing_file.plist; mọi khoá lạ
+ * (public_key/private_key/identifier/alt_irk/...) được merge vào plist xuất.
+ * SideStore 0.7+ trên iOS 17.4+ ưu tiên RP, nên có file này sẽ dùng được
+ * cả 3 tên: ALTPairingFile / PairingFile_Lockdown.plist / PairingFile_RemoteRP.plist.
+ */
+static bool merge_external_rp(plist_t pl) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/rp_pairing_file.plist", g_files_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(f); return false; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = 0;
+    plist_t rp = NULL;
+    plist_format_t fmt = PLIST_FORMAT_XML;
+    if (plist_from_memory(buf, (uint32_t)got, &rp, &fmt) != PLIST_ERR_SUCCESS || !rp ||
+        plist_get_node_type(rp) != PLIST_DICT) {
+        if (rp) plist_free(rp);
+        free(buf);
+        emit_log("[pairing] ⚠️  rp_pairing_file.plist không đọc được — bỏ qua.");
+        return false;
+    }
+    free(buf);
+    plist_dict_iter it = NULL;
+    plist_dict_new_iter(rp, &it);
+    char *key = NULL;
+    plist_t val = NULL;
+    int added = 0;
+    plist_dict_next_item(rp, it, &key, &val);
+    while (val) {
+        if (key && !plist_dict_get_item(pl, key)) {
+            plist_dict_set_item(pl, key, plist_copy(val));
+            added++;
+        }
+        free(key); key = NULL; val = NULL;
+        plist_dict_next_item(rp, it, &key, &val);
+    }
+    plist_free(rp);
+    emitf("[pairing] Đã gộp %d khoá RPPairing từ rp_pairing_file.plist", added);
+    return added > 0;
+}
+
+static bool pairing_has_rp(plist_t pl) {
+    for (int i = 0; PAIRING_RP_KEYS[i]; i++)
+        if (plist_dict_get_item(pl, PAIRING_RP_KEYS[i])) return true;
+    return false;
+}
+
+/* Trả XML plist đầy đủ, hoặc NULL + log nếu thiếu key bắt buộc. */
+static char *build_pairing_file_xml(uint32_t *out_len, bool *has_rp_out) {
+    if (out_len) *out_len = 0;
+    if (has_rp_out) *has_rp_out = false;
+    if (!is_real_udid(g_udid)) {
+        emit_log("[pairing] ❌ Chưa có UDID thật — không tạo được file ghép nối.");
+        return NULL;
+    }
+    char *data = NULL; uint32_t size = 0;
     if (usbmuxd_read_pair_record(g_udid, &data, &size) != 0 || !data || !size) {
         free(data);
+        emit_log("[pairing] ❌ Chưa có pair record — ghép nối iPhone trước.");
         return NULL;
     }
     plist_t pl = NULL;
     plist_format_t fmt = PLIST_FORMAT_XML;
-    if (plist_from_memory(data, size, &pl, &fmt) != PLIST_ERR_SUCCESS || !pl) {
+    if (plist_from_memory(data, size, &pl, &fmt) != PLIST_ERR_SUCCESS || !pl ||
+        plist_get_node_type(pl) != PLIST_DICT) {
+        if (pl) plist_free(pl);
         free(data);
+        emit_log("[pairing] ❌ Pair record không parse được (plist hỏng).");
         return NULL;
     }
     free(data);
-    if (plist_dict_get_item(pl, "UDID") == NULL) {
-        plist_dict_set_item(pl, "UDID", plist_new_string(g_udid));
+
+    /* 1. UDID — SideStore đọc UDID từ chính file, không phải từ lockdown. */
+    plist_dict_set_item(pl, "UDID", plist_new_string(g_udid));
+
+    /* 2. SystemBUID — bản cũ tin rằng pair record luôn có; khi thiếu thì lấy
+     *    từ usbmuxd ReadBUID (chính SystemConfiguration.plist của tool). */
+    if (!plist_item_usable(pl, "SystemBUID")) {
+        char *buid = NULL;
+        if (usbmuxd_read_buid(&buid) == 0 && buid && buid[0]) {
+            plist_dict_set_item(pl, "SystemBUID", plist_new_string(buid));
+            emit_log("[pairing] Bổ sung SystemBUID từ usbmuxd ReadBUID.");
+        }
+        free(buid);
     }
-    char *xml = NULL;
-    uint32_t len = 0;
+
+    /* 3. WiFiMACAddress — iOS 26/27 có thể không trả lúc pair. Đọc lại. */
+    if (!plist_item_usable(pl, "WiFiMACAddress")) {
+        plist_t alt = plist_dict_get_item(pl, "WiFiAddress");
+        if (alt && plist_get_node_type(alt) == PLIST_STRING) {
+            plist_dict_set_item(pl, "WiFiMACAddress", plist_copy(alt));
+            emit_log("[pairing] Bổ sung WiFiMACAddress từ khoá WiFiAddress có sẵn.");
+        } else {
+            char *mac = lockdown_wifi_mac();
+            if (mac) {
+                plist_dict_set_item(pl, "WiFiMACAddress", plist_new_string(mac));
+                emitf("[pairing] Bổ sung WiFiMACAddress từ lockdownd: %s", mac);
+                free(mac);
+            } else {
+                emit_log("[pairing] ⚠️  Không đọc được WiFiAddress từ iPhone — "
+                        "một số bản SideStore sẽ từ chối file (tắt Private Wi-Fi Address rồi thử lại).");
+            }
+        }
+    }
+
+    /* 4. Khoá cert/key phải là <data>. */
+    plist_normalise_data_keys(pl);
+
+    /* 5. Gộp RPPairing nếu có (iOS 17.4+ / SideStore nightly). */
+    merge_external_rp(pl);
+
+    /* 6. Kiểm chứng — fail-closed thay vì ghi file hỏng im lặng. */
+    char missing[512] = {0};
+    for (int i = 0; PAIRING_REQUIRED_KEYS[i]; i++) {
+        if (!plist_item_usable(pl, PAIRING_REQUIRED_KEYS[i])) {
+            if (missing[0]) strncat(missing, ", ", sizeof(missing) - strlen(missing) - 1);
+            strncat(missing, PAIRING_REQUIRED_KEYS[i], sizeof(missing) - strlen(missing) - 1);
+        }
+    }
+    for (int i = 0; PAIRING_RECOMMENDED_HINT_KEYS[i]; i++) {
+        if (!plist_item_usable(pl, PAIRING_RECOMMENDED_HINT_KEYS[i]))
+            emitf("[pairing] ⚠️  Thiếu '%s' — một số app có thể từ chối file.",
+                  PAIRING_RECOMMENDED_HINT_KEYS[i]);
+    }
+    if (missing[0]) {
+        emitf("[pairing] ❌ TỪ CHỐI tạo file ghép nối — thiếu: %s", missing);
+        emit_log("[pairing]    → Hãy xoá pair record cũ, ghép nối lại iPhone (Tin cậy + mật mã), "
+                "rồi xuất/nhúng lại file.");
+        plist_free(pl);
+        return NULL;
+    }
+    if (has_rp_out) *has_rp_out = pairing_has_rp(pl);
+    char *xml = NULL; uint32_t len = 0;
     if (plist_to_xml(pl, &xml, &len) != PLIST_ERR_SUCCESS || !xml) {
         plist_free(pl);
         return NULL;
     }
     plist_free(pl);
     if (out_len) *out_len = len;
+    emitf("[pairing] ✅ File ghép nối hợp lệ (%u byte, UDID %s, RP %s)",
+          len, g_udid, (has_rp_out && *has_rp_out) ? "có" : "không");
     return xml;
 }
 
@@ -962,6 +1188,110 @@ static bool afc_write_file_all(afc_client_t afc, const char *path, const char *d
     }
     afc_file_close(afc, h);
     return true;
+}
+
+/* v73: ghi xong phai DOC LAI de biet file that su nam trong container.
+ * Loi "tao file xong nhung app khong doc duoc" thuong la AFC bao success nhung
+ * ghi nham duong dan (Documents/Documents/...) hoac bi afcd cat xén. */
+static bool afc_write_and_verify(afc_client_t afc, const char *path,
+                                 const char *data, uint32_t len) {
+    if (!afc_write_file_all(afc, path, data, len)) return false;
+    uint64_t h = 0;
+    if (afc_file_open(afc, path, AFC_FOPEN_RDONLY, &h) != AFC_E_SUCCESS || !h) {
+        emitf("[pairing] ⚠️  Ghi xong nhưng không mở lại được %s để kiểm chứng", path);
+        return false;
+    }
+    uint32_t total = 0;
+    char buf[256];
+    while (total < len) {
+        uint32_t want = len - total < sizeof(buf) ? len - total : (uint32_t)sizeof(buf);
+        uint32_t got = 0;
+        if (afc_file_read(afc, h, buf, want, &got) != AFC_E_SUCCESS || got == 0) break;
+        if (memcmp(buf, data + total, got) != 0) { total = 0; break; }
+        total += got;
+    }
+    afc_file_close(afc, h);
+    if (total != len) {
+        emitf("[pairing] ⚠️  Đọc lại %s chỉ được %u/%u byte — coi như ghi thất bại", path, total, len);
+        return false;
+    }
+    emitf("[pairing] 🔎 Đã đọc lại & khớp %u byte: %s", len, path);
+    return true;
+}
+
+/* Ghi file RP hoac lockdown vao 1 phien house_arrest/AFC. */
+static bool vend_and_write(const char *bundle, const char *rel,
+                           const char *xml, uint32_t len, bool has_rp) {
+    static const char *vend_cmds[] = {"VendContainer", "VendDocuments"};
+    char remote[600];
+    snprintf(remote, sizeof(remote), "/Documents/%s", rel);
+    /* Mot so afcd root o Documents (gvfs), mot so root o container (iLoader).
+     * Thu ca 2 kieu path de tuong thich moi ban iOS. */
+    const char *paths[2] = {remote, rel};
+    int npaths = strcmp(remote, rel) == 0 ? 1 : 2;
+
+    /* Khong bao gio ghi file lockdown vao ten file RemoteRP (se bi SideStore
+     * nightly coi la RP hop le roi that bai kho hieu). */
+    if (!has_rp && strstr(rel, "PairingFile_RemoteRP.plist")) {
+        emit_log("[pairing] ℹ️  Bỏ qua PairingFile_RemoteRP.plist: chưa có khoá RPPairing. "
+                 "Dùng idevice_pair để tạo rp_pairing_file.plist nếu SideStore nightly yêu cầu.");
+        return false;
+    }
+
+    for (int ci = 0; ci < 2; ci++) {
+        for (int pi = 0; pi < npaths; pi++) {
+            house_arrest_client_t ha = NULL;
+            house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
+            if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
+                emitf("[pairing] ⚠️  house_arrest không mở được (lỗi %d)", (int)he);
+                continue;
+            }
+            he = house_arrest_send_command(ha, vend_cmds[ci], bundle);
+            plist_t res = NULL;
+            if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
+            if (he == HOUSE_ARREST_E_SUCCESS && res) {
+                plist_t err_item = plist_dict_get_item(res, "Error");
+                if (err_item) {
+                    char *es = NULL;
+                    plist_get_string_val(err_item, &es);
+                    emitf("[pairing]   %s(%s) từ chối: %s", vend_cmds[ci], bundle, es ? es : "?");
+                    free(es);
+                    he = HOUSE_ARREST_E_UNKNOWN_ERROR;
+                }
+            }
+            if (res) plist_free(res);
+            bool wrote = false;
+            afc_client_t afc = NULL;
+            if (he == HOUSE_ARREST_E_SUCCESS &&
+                afc_client_new_from_house_arrest_client(ha, &afc) == AFC_E_SUCCESS && afc) {
+                wrote = afc_write_and_verify(afc, paths[pi], xml, len);
+                if (wrote) {
+                    emitf("[pairing] ✅ Ghi %s qua %s → %s", rel, vend_cmds[ci], paths[pi]);
+                    /* Neu co RP keys: tu dong ghi ca file ben canh cho
+                     * SideStore nightly (du nguoi goi chi xin 1 ten file). */
+                    if (has_rp && !strstr(rel, "PairingFile_RemoteRP.plist")) {
+                        char sibling[600];
+                        const char *slash = strrchr(paths[pi], '/');
+                        if (slash) {
+                            size_t prefix = (size_t)(slash - paths[pi]) + 1;
+                            snprintf(sibling, sizeof(sibling), "%.*sPairingFile_RemoteRP.plist",
+                                     (int)prefix, paths[pi]);
+                        } else {
+                            snprintf(sibling, sizeof(sibling), "PairingFile_RemoteRP.plist");
+                        }
+                        if (strcmp(sibling, paths[pi]) != 0)
+                            afc_write_and_verify(afc, sibling, xml, len);
+                    }
+                }
+            } else if (he != HOUSE_ARREST_E_SUCCESS) {
+                emitf("[pairing]   %s(%s) thất bại (lỗi %d)", vend_cmds[ci], bundle, (int)he);
+            }
+            /* CHI free house_arrest (dung chung connection voi AFC). */
+            if (ha) house_arrest_client_free(ha);
+            if (wrote) return true;
+        }
+    }
+    return false;
 }
 
 /* Đọc file plist nhị phân/XML qua AFC — trả dict hoặc NULL nếu không có. */
@@ -1041,7 +1371,7 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFile(JNIEnv *en
             return NULL;
         }
     }
-    char *xml = build_pairing_file_xml(NULL);
+    char *xml = build_pairing_file_xml(NULL, NULL);
     pthread_mutex_unlock(&g_api);
     if (!xml) return NULL;
     jstring r = (*env)->NewStringUTF(env, xml);
@@ -1064,9 +1394,6 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
     const char *bundle = j_bundle ? (*env)->GetStringUTFChars(env, j_bundle, NULL) : NULL;
     const char *rel    = j_rel    ? (*env)->GetStringUTFChars(env, j_rel, NULL)    : NULL;
     jboolean ok = JNI_FALSE;
-    house_arrest_client_t ha = NULL;
-    afc_client_t afc = NULL;
-    char *xml = NULL;
 
     pthread_mutex_lock(&g_api);
     do {
@@ -1078,79 +1405,85 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWritePairingFileToApp(
             emit_log("[pairing] ❌ iPhone chưa kết nối / chưa ghép nối");
             break;
         }
-        /* iLoader (generate_lockdown_plist): SetValue thành công là điều
-         * kiện để file nhúng vào app dùng được qua VPN loopback — thiếu
-         * là lockdownd đóng bắt tay ("early eof" khi StartSession), nên
-         * từ chối nhúng file hỏng thay vì cảnh báo cho qua như trước. */
         if (!g_wifi_debug_ok) {
-            int sk = 0; lockdownd_error_t we = ensure_wifi_debugging("xuất file ghép nối", &sk);
+            int sk = 0;
+            lockdownd_error_t we = ensure_wifi_debugging("nhúng file ghép nối", &sk);
             if (!sk && we != LOCKDOWN_E_SUCCESS) {
-                emit_log("[pairing] ❌ Từ chối nhúng file: Wi-Fi Debugging chưa bật trên iPhone (đặt mật mã màn hình rồi ghép nối lại)");
+                emit_log("[pairing] ❌ Từ chối nhúng file: Wi-Fi Debugging chưa bật. "
+                        "iPhone cần ĐẶT MẬT MÃ MÀN HÌNH rồi ghép nối lại.");
                 break;
             }
         }
-        xml = build_pairing_file_xml(NULL);
-        if (!xml) {
-            emit_log("[pairing] ❌ Chưa có pair record — ghép nối iPhone trước");
+        uint32_t len = 0;
+        bool has_rp = false;
+        char *xml = build_pairing_file_xml(&len, &has_rp);
+        if (!xml || !len) {
+            emit_log("[pairing] ❌ File ghép nối không hợp lệ — không nhúng (xem log kiểm chứng ở trên).");
+            free(xml);
             break;
         }
-
-        house_arrest_error_t he = house_arrest_client_start_service(g_device, &ha, CLIENT_LABEL);
-        if (he != HOUSE_ARREST_E_SUCCESS || !ha) {
-            emitf("[pairing] ❌ Không mở được house_arrest (lỗi %d)", (int)he);
-            break;
-        }
-
-        he = house_arrest_send_command(ha, "VendDocuments", bundle);
-        plist_t res = NULL;
-        if (he == HOUSE_ARREST_E_SUCCESS) he = house_arrest_get_result(ha, &res);
-        if (he == HOUSE_ARREST_E_SUCCESS && res) {
-            plist_t err_item = plist_dict_get_item(res, "Error");
-            if (err_item) {
-                char *es = NULL;
-                plist_get_string_val(err_item, &es);
-                emitf("[pairing] ❌ iPhone từ chối truy cập Documents của %s (%s)",
-                      bundle, es ? es : "?");
-                free(es);
-                he = HOUSE_ARREST_E_UNKNOWN_ERROR;
-            }
-        }
-        if (res) plist_free(res);
-        if (he != HOUSE_ARREST_E_SUCCESS) {
-            emitf("[pairing] ❌ VendDocuments(%s) thất bại (lỗi %d)", bundle, (int)he);
-            break;
-        }
-
-        if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
-            emit_log("[pairing] ❌ Không chuyển sang chế độ AFC được");
-            break;
-        }
-
-        /*
-         * iLoader place_file(): gốc AFC sau VendDocuments là DATA CONTAINER
-         * của app — file phải ghi vào /Documents/<rel_path> (v56 ghi nhầm ở
-         * gốc "/" → bị từ chối). afc_write_file_all tự tạo thư mục cha.
-         */
-        char remote[512];
-        snprintf(remote, sizeof(remote), "/Documents/%s", rel);
-        if (afc_write_file_all(afc, remote, xml, (uint32_t)strlen(xml))) {
-            emitf("[pairing] ✅ Đã ghi file ghép nối vào Documents của %s", bundle);
-            ok = JNI_TRUE;
-        }
+        ok = vend_and_write(bundle, rel, xml, len, has_rp) ? JNI_TRUE : JNI_FALSE;
+        if (!ok)
+            emitf("[pairing] ❌ Không ghi được '%s' vào %s bằng VendContainer lẫn VendDocuments. "
+                  "Kiểm tra: app đã được tin cậy? bundle id đúng '%s'?", rel, bundle, bundle);
+        free(xml);
     } while (0);
-
-    /*
-     * LƯU Ý QUAN TRỌNG (tránh double-free): afc_client được tạo từ house_arrest
-     * DÙNG CHUNG service connection với house_arrest client. Chỉ được free
-     * MỘT trong hai — ở đây free house_arrest (sạch chuỗi service + connection).
-     * Struct afc (~vài chục byte) không free — chấp nhận cho lần gọi hiếm.
-     */
-    if (ha) house_arrest_client_free(ha);
-    free(xml);
     pthread_mutex_unlock(&g_api);
     if (bundle) (*env)->ReleaseStringUTFChars(env, j_bundle, bundle);
     if (rel) (*env)->ReleaseStringUTFChars(env, j_rel, rel);
     return ok;
+}
+
+/* v73: bao cao noi dung file ghep noi + phien ban iOS cho Python/UI.
+ * Day la cach user thay DUOC ly do that khi pair khong chay, thay vi chi
+ * thay "Khong nhung duoc file ghep noi". */
+JNIEXPORT jstring JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetPairingFileReport(JNIEnv *env, jobject obj) {
+    (void)obj;
+    char report[2048];
+    pthread_mutex_lock(&g_api);
+    uint32_t len = 0;
+    bool has_rp = false;
+    char *xml = build_pairing_file_xml(&len, &has_rp);
+    int n = 0;
+    if (!xml) {
+        n = snprintf(report, sizeof(report),
+                     "ios=%s;wifi_debug=%s;paired=%s;status=INVALID;udid=%s;rp=no;keys=",
+                     g_ios_version[0] ? g_ios_version : "?", g_wifi_debug_ok ? "yes" : "no",
+                     g_paired ? "yes" : "no", g_udid[0] ? g_udid : "?");
+    } else {
+        plist_t pl = NULL;
+        plist_format_t fmt = PLIST_FORMAT_XML;
+        n = snprintf(report, sizeof(report),
+                     "ios=%s;wifi_debug=%s;paired=%s;status=OK;udid=%s;rp=%s;bytes=%u;keys=",
+                     g_ios_version[0] ? g_ios_version : "?", g_wifi_debug_ok ? "yes" : "no",
+                     g_paired ? "yes" : "no", g_udid[0] ? g_udid : "?",
+                     has_rp ? "yes" : "no", len);
+        if (plist_from_memory(xml, len, &pl, &fmt) == PLIST_ERR_SUCCESS && pl &&
+            plist_get_node_type(pl) == PLIST_DICT) {
+            plist_dict_iter it = NULL;
+            plist_dict_new_iter(pl, &it);
+            char *key = NULL; plist_t val = NULL;
+            plist_dict_next_item(pl, it, &key, &val);
+            while (val) {
+                if (key && n < (int)sizeof(report) - 64)
+                    n += snprintf(report + n, sizeof(report) - (size_t)n, "%s,", key);
+                free(key); key = NULL; val = NULL;
+                plist_dict_next_item(pl, it, &key, &val);
+            }
+            if (n && report[n - 1] == ',') report[--n] = 0;
+        }
+        if (pl) plist_free(pl);
+    }
+    free(xml);
+    pthread_mutex_unlock(&g_api);
+    return (*env)->NewStringUTF(env, report);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_superalpha_sideload_bridge_NativeBridge_nativeGetIosVersion(JNIEnv *env, jobject obj) {
+    (void)obj;
+    return (*env)->NewStringUTF(env, g_ios_version[0] ? g_ios_version : "");
 }
 
 /*
@@ -1224,16 +1557,31 @@ Java_com_superalpha_sideload_bridge_NativeBridge_nativeWriteSideStorePrefs(
                         emitf("[prefs] ℹ️ mkdir /Library/Preferences qua %s: AFC lỗi %d",
                               vend_cmds[ci], (int)me);
                     }
+                    /* v73: SideStore cai TRUC TIEP -> /Library/Preferences.
+                     * SideStore chay TRONG LiveContainer -> guest prefs nam o
+                     * Documents/SideStore/Library/Preferences (SideInstaller
+                     * NOTES.md). Ghi ca 2 bo duong dan, bo qua cai nao afcd
+                     * tu choi; khong con "ghi duoc file nhung sai cho". */
                     char path[600];
-                    bool o1 = false, o2 = false;
-                    snprintf(path, sizeof(path),
-                             "/Library/Preferences/group.com.SideStore.SideStore.plist");
-                    o1 = write_pairing_prefs(afc, path);
-                    snprintf(path, sizeof(path), "/Library/Preferences/%s.plist", bundle);
-                    o2 = write_pairing_prefs(afc, path);
-                    wrote = o1 || o2;
+                    const char *pref_dirs[] = {
+                        "/Library/Preferences",
+                        "/Documents/SideStore/Library/Preferences",
+                    };
+                    static const char *pref_names[] = {
+                        "group.com.SideStore.SideStore.plist",
+                        "com.SideStore.SideStore.plist",
+                    };
+                    for (int d = 0; d < 2; d++) {
+                        for (int k = 0; k < 3; k++) {
+                            if (k < 2)
+                                snprintf(path, sizeof(path), "%s/%s", pref_dirs[d], pref_names[k]);
+                            else
+                                snprintf(path, sizeof(path), "%s/%s.plist", pref_dirs[d], bundle);
+                            if (write_pairing_prefs(afc, path)) wrote = true;
+                        }
+                    }
                     if (!wrote) {
-                        emitf("[prefs] ⚠️ Không ghi được /Library/Preferences qua %s", vend_cmds[ci]);
+                        emitf("[prefs] ⚠️ Không ghi được UserDefaults qua %s", vend_cmds[ci]);
                     }
                 } else {
                     emit_log("[prefs] ⚠️ Không chuyển sang AFC được");

@@ -72,6 +72,7 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
     val pairingFileReady by viewModel.pairingFileReady.collectAsState()
     val autoEmbed by viewModel.autoEmbedPairing.collectAsState()
     val pairingApps by viewModel.pairingApps.collectAsState()
+    val pairingReport by viewModel.pairingReport.collectAsState()
 
     // Vào tab / iPhone mới ghép nối xong → làm mới trạng thái 1 lần.
     LaunchedEffect(status.udid, status.paired) {
@@ -129,6 +130,24 @@ fun PairingFileManagerScreen(viewModel: HomeViewModel) {
                         "không cần bấm \"Tin cậy\" lại.",
                 style = MaterialTheme.typography.bodySmall,
                 color = BrandTextDim
+            )
+            if (pairingReport.isNotBlank()) {
+                Text(
+                    "Kiểm chứng native: $pairingReport",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = BrandTextDim,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+            Text(
+                "Yêu cầu: iPhone phải ĐẶT MẬT MÃ MÀN HÌNH (để bật Wi-Fi Debugging). " +
+                        "iOS 17.4+/26+: SideStore nightly ưu tiên RemotePairing — nếu app vẫn " +
+                        "báo lỗi pairing, dùng idevice_pair tạo rp_pairing_file.plist rồi chép " +
+                        "vào thư mục dữ liệu của tool; bản v73 tự gộp và ghi cả 3 tên file.",
+                style = MaterialTheme.typography.labelSmall,
+                color = BrandTextDim,
+                modifier = Modifier.padding(top = 8.dp)
             )
         }
 

@@ -827,9 +827,11 @@ _PAIRING_APPS = (
     # tự dọn file legacy. Lưu ý: SideStore 0.7 KHÔNG tự nạp file có sẵn —
     # người dùng phải chọn file 1 lần duy nhất khi app hỏi (xem hướng dẫn
     # sau khi nhúng).
-    ("SideStore", ("ALTPairingFile.mobiledevicepairing", "PairingFile_Lockdown.plist")),
+    ("SideStore", ("ALTPairingFile.mobiledevicepairing", "PairingFile_Lockdown.plist",
+                   "PairingFile_RemoteRP.plist")),
     ("LiveContainer", ("SideStore/Documents/ALTPairingFile.mobiledevicepairing",
-                       "SideStore/Documents/PairingFile_Lockdown.plist")),
+                       "SideStore/Documents/PairingFile_Lockdown.plist",
+                       "SideStore/Documents/PairingFile_RemoteRP.plist")),
     ("Feather", ("pairingFile.plist",)),
     ("StikDebug", ("pairingFile.plist",)),
     ("StikDebug (Sideloaded)", ("rp_pairing_file.plist",)),
@@ -844,6 +846,108 @@ _PAIRING_APPS = (
 )
 
 
+# ── v73: kiểm chứng nội dung file ghép nối TRƯỚC khi nhúng ──────────────────
+# SideStore/minimuxer (va Feather/StikDebug) doc file nay bang parser that su:
+#   loaded pairing file keys: [WiFiMACAddress, HostCertificate, UDID, HostID,
+#   HostPrivateKey, EscrowBag, DeviceCertificate, SystemBUID, RootPrivateKey,
+#   RootCertificate]                       — SideStore issue #1532
+# Nhua ipaforge PR #26: "Current SideStore reads pairing files with a parser
+# that requires RootPrivateKey and WiFiMACAddress ... Records the OS creates
+# may also lack WiFiMACAddress". Ban cu CUA TOOL chi them khoa UDID vao pair
+# record roi ghi ra -> thieu key van am tham ghi file "co ma khong dung duoc".
+PAIRING_REQUIRED_KEYS = (
+    "DeviceCertificate", "HostCertificate", "HostPrivateKey", "RootCertificate",
+    "RootPrivateKey", "HostID", "SystemBUID", "UDID",
+)
+PAIRING_RECOMMENDED_KEYS = ("WiFiMACAddress", "EscrowBag")
+PAIRING_RP_KEYS = ("alt_irk", "private_key", "public_key", "identifier")
+
+
+def validate_pairing_file_xml(xml) -> dict:
+    """Parse + kiểm tra file ghép nối. Không gọi Kotlin/C — test được ở host.
+
+    Trả dict: {ok, missing, warnings, has_rp, keys, udid, ios_note}
+    """
+    result = {"ok": False, "missing": [], "warnings": [], "has_rp": False,
+              "keys": [], "udid": "", "ios_note": ""}
+    if not xml:
+        result["warnings"].append("Không lấy được nội dung file ghép nối từ native layer.")
+        return result
+    try:
+        import plistlib as _plistlib
+        data = xml.encode("utf-8") if isinstance(xml, str) else bytes(xml)
+        pl = _plistlib.loads(data)
+    except Exception as e:
+        result["warnings"].append(f"File ghép nối không phải plist hợp lệ: {e}")
+        return result
+    if not isinstance(pl, dict):
+        result["warnings"].append("Root plist không phải dict.")
+        return result
+    result["keys"] = sorted(str(k) for k in pl.keys())
+    result["udid"] = str(pl.get("UDID") or "")
+    result["has_rp"] = any(k in pl for k in PAIRING_RP_KEYS)
+
+    for key in PAIRING_REQUIRED_KEYS:
+        value = pl.get(key)
+        if value is None or (isinstance(value, (bytes, str, list, dict)) and len(value) == 0):
+            result["missing"].append(key)
+    for key in PAIRING_RECOMMENDED_KEYS:
+        value = pl.get(key)
+        if value is None or (isinstance(value, (bytes, str)) and len(value) == 0):
+            result["warnings"].append(f"Thiếu '{key}' — một số bản SideStore/minimuxer từ chối file.")
+    if not result["udid"]:
+        result["warnings"].append("Thiếu UDID — SideStore báo 'could not determine this device's UDID'.")
+
+    result["ok"] = not result["missing"]
+    return result
+
+
+def _pairing_preflight(app_name: str) -> dict:
+    """Lấy file ghép nối thật từ native, kiểm chứng, in chẩn đoán ra log UI."""
+    info = {"ok": False, "missing": [], "warnings": [], "has_rp": False,
+            "keys": [], "udid": "", "ios_note": ""}
+    try:
+        from com.superalpha.sideload.bridge import DeviceNative
+        # Cac ban cu khong co method nay -> bo qua kiem chung (khong lam gãy luồng).
+        getter = getattr(DeviceNative, "getPairingFileXml", None)
+        if getter is None:
+            info["ok"] = True          # không có dữ liệu để phán xét → không chặn
+            info["warnings"].append("Native layer cũ — bỏ qua kiểm chứng nội dung file.")
+            return info
+        xml = getter()
+        info = validate_pairing_file_xml(xml)
+        report_getter = getattr(DeviceNative, "getPairingFileReport", None)
+        report = report_getter() if report_getter else ""
+        ios_getter = getattr(DeviceNative, "getIosVersion", None)
+        ios = str(ios_getter() if ios_getter else "") or ""
+        info["ios_note"] = ios
+        print(f"[pairing] Kiểm chứng file: {len(info['keys'])} key, UDID={info['udid'] or '?'}, "
+              f"iOS={ios or '?'}, RP={'có' if info['has_rp'] else 'không'}")
+        if report:
+            print(f"[pairing] Báo cáo native: {report}")
+        for w in info["warnings"]:
+            print(f"[pairing] ⚠️  {w}")
+        if info["missing"]:
+            print(f"[pairing] ❌ THIẾU KEY BẮT BUỘC: {', '.join(info['missing'])}")
+            print("[pairing]    → SideStore sẽ báo 'invalid pairing file' / không đọc được UDID. "
+                  "Hãy ghép nối lại (xoá pair record cũ) rồi thử lại.")
+        # iOS 17.4+ / 26+: SideStore nightly ưu tiên RP pairing.
+        try:
+            major = int(str(ios).split(".")[0] or 0)
+        except ValueError:
+            major = 0
+        if major >= 17 and not info["has_rp"]:
+            print(f"[pairing] ℹ️  iOS {ios}: SideStore nightly (0.7+) ưu tiên RemotePairing. "
+                  "Tool hiện chỉ tạo lockdown pairing — nếu app báo lỗi pairing, hãy dùng "
+                  "idevice_pair để tạo RPPairing rồi chép file rp_pairing_file.plist vào "
+                  "thư mục dữ liệu của tool; tool sẽ tự gộp và ghi cả 3 tên file.")
+    except Exception as e:
+        info["ok"] = True              # lỗi chẩn đoán không được chặn cài app
+        info["warnings"].append(f"Không kiểm chứng được file ghép nối: {e}")
+        print(f"[pairing] ⚠️  {info['warnings'][-1]}")
+    return info
+
+
 def _pairing_needs_prefs(app_name: str, bundle_id: str) -> bool:
     """True nếu app là SideStore cài TRỰC TIẾP (không phải LiveContainer) —
     các bản này dùng UserDefaults trong chính container của app, tool ghi
@@ -855,15 +959,22 @@ def _pairing_needs_prefs(app_name: str, bundle_id: str) -> bool:
     return "sidestore" in name_l or "sidestore" in bid_l
 
 
-def _pairing_rel_paths_for(app_name: str, bundle_id: str) -> tuple:
+def _pairing_rel_paths_for(app_name: str, bundle_id: str, has_rp: bool = False) -> tuple:
     """Các đường dẫn file ghép nối cần ghi vào app nếu app này cần (theo tên
-    hoặc bundle id), ngược lại trả tuple rỗng."""
+    hoặc bundle id), ngược lại trả tuple rỗng.
+
+    v73: CHI ghi PairingFile_RemoteRP.plist khi file that su chua khoa RP.
+    Ghi mot file lockdown (thieu alt_irk/private_key) vao ten file RP se lam
+    SideStore nightly coi do la file RP hop le roi that bai kho hieu hon.
+    """
     name_l = str(app_name or "").strip().lower()
     bid_l = str(bundle_id or "").lower()
     for name, rels in _PAIRING_APPS:
         nl = name.lower()
         if (name_l and name_l == nl) or (bid_l and nl in bid_l):
-            return rels
+            if has_rp:
+                return rels
+            return tuple(r for r in rels if "PairingFile_RemoteRP.plist" not in r)
     return ()
 
 
@@ -1111,7 +1222,19 @@ def do_sideload(
               "Quản lý VPN & Thiết bị > tin cậy Apple ID của bạn.)")
         # ── v56..v58: tự động nhúng file ghép nối vào SideStore/LiveContainer… ──
         if embed_pairing and targets and targets[0] and targets[0][1]:
-            rels = _pairing_rel_paths_for(app_name, targets[0][1])
+            preflight = _pairing_preflight(app_name)
+            has_rp = bool(preflight.get("has_rp"))
+            rels = _pairing_rel_paths_for(app_name, targets[0][1], has_rp=has_rp)
+            if rels and not preflight.get("ok"):
+                # FAIL-CLOSED: dừng nhúng file hỏng thay vì tạo file "có mà
+                # không dùng được" (dung trieu chung nguoi dung bao o loi #2).
+                set_last_error(
+                    "Cài app thành công NHƯNG file ghép nối thiếu: "
+                    + ", ".join(preflight.get("missing") or [])
+                    + ". SideStore/LiveContainer sẽ không dùng được — hãy ghép nối lại iPhone.")
+                print("[pairing] ❌ Không nhúng file ghép nối vì nội dung chưa hợp lệ "
+                      "(xem các dòng kiểm chứng ở trên).")
+                rels = ()
             if rels:
                 print(f"[pairing] Phát hiện {app_name} — tự động ghi file ghép nối vào app...")
                 placed = False
@@ -1142,6 +1265,11 @@ def do_sideload(
                         print("[pairing]       rồi chọn file như trên, sau đó KHỞI ĐỘNG LẠI SideStore.")
                 else:
                     print("[pairing] ⚠️ Không nhúng được file ghép nối (cài đặt vẫn thành công).")
+                    set_last_error(
+                        "Cài app thành công nhưng KHÔNG ghi được file ghép nối vào Documents. "
+                        "Nguyên nhân thường gặp: Wi-Fi Debugging chưa bật (iPhone cần mật mã "
+                        "màn hình), app chưa được tin cậy, hoặc house_arrest bị iOS từ chối. "
+                        "Xem log [pairing] ở trên để biết lỗi AFC/VendDocuments cụ thể.")
 
         return True
 

@@ -230,7 +230,9 @@ fun SettingsScreen(viewModel: HomeViewModel) {
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Server Anisette cấp dữ liệu xác thực thiết bị cho đăng nhập Apple ID/2FA.",
+                    "Server Anisette cấp dữ liệu xác thực thiết bị cho đăng nhập Apple ID/2FA. " +
+                        "Chế độ Tự động tự đổi sang server khác khi server hiện tại lỗi " +
+                        "(kể cả khi server do bạn chọn bị chết).",
                     style = MaterialTheme.typography.bodySmall,
                     color = BrandTextDim,
                     modifier = Modifier.weight(1f)

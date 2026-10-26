@@ -148,9 +148,13 @@ object PythonBridge {
                 effectiveAnisetteUrl,
                 embedPairing
             ).toBoolean()
+            // v73: vẫn hiện cảnh báo (file ghép nối hỏng, iOS cần RP pairing…)
+            // ngay cả khi cài app thành công — trước đây UI chỉ báo "thành công".
+            val warn = pyLastError(core)
             Outcome(
                 ok,
-                if (ok) "Cài đặt IPA thành công."
+                if (ok) "Cài đặt IPA thành công." +
+                        (if (warn.isBlank()) "" else "\n⚠️ $warn")
                 else failMessage(core, "Cài đặt thất bại:")
             )
         } catch (e: Exception) {
@@ -241,10 +245,12 @@ object PythonBridge {
      * nên danh sách này cũ vài tuần vẫn không làm hỏng đăng nhập.
      */
     private val priorityAnisetteServers = listOf(
-        AnisetteServer("mac-ani.jkcoxson.com (đã kiểm chứng)", "https://mac-ani.jkcoxson.com"),
-        AnisetteServer("ani.jkcoxson.com", "https://ani.jkcoxson.com"),
-        AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
+        AnisetteServer("mac-ani.jkcoxson.com (Mac ADI)", "https://mac-ani.jkcoxson.com"),
+        AnisetteServer("ani.jkcoxson.com (Mac ADI)", "https://ani.jkcoxson.com"),
+        AnisetteServer("ani3.stikstore.app", "https://ani3.stikstore.app"),
         AnisetteServer("new.ani.sidestore.io", "https://new.ani.sidestore.io"),
+        AnisetteServer("ani2.stikstore.app", "https://ani2.stikstore.app"),
+        AnisetteServer("SideStore Official", "https://ani.sidestore.io"),
     )
 
     /** Danh sách server Anisette công khai — Kotlin OkHttp, không cần Python. */
