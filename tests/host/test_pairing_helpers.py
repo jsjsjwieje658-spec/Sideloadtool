@@ -117,6 +117,11 @@ int main(void) {
         except FileNotFoundError:
             pass
 
+        # The CI host dependencies build libplist as a static archive. Its
+        # implementation calls fmin()/pow(), which need libm on the final
+        # executable link (pkg-config --libs does not expose this dependency).
+        # Keep -lm after the archive flags so GNU ld resolves those symbols.
+        libs.append("-lm")
         cmd = ["gcc", "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra",
                *cflags, *incs, cfile, "-o", exe, *libs]
         build = subprocess.run(cmd, capture_output=True, text=True)

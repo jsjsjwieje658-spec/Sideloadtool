@@ -224,3 +224,12 @@ Trong quá trình viết, `test_apple_oct2026.py` **đã bắt được lỗi th
 4. Sau khi cài SideStore/LiveContainer, mở tab **File ghép nối** → đọc dòng `Kiểm chứng native: ios=…;status=OK;keys=…`. Nếu `status=INVALID` → làm theo log (xoá pair record, ghép nối lại).
 5. Nếu dùng **SideStore nightly trên iOS 17.4+/26+** và app vẫn đòi pairing: dùng `idevice_pair` tạo **Remote Pairing**, export `.plist`, chép vào thư mục dữ liệu của tool với tên `rp_pairing_file.plist`, rồi bấm **Quét app → Nhúng** lại. Tool sẽ ghi cả 3 tên file.
 6. Nếu gặp `-20209`: **dừng thử**, mở https://iforgot.apple.com để mở khoá tài khoản.
+
+---
+
+## 9. CI follow-up — sửa lỗi link test host (2026-10-27)
+
+- GitHub Actions run `40364605831`: job **Build APK** thành công; job **Protocol tests** dừng tại `tests/host/test_pairing_helpers.py`.
+- Nguyên nhân gốc: CI build libplist 2.6.0 thành **static archive**. `plist.o`/`jplist.o` tham chiếu `fmin()`/`pow()` từ libm, nhưng lệnh link của harness chỉ truyền `pkg-config --libs libplist-2.0` rồi `-lplist-2.0`, không thêm `-lm`. Linker vì vậy báo `undefined reference to fmin` và `pow`. Đây là lỗi phụ thuộc của **host test harness**, không phải lỗi compile/link APK; job APK đã xanh.
+- Sửa tối thiểu: thêm `-lm` **sau** các thư viện trong `tests/host/test_pairing_helpers.py`, giữ thứ tự liên kết tĩnh đúng. Không thay đổi mã production.
+- Verify sau sửa: tái tạo host dependencies theo đúng `tests/native-host/build_host_deps.sh` (libplist 2.6.0 static), chạy đủ 5 bộ Python, C syntax (4/4), functional pairing-helper C và fake-iPhone native-host integration; tất cả đều đạt. Chờ run GitHub Actions kế tiếp để xác nhận CI xanh từ đầu đến cuối.
