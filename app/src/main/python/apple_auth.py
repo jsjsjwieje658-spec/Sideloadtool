@@ -1015,10 +1015,16 @@ class AppleAuth:
         edge_statuses = {429, 502, 503, 504}
 
         last_status = None
-        for attempt in range(3):
+        # [v74] Apple edge trả 503 HTML từng đợt kéo dài 10-40s (không phải
+        # anisette bị chặn). Retry 3 lần cách nhau 0.25s là quá ngắn: cả 3 lần
+        # đều rơi vào cùng một đợt -> báo sai thành "danh tính bị từ chối"
+        # (-80045). Nay: 6 lần, backoff 2/5/10/20/30s để thoát khỏi đợt 503.
+        EDGE_RETRIES = 6
+        EDGE_BACKOFF = (2, 5, 10, 20, 30, 30)
+        for attempt in range(EDGE_RETRIES):
             try:
                 if debug:
-                    extra = f" (kết nối mới {attempt + 1}/3)" if attempt else ""
+                    extra = f" (kết nối mới {attempt + 1}/{EDGE_RETRIES})" if attempt else ""
                     print(f"[gsa] Request operation: {op}{extra}")
 
                 print("[gsa] Sending request to Apple GSA service...")
@@ -1034,13 +1040,14 @@ class AppleAuth:
                 print(f"[gsa] Response status: {response.status_code}")
                 last_status = response.status_code
 
-                if response.status_code in edge_statuses and attempt < 2:
+                if response.status_code in edge_statuses and attempt < EDGE_RETRIES - 1:
                     snippet = response.content[:140].decode("utf-8", "replace").replace("\n", " ")
+                    wait = EDGE_BACKOFF[min(attempt, len(EDGE_BACKOFF) - 1)]
                     print(
-                        f"[gsa] Apple edge {response.status_code} (HTML, không phải anisette bị chặn). "
-                        f"Gửi lại trên socket mới... {snippet}"
+                        f"[gsa] Apple edge {response.status_code} (đợt rate-limit của edge, "
+                        f"không phải anisette bị chặn). Chờ {wait}s rồi gửi lại... {snippet}"
                     )
-                    time.sleep(0.25)
+                    time.sleep(wait)
                     continue
 
                 if response.status_code == 429:
@@ -1095,7 +1102,7 @@ class AppleAuth:
                 print(f"[gsa] Request failed: {e}")
                 raise
 
-        raise GsaRateLimitedError(f"edge {last_status} sau 3 kết nối mới")
+        raise GsaRateLimitedError(f"edge {last_status} sau {EDGE_RETRIES} kết nối mới (đã backoff)")
 
     # =========================================================================
     # HELPER: _build_2fa_base_headers — PHẢI gọi riêng cho mỗi HTTP request
@@ -1615,6 +1622,9 @@ class AppleAuth:
                             "message": "2FA completed, re-run tool to get full session"
                         }
                     print("[icloud] 2FA thành công! Đang xác thực lại để lấy token phiên đầy đủ...")
+                    # [v74] nghỉ ngắn: chuỗi SRP init/complete liên tiếp ngay sau
+                    # validate rất dễ ăn 503 HTML của edge Apple.
+                    time.sleep(12)
                     return self.authenticate(apple_id, password, _depth=_depth + 1)
                 else:
                     self.last_error = "Xác thực 2FA thất bại hoặc bị huỷ."
